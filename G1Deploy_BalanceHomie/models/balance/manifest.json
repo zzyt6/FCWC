@@ -1,0 +1,28 @@
+{
+  "policy_profile": "balance_g1_zero_command_456_to_12_v1",
+  "source_archive": "models/balance.zip",
+  "source_archive_sha256": "b06d7f1517a9d73fcc28d42965d93978d8f188ad0af0364f6df3416f468e9564",
+  "source_checkpoint": "model_68600.pt",
+  "imported_at_utc": "2026-10-14T13:56:32.404462+00:00",
+  "model_files": {
+    "balance": "models/balance/policy.onnx"
+  },
+  "model_sha256": {
+    "balance": "337a51066937b9b0ac8e72b14fd1763d232e17fcdeaacc5d06210e6e5f78349c"
+  },
+  "artifact_sha256": {
+    "config.json": "ab69a066d23468cd9d488442c9df5a054ef3c2b4bf6c658d30d4433b691456b4",
+    "policy.onnx": "337a51066937b9b0ac8e72b14fd1763d232e17fcdeaacc5d06210e6e5f78349c",
+    "verification_vectors.npz": "902705d4617d03689f07c3c6455e4e4bcba24e27bd3776d32c329429f10a6cc9",
+    "deployment_contract.json": "04b64755444585c007f99515a80c12ffc8661b5bbe60f590b8fa59f47d995541"
+  },
+  "model_bytes_unchanged": true,
+  "deployment_notes": [
+    "Balance newest candidate command is zero; older frames retain the selected walking or balance command history.",
+    "Both models use the previous selected policy action after training clipping, before joint/PD limits. Unselected outputs are logged only.",
+    "Both policies control 12 leg joints. Waist/arms hold prepared targets; Viser disables SDK slots 13/14.",
+    "Kp/Kd follow the export for all 27 listed joints. Unlisted SDK slots 13/14 retain their existing gains.",
+    "Shared effort limits remain at existing values: hip roll 88 Nm is lower than the export 139 Nm."
+  ],
+  "execution_history_source": "CJME_Push_car 1b9574d682a2acfe34eebd21654e792c781aa3f7: env.py _balance_reset_buffers; task_core.py compute_observations"
+}

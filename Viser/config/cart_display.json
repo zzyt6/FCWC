@@ -1,0 +1,9 @@
+{
+  "urdf": "../../G1_high_policy_deploy/assets/cart_v7/cart_v7.urdf",
+  "handle_center_in_cart_m": [-0.49, 0.0, 0.913135],
+  "grasp_point_in_palm_m": {
+    "left": [0.0589450684, -0.0340401587, -0.0003957130],
+    "right": [0.0589450872, 0.0340403294, -0.0003957297]
+  },
+  "tag_positions_in_cart_m": {}
+}

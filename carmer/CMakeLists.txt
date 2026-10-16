@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.16)
+project(apriltag_robot_feedback LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(Threads REQUIRED)
+set(SDK "${CMAKE_CURRENT_SOURCE_DIR}/../G1Deploy_BalanceHomie/vendor/unitree_sdk2")
+set(ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+if(ARCH STREQUAL "arm64")
+  set(ARCH aarch64)
+endif()
+add_executable(robot_state_bridge robot_state_bridge.cpp)
+target_compile_options(robot_state_bridge PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(robot_state_bridge SYSTEM PRIVATE
+  "${SDK}/include" "${SDK}/thirdparty/include" "${SDK}/thirdparty/include/ddscxx")
+target_link_libraries(robot_state_bridge PRIVATE "${SDK}/lib/${ARCH}/libunitree_sdk2.a"
+  "${SDK}/thirdparty/lib/${ARCH}/libddscxx.so" "${SDK}/thirdparty/lib/${ARCH}/libddsc.so" Threads::Threads)
+set_target_properties(robot_state_bridge PROPERTIES BUILD_RPATH "${SDK}/thirdparty/lib/${ARCH}")

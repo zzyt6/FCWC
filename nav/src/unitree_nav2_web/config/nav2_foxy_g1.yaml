@@ -1,0 +1,285 @@
+amcl:
+  ros__parameters:
+    use_sim_time: false
+    alpha1: 0.10
+    alpha2: 0.10
+    alpha3: 0.15
+    alpha4: 0.10
+    alpha5: 0.10
+    base_frame_id: base_nav
+    global_frame_id: map
+    odom_frame_id: odom
+    # Localization uses its own structural-height projection.  The stricter
+    # ground-relative /scan remains dedicated to dynamic obstacle avoidance.
+    scan_topic: scan_localization
+    map_topic: map
+    robot_model_type: omnidirectional
+    laser_model_type: likelihood_field
+    laser_min_range: 0.60
+    # Long-range structure improves global localization.  Dynamic obstacle
+    # avoidance remains independently capped at 4 m below.
+    laser_max_range: 8.0
+    laser_likelihood_max_dist: 1.0
+    # The projected PCD map is dense and locally repetitive.  Use enough
+    # structural beams/particles for the initial correction instead of
+    # declaring success from a sparse 120-beam sample.
+    max_beams: 360
+    min_particles: 1000
+    max_particles: 5000
+    pf_err: 0.02
+    pf_z: 0.99
+    sigma_hit: 0.12
+    z_hit: 0.95
+    z_rand: 0.05
+    z_max: 0.0
+    z_short: 0.0
+    update_min_d: 0.02
+    update_min_a: 0.02
+    resample_interval: 1
+    # Keep Foxy AMCL's random-recovery injection disabled.  On this arm64
+    # 0.4.7 build, a captured SIGSEGV resolves to
+    # pf_update_resample -> AmclNode::uniformPoseGenerator when these are
+    # non-zero.  Normal sensor resampling and explicit initial-pose
+    # refinement remain active.
+    recovery_alpha_fast: 0.0
+    recovery_alpha_slow: 0.0
+    transform_tolerance: 0.50
+    tf_broadcast: true
+    set_initial_pose: false
+    always_reset_initial_pose: true
+    save_pose_rate: -1.0
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_nav
+    odom_topic: /Odometry_base
+    enable_groot_monitoring: false
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_distance_traveled_condition_bt_node
+
+# Nav2 is only the outer path follower.  /cmd_vel is clamped by
+# g1_cmd_vel_udp (vx 0.60, vy 0.20, wz 0.50) and executed by
+# nav/locomotion/g1_locomotion_executor.py, i.e. our Balance/Homie policies
+# with the pelvis-IMU heading outer loop and the shared 0.4 s command filter.
+# DWB retains conservative acceleration limits for trajectory prediction.
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 15.0
+    odom_topic: /Odometry_base
+    min_x_velocity_threshold: 0.01
+    min_y_velocity_threshold: 0.01
+    min_theta_velocity_threshold: 0.01
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugin: "goal_checker"
+    controller_plugins: ["FollowPath"]
+    progress_checker:
+      plugin: "nav2_controller::PoseProgressChecker"
+      required_movement_radius: 0.20
+      required_movement_angle: 0.20
+      movement_time_allowance: 15.0
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.15
+      yaw_goal_tolerance: 0.17453292519943295  # 10 degrees
+      stateful: true
+    FollowPath:
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "unitree_nav2_core::ApproachDWBLocalPlanner"
+      trajectory_generator_name: "unitree_nav2_core::SpeedLimitedGenerator"
+      navigation_speed_mode: "auto"
+      navigation_speed: 0.35
+      approach_distance: 0.60
+      approach_speed: 0.10
+      angular_dist_threshold: 0.52
+      forward_sampling_distance: 0.50
+      rotate_to_heading_angular_vel: 0.35
+      # Matches the locomotion wz slew (0.4 rad/s^2).
+      max_angular_accel: 0.40
+      simulate_ahead_time: 1.0
+      # The executor ramps every command itself; ramp from the last command so
+      # the shim does not wait for odometry to confirm each small step.
+      closed_loop: false
+      # DWB parameters (the shim delegates to DWB after heading alignment)
+      debug_trajectory_details: false
+      min_vel_x: -0.12
+      min_vel_y: -0.18
+      max_vel_x: 0.60
+      max_vel_y: 0.18
+      max_vel_theta: 0.45
+      min_speed_xy: 0.0
+      max_speed_xy: 0.60
+      min_speed_theta: 0.0
+      acc_lim_x: 0.30
+      acc_lim_y: 0.20
+      acc_lim_theta: 0.40
+      decel_lim_x: -0.30
+      decel_lim_y: -0.20
+      decel_lim_theta: -0.40
+      vx_samples: 15
+      vy_samples: 11
+      vtheta_samples: 17
+      sim_time: 1.0
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.50
+      xy_goal_tolerance: 0.15  # Keep RotateToGoal aligned with the goal checker.
+      trans_stopped_velocity: 0.05
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist", "CruiseSpeed"]
+      CruiseSpeed.class: "unitree_nav2_core::CruiseSpeedCritic"
+      CruiseSpeed.scale: 24.0
+      BaseObstacle.scale: 0.04
+      PathAlign.scale: 28.0
+      PathAlign.forward_point_distance: 0.15
+      GoalAlign.scale: 20.0
+      GoalAlign.forward_point_distance: 0.15
+      PathDist.scale: 28.0
+      GoalDist.scale: 20.0
+      RotateToGoal.scale: 28.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 8.0
+      publish_frequency: 8.0
+      global_frame: odom
+      robot_base_frame: base_nav
+      rolling_window: true
+      width: 8
+      height: 8
+      resolution: 0.05
+      footprint: "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          inf_is_valid: true
+          min_obstacle_height: -2.0
+          max_obstacle_height: 2.0
+          # Keep dynamic avoidance within the 4 m half-width rolling window;
+          # long-range structure belongs to the static global map.
+          obstacle_range: 3.5
+          raytrace_range: 4.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.65
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_nav
+      resolution: 0.05
+      footprint: "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+      # The BT replans /plan periodically, but it can only route around a
+      # live obstacle if that obstacle is also present in the planner's
+      # global costmap.
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          inf_is_valid: true
+          min_obstacle_height: -2.0
+          max_obstacle_height: 2.0
+          obstacle_range: 3.5
+          raytrace_range: 4.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.65
+      always_send_full_costmap: true
+
+map_server:
+  ros__parameters:
+    use_sim_time: false
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.25
+      use_astar: true
+      allow_unknown: false
+
+recoveries_server:
+  ros__parameters:
+    use_sim_time: false
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    recovery_plugins: ["spin", "back_up", "wait"]
+    spin:
+      plugin: "nav2_recoveries/Spin"
+    back_up:
+      plugin: "nav2_recoveries/BackUp"
+    wait:
+      plugin: "nav2_recoveries/Wait"
+    global_frame: odom
+    robot_base_frame: base_nav
+    transform_timeout: 0.20
+    simulate_ahead_time: 1.5
+    max_rotational_vel: 0.40
+    min_rotational_vel: 0.15
+    rotational_acc_lim: 0.40
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    loop_rate: 10
+    stop_on_failure: true

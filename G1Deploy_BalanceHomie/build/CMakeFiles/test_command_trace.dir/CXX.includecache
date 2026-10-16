@@ -1,0 +1,30 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+../cpp/command_trace.hpp
+protocol.hpp
+../cpp/protocol.hpp
+algorithm
+-
+
+../cpp/protocol.hpp
+array
+-
+cstdint
+-
+cstring
+-
+cmath
+-
+
+/home/unitree/CWC/G1Deploy_BalanceHomie/tests/test_command_trace.cpp
+command_trace.hpp
+/home/unitree/CWC/G1Deploy_BalanceHomie/tests/command_trace.hpp
+cassert
+-
+

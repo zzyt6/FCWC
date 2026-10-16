@@ -1,0 +1,19 @@
+{
+  "source_checkpoint": "/home/amax/RobotProjects/CJME_Push_car/models/model_60000.pt",
+  "source_checkpoint_sha256": "563125eaa4ff551a8573451e4babcee4359d3162efd31a34e199d1387a38ea36",
+  "source_params_sha256": "24d26fe961e0a62a91b763bc84747b48a79073fff071693bfac0a3254a2473a6",
+  "source_physics_sha256": "64ee7eea5fffc81246e893244f7e5e572d9e206559e0de26336ae3b44a8ea6fd",
+  "checkpoint_iteration": 60000,
+  "torch_version": "2.7.0+cu128",
+  "saved_model_loaded_strictly": true,
+  "samples": 128,
+  "jit_max_abs_error": 0.0,
+  "artifact_sha256": {
+    "policy.onnx": "676765c20e3df7c838cb3d1cdf054cd0376158dab41e176949e9a4cdfd049f0c",
+    "policy_jit.pt": "470c8776c19e9ad70506906d605e9dc91a79c658401a2996a10ababaee5e1781",
+    "verification_vectors.npz": "6cd12532fee58f415bc1783075eb74a01dab77e68a439380a04b0369116c5805",
+    "deployment_contract.json": "388ae6e2aa9b1160a5ec3b904d06eeb09fa10aee37dd3d2f31e5f429f36c1a93"
+  },
+  "scope": "Offline export only; no robot connection, no actuator commands.",
+  "execution_history_source": "CJME_Push_car 1b9574d682a2acfe34eebd21654e792c781aa3f7: env.py _balance_reset_buffers; task_core.py compute_observations"
+}

@@ -1,0 +1,9 @@
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/rebuild_cache.dir
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/test_hand_dds.dir
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/edit_cache.dir
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/test.dir
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/test_control_core.dir
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/test_hand_core.dir
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/test_command_trace.dir
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/test_hand_recovery.dir
+/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/g1_control.dir

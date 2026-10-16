@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+artifacts/
+environment-linux-aarch64-explicit.txt
+/G1Deploy_BalanceHomie/reports/

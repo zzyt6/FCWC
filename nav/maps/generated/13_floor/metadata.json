@@ -1,0 +1,18 @@
+{
+  "source_pcd": "maps/13_floor.pcd",
+  "points": 278624,
+  "filtered_points": 271142,
+  "ground_points": 136343,
+  "obstacle_points": 116502,
+  "xyz_min": [-2.521720, -11.776021, -3.233879],
+  "xyz_max": [17.865738, 6.792150, 2.028554],
+  "ground_plane": [0.007644, 0.001271, 0.999970, 1.298371],
+  "ground_z_at_origin": -1.298410,
+  "obstacle_height": [0.150000, 1.800000],
+  "resolution": 0.030000,
+  "origin": [-3.030000, -12.300000],
+  "width": 714,
+  "height": 654,
+  "free_cells": 146989,
+  "occupied_cells": 52335
+}

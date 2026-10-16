@@ -1,0 +1,13 @@
+name: CWC
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - numpy>=1.24,<3
+  - opencv>=4.8,<6
+  - pyyaml>=6.0
+  - pip
+# This machine already has a locally compiled pyrealsense2 2.56.5 binding in
+# CWC. On another Jetson, install a RealSense binding built for that host's
+# glibc before running camera_viewer.py.

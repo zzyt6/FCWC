@@ -1,0 +1,46 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+../cpp/control_core.hpp
+protocol.hpp
+../cpp/protocol.hpp
+generated_config.hpp
+../cpp/generated_config.hpp
+algorithm
+-
+sstream
+-
+string
+-
+
+../cpp/protocol.hpp
+array
+-
+cstdint
+-
+cstring
+-
+cmath
+-
+
+/home/unitree/CWC/G1Deploy_BalanceHomie/tests/test_control_core.cpp
+control_core.hpp
+/home/unitree/CWC/G1Deploy_BalanceHomie/tests/control_core.hpp
+cassert
+-
+iostream
+-
+limits
+-
+
+generated_config.hpp
+array
+-
+cstdint
+-
+

@@ -1,0 +1,1 @@
+/usr/bin/c++  -O3 -DNDEBUG   CMakeFiles/test_hand_core.dir/tests/test_hand_core.cpp.o  -o test_hand_core 

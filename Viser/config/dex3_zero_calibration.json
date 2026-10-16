@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "reference_source": "/home/unitree/uinitree_fast_lio_nav2/motion_mode_trajectory/dex3_zero_calibration.json",
+  "method": "Viser offsets based on the reference calibration; right thumb_0 adjusted to +0.7 rad at user request. Applied only by the compensated open/grasp buttons.",
+  "left_raw_zero_rad": {
+    "left_hand_thumb_0_joint": 0.0,
+    "left_hand_thumb_1_joint": 0.0,
+    "left_hand_thumb_2_joint": 0.0,
+    "left_hand_middle_0_joint": 0.0,
+    "left_hand_middle_1_joint": 0.0,
+    "left_hand_index_0_joint": 0.0,
+    "left_hand_index_1_joint": 0.0
+  },
+  "right_raw_zero_rad": {
+    "right_hand_thumb_0_joint": 0.73,
+    "right_hand_thumb_1_joint": 0.0,
+    "right_hand_thumb_2_joint": 0.0,
+    "right_hand_middle_0_joint": 0.0,
+    "right_hand_middle_1_joint": 0.0,
+    "right_hand_index_0_joint": 0.0,
+    "right_hand_index_1_joint": 0.0
+  }
+}

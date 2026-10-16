@@ -1,0 +1,4 @@
+{
+    "ros.distro": "foxy",
+    "cmake.sourceDirectory": "/home/unitree/CWC/G1Deploy_BalanceHomie"
+}

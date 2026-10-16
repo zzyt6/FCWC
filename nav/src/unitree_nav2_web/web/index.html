@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>Unitree G1 · Nav2</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <button id="sidebarToggle" class="iconButton" title="收起 / 展开侧边栏" aria-label="收起或展开侧边栏">☰</button>
+    <div class="titleBlock">
+      <h1>Unitree G1 · FAST-LIO / Nav2</h1>
+      <p id="statusText">正在连接机器人…</p>
+    </div>
+    <div id="connection" class="pill offline">ROSBRIDGE 离线</div>
+  </header>
+
+  <main id="layout">
+    <aside id="sidebar">
+      <div class="sidebarScroll">
+        <ol class="steps" aria-label="执行顺序">
+          <li id="stepMap"><span>1</span><b>地图</b></li>
+          <li id="stepLoc"><span>2</span><b>定位</b></li>
+          <li id="stepLoco"><span>3</span><b>运控</b></li>
+          <li id="stepMotion"><span>4</span><b>运动门</b></li>
+          <li id="stepNav"><span>5</span><b>导航</b></li>
+        </ol>
+
+        <details class="card" open>
+          <summary><span>PCD 地图</span><em id="mapBadge" class="badge">未装载</em></summary>
+          <div class="cardBody">
+            <label class="field">已保存地图<select id="mapSelect"></select></label>
+            <div class="grid2">
+              <label class="field">分辨率 m<input id="resolution" type="number" value="0.03" min="0.02" max="0.3" step="0.005"></label>
+              <label class="field">地面 Z<input id="groundZ" value="auto"></label>
+              <label class="field">障碍下限 m<input id="minHeight" type="number" value="0.15" step="0.05"></label>
+              <label class="field">障碍上限 m<input id="maxHeight" type="number" value="1.80" step="0.10"></label>
+              <label class="field">轮廓半径 m<input id="obstacleRadius" type="number" value="0.04" min="0" max="0.4" step="0.01"></label>
+              <label class="field">地面补洞 m<input id="freeRadius" type="number" value="0.15" min="0" max="0.8" step="0.01"></label>
+            </div>
+            <button id="processMap" class="block primary">处理并装载所选 PCD</button>
+            <div id="mapStats" class="stats">尚未处理地图</div>
+          </div>
+        </details>
+
+        <details class="card" open>
+          <summary><span>定位</span><em id="locBadge" class="badge">等待地图</em></summary>
+          <div class="cardBody">
+            <div id="scanStats" class="note info">等待实时 /scan…</div>
+            <button id="initialMode" class="block" disabled>设置初始位姿</button>
+            <p class="hint">在地图上按住并拖动，青色扫描轮廓会跟随候选位置和朝向，用墙角和走廊与静态地图对齐。</p>
+          </div>
+        </details>
+
+        <details class="card locomotionCard" open>
+          <summary><span>运控（Balance / Homie）</span><em id="locoBadge" class="badge">未连接</em></summary>
+          <div class="cardBody">
+            <div id="locoStatus" class="note">等待运控执行进程…</div>
+            <div id="locoWarnings" class="note warn" role="status" hidden></div>
+            <label class="field">上半身准备姿态
+              <select id="locoPreparePose" disabled>
+                <option value="">等待运控连接</option>
+              </select>
+            </label>
+            <p id="locoPreparePoseStatus" class="hint">准备前选择；开始准备后锁定，并保持到策略运行。</p>
+            <div class="buttonGrid">
+              <button id="locoAcquire" disabled>① 接管底层</button>
+              <button id="locoPrepare" disabled>② 准备姿态</button>
+              <button id="locoPolicy" class="accent" disabled>③ 启动策略</button>
+              <button id="locoZero" disabled>速度归零</button>
+            </div>
+            <div class="buttonGrid">
+              <button id="locoStop" class="danger" disabled>阻尼停止</button>
+              <button id="locoReset" disabled>复位（只读）</button>
+            </div>
+            <p class="hint">导航速度直接交给我们自己的 Balance/Homie 策略执行（含骨盆航向外环）。接管底层后没有姿态支撑，需吊装或扶稳；实体遥控器 L2 随时可停止。</p>
+          </div>
+        </details>
+
+        <details class="card" open>
+          <summary><span>导航</span><em id="navBadge" class="badge">未就绪</em></summary>
+          <div class="cardBody">
+            <label class="field">速度模式
+              <select id="speedMode">
+                <option value="auto">自动调速</option>
+                <option value="fixed">固定巡航</option>
+              </select>
+            </label>
+            <label class="field"><span id="speedLabel">速度上限（m/s）</span>
+              <input id="speedValue" type="number" min="0.2" max="0.6" step="0.01" value="0.35">
+            </label>
+            <input id="speedSlider" type="range" min="0.2" max="0.6" step="0.01" value="0.35" aria-label="导航速度">
+            <button id="applySpeed" class="block" disabled>应用并保存速度</button>
+            <p id="speedHint" class="hint">由 Nav2 根据路径和障碍自动调速，不超过设定上限。</p>
+            <div id="speedStatus" class="note" aria-live="polite">等待速度设置状态…</div>
+            <button id="motionButton" class="block gate" disabled>启用 G1 运动安全门</button>
+            <div id="gateBlockers" class="note warn" hidden></div>
+            <button id="goalMode" class="block" disabled>设置导航目标</button>
+            <div id="navStats" class="stats"></div>
+          </div>
+        </details>
+
+        <details class="card displays">
+          <summary><span>显示图层</span></summary>
+          <div class="cardBody layerList">
+            <label><input type="checkbox" data-display="grid" checked><i class="layerDot gridDot"></i>米制网格</label>
+            <label><input type="checkbox" data-display="map" checked><i class="layerDot mapDot"></i>静态占据地图</label>
+            <label><input type="checkbox" data-display="global" checked><i class="layerDot globalDot"></i>Global Costmap</label>
+            <label><input type="checkbox" data-display="local" checked><i class="layerDot localDot"></i>Local Costmap</label>
+            <label><input type="checkbox" data-display="scan" checked><i class="layerDot scanDot"></i>实时 LaserScan</label>
+            <label><input type="checkbox" data-display="globalPath" checked><i class="layerDot pathDot"></i>全局路径</label>
+            <label><input type="checkbox" data-display="localPath" checked><i class="layerDot localPathDot"></i>Local Plan</label>
+            <label><input type="checkbox" data-display="robot" checked><i class="layerDot robotDot"></i>G1 位姿 / 朝向</label>
+            <label><input type="checkbox" data-display="radar" checked><i class="layerDot scanDot"></i>局部雷达窗</label>
+          </div>
+        </details>
+      </div>
+
+      <div class="sidebarFooter">
+        <button id="stopButton" class="block stop">停止 / 取消导航</button>
+      </div>
+    </aside>
+
+    <section class="viewer">
+      <div class="viewerToolbar">
+        <button id="panMode" class="tool active" title="拖动画面，滚轮缩放">✥ 平移</button>
+        <button id="toolbarInitial" class="tool poseTool" disabled>↗ 初始位姿</button>
+        <button id="toolbarGoal" class="tool goalTool" disabled>◎ Nav2 Goal</button>
+        <button id="focusRobot" class="tool" title="回到完整地图">⌂ 全图</button>
+      </div>
+      <canvas id="mapCanvas"></canvas>
+      <div class="legend">
+        <span><i class="static"></i>静态地图</span>
+        <span><i class="global"></i>全局代价</span>
+        <span><i class="local"></i>局部障碍</span>
+        <span><i class="scan"></i>实时雷达</span>
+        <span><i class="path"></i>规划路径</span>
+      </div>
+      <div id="modeBadge">平移 / 缩放模式</div>
+      <div class="viewerStatus">
+        <span>Fixed Frame: <b>map</b></span>
+        <span id="poseReadout">G1 Pose: --</span>
+        <span id="scanReadout">/scan: waiting</span>
+        <span id="zoomReadout">Zoom: 100%</span>
+      </div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

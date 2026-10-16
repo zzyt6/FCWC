@@ -1,0 +1,5 @@
+<library path="navigation_speed">
+  <class type="unitree_nav2_core::ApproachDWBLocalPlanner" base_class_type="nav2_core::Controller">
+    <description>DWB with a distance-based speed cap before trajectory prediction.</description>
+  </class>
+</library>

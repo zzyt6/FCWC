@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "source": "Intel RealSense factory stream intrinsics",
+  "retrieved_at_utc": "2026-10-11T13:03:07.597863+00:00",
+  "device": {
+    "name": "Intel RealSense D435I",
+    "serial_number": "342222072884",
+    "sdk_version": "2.56.5",
+    "firmware_version": "5.15.1.55",
+    "usb_type_descriptor": "3.2"
+  },
+  "stream": {
+    "type": "color",
+    "format": "BGR8",
+    "width": 640,
+    "height": 480,
+    "fps": 60,
+    "image_processing": "Native 640x480 color frames; YUYV-to-BGR conversion only; no resize, crop, alignment, or undistortion"
+  },
+  "camera_model": "pinhole",
+  "distortion_model": "distortion.inverse_brown_conrady",
+  "realsense_distortion_model": "RS2_DISTORTION_INVERSE_BROWN_CONRADY",
+  "distortion_order": [
+    "k1",
+    "k2",
+    "p1",
+    "p2",
+    "k3"
+  ],
+  "distortion_coefficients": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "camera_matrix": [
+    [
+      606.695068359375,
+      0.0,
+      323.6654968261719
+    ],
+    [
+      0.0,
+      606.1744384765625,
+      246.5123748779297
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "intrinsics": {
+    "fx_px": 606.695068359375,
+    "fy_px": 606.1744384765625,
+    "cx_px": 323.6654968261719,
+    "cy_px": 246.5123748779297
+  },
+  "coordinate_convention": "OpenCV/RealSense camera frame: x right, y down, z forward; K is in pixels.",
+  "opencv_note": "For this stream the factory coefficients are all zero, so use the zero D vector with cv2.solvePnP on raw frames at exactly this resolution."
+}

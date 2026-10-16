@@ -1,0 +1,12 @@
+{
+  "schema": "pushcart_viser_v1",
+  "models_dir": "../models",
+  "camera": {
+    "udp_port": 9870,
+    "tag_ids": [0, 1],
+    "timeout_s": 0.3,
+    "yaw_offset_rad": 0.0
+  },
+  "task_limits": [[-0.2, 0.4], [-0.1, 0.1], [-0.3, 0.3]],
+  "onnx_threads": 1
+}

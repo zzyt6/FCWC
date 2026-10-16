@@ -1,0 +1,40 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+../cpp/hand_core.hpp
+protocol.hpp
+../cpp/protocol.hpp
+algorithm
+-
+optional
+-
+stdexcept
+-
+string
+-
+
+../cpp/protocol.hpp
+array
+-
+cstdint
+-
+cstring
+-
+cmath
+-
+
+/home/unitree/CWC/G1Deploy_BalanceHomie/tests/test_hand_core.cpp
+hand_core.hpp
+/home/unitree/CWC/G1Deploy_BalanceHomie/tests/hand_core.hpp
+cassert
+-
+iostream
+-
+limits
+-
+

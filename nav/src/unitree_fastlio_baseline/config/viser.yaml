@@ -1,0 +1,20 @@
+/**:
+  ros__parameters:
+    host: "0.0.0.0"
+    port: 8080
+    cloud_topic: "/cloud_registered"
+    map_topic: "/Laser_map"
+    odom_topic: "/Odometry_base"
+    live_voxel_size: 0.10
+    live_max_points: 250000
+    current_scan_max_points: 15000
+    sensor_range: 10.0
+    update_rate_hz: 2.0
+    point_size: 0.035
+    color_mode: "height"
+    color_min_z: -1.5
+    color_max_z: 2.5
+    trajectory_min_distance: 0.02
+    pcd_path: "./maps/fastlio_map.pcd"
+    full_map_chunk_points: 50000
+    full_map_chunk_period: 0.15

@@ -1,0 +1,18 @@
+{
+  "source_pcd": "/home/unitree/CWC/nav/maps/CJME.pcd",
+  "points": 209644,
+  "filtered_points": 206618,
+  "ground_points": 115326,
+  "obstacle_points": 81361,
+  "xyz_min": [-10.484005, -13.237942, -5.829279],
+  "xyz_max": [8.883830, 9.747901, 2.457752],
+  "ground_plane": [0.011862, 0.007128, 0.999904, 1.249640],
+  "ground_z_at_origin": -1.249760,
+  "obstacle_height": [0.150000, 1.800000],
+  "resolution": 0.030000,
+  "origin": [-11.010000, -13.740000],
+  "width": 680,
+  "height": 800,
+  "free_cells": 180973,
+  "occupied_cells": 45195
+}

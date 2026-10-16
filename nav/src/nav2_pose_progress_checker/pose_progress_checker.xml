@@ -1,0 +1,8 @@
+<library path="pose_progress_checker">
+  <class type="nav2_controller::PoseProgressChecker"
+    base_class_type="nav2_core::ProgressChecker">
+    <description>
+      Counts translation or rotation as progress (official Nav2 behavior).
+    </description>
+  </class>
+</library>

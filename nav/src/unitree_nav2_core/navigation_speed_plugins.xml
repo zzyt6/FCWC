@@ -1,0 +1,8 @@
+<library path="navigation_speed">
+  <class type="unitree_nav2_core::SpeedLimitedGenerator" base_class_type="dwb_core::TrajectoryGenerator">
+    <description>Sample bounded navigation speeds before DWB trajectory checks.</description>
+  </class>
+  <class type="unitree_nav2_core::CruiseSpeedCritic" base_class_type="dwb_core::TrajectoryCritic">
+    <description>Prefer the requested cruise speed while preserving slower alternatives.</description>
+  </class>
+</library>

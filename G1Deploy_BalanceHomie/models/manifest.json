@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "profile": "hybrid_balance_homie_456_456",
+  "model_files": {
+    "balance": "models/balance/policy.onnx",
+    "homie": "models/homie/policy.onnx"
+  },
+  "model_sha256": {
+    "balance": "337a51066937b9b0ac8e72b14fd1763d232e17fcdeaacc5d06210e6e5f78349c",
+    "homie": "676765c20e3df7c838cb3d1cdf054cd0376158dab41e176949e9a4cdfd049f0c"
+  },
+  "artifact_sha256": {
+    "models/balance/deployment_contract.json": "04b64755444585c007f99515a80c12ffc8661b5bbe60f590b8fa59f47d995541",
+    "models/balance/verification_vectors.npz": "902705d4617d03689f07c3c6455e4e4bcba24e27bd3776d32c329429f10a6cc9",
+    "models/balance/manifest.json": "093b4d61bddc40c4ca72f77a54bd603d03c26889e0eac49174325b3d96655c93",
+    "models/balance/policy.onnx": "337a51066937b9b0ac8e72b14fd1763d232e17fcdeaacc5d06210e6e5f78349c",
+    "models/homie/deployment_contract.json": "388ae6e2aa9b1160a5ec3b904d06eeb09fa10aee37dd3d2f31e5f429f36c1a93",
+    "models/homie/verification_vectors.npz": "6cd12532fee58f415bc1783075eb74a01dab77e68a439380a04b0369116c5805",
+    "models/homie/training_g1.urdf": "4405422415b957c940dc46ba98a0faab4cfc402cba5db800dab0cfd5bd26029b",
+    "models/homie/policy_jit.pt": "470c8776c19e9ad70506906d605e9dc91a79c658401a2996a10ababaee5e1781",
+    "models/homie/physics_config.json": "64ee7eea5fffc81246e893244f7e5e572d9e206559e0de26336ae3b44a8ea6fd",
+    "models/homie/manifest.json": "5efa48d775a23f523a2161686677ab25fcaeabf089feae11ffb1fde75a737061",
+    "models/homie/policy.onnx": "676765c20e3df7c838cb3d1cdf054cd0376158dab41e176949e9a4cdfd049f0c",
+    "reference_adapters/balance_policy.py": "04121ad9aa707f511cf31995bc395effba9bd5fec293806db332dac91a61d7e1",
+    "reference_adapters/homie_policy.py": "cd97f27fc857d0f1e4e4aa22e8e5843ef464276a338c8ecaf5daf8ef83921c0e",
+    "models/balance/config.json": "ab69a066d23468cd9d488442c9df5a054ef3c2b4bf6c658d30d4433b691456b4"
+  },
+  "sources": {
+    "balance": "models/balance.zip",
+    "homie": "/home/unitree/CWC/G1Deploy_Homie60000"
+  },
+  "model_bytes_unchanged": true
+}

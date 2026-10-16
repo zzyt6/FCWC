@@ -1,0 +1,58 @@
+# Upper-body preparation pose 2: arms down, slightly out to the sides.
+# Angles are radians in the G1 URDF joint coordinates.
+# Elbow +90 deg points the forearm down in this model; it is not a human elbow angle.
+# Both legs use G1Deploy_BalanceHomie/config/deploy.json default_q_sdk29.
+# Waist yaw and the shared Dex3 grasp match the original preparation file.
+
+upper_body_order: [waist_yaw_joint,
+                   left_shoulder_pitch_joint, left_shoulder_roll_joint, left_shoulder_yaw_joint, left_elbow_joint,
+                   left_wrist_roll_joint, left_wrist_pitch_joint, left_wrist_yaw_joint,
+                   right_shoulder_pitch_joint, right_shoulder_roll_joint, right_shoulder_yaw_joint, right_elbow_joint,
+                   right_wrist_roll_joint, right_wrist_pitch_joint, right_wrist_yaw_joint]
+
+hold_target_q:
+  waist_yaw_joint: 0.000117
+  left_shoulder_pitch_joint: 0.0
+  left_shoulder_roll_joint: 0.35  # +10 deg
+  left_shoulder_yaw_joint: 0.0
+  left_elbow_joint: 1.22         # +90 deg
+  left_wrist_roll_joint: 0.0
+  left_wrist_pitch_joint: 0.0
+  left_wrist_yaw_joint: 0.0
+  right_shoulder_pitch_joint: 0.0
+  right_shoulder_roll_joint: -0.35  # -10 deg
+  right_shoulder_yaw_joint: 0.0
+  right_elbow_joint: 1.22            # +90 deg
+  right_wrist_roll_joint: 0.0
+  right_wrist_pitch_joint: 0.0
+  right_wrist_yaw_joint: 0.0
+
+# Reference list in upper_body_order; Viser loads the named hold_target_q above.
+hold_target_q_list: [0.000117,
+                     0.0, 0.17453292519943295, 0.0, 1.5707963267948966, 0.0, 0.0, 0.0,
+                     0.0, -0.17453292519943295, 0.0, 1.5707963267948966, 0.0, 0.0, 0.0]
+
+# Reference gains retained in the original file format. Viser's active body
+# gains come from config/balance_pd.json and config/homie_pd.json in the deployment.
+upper_kp: {waist: 300.0, shoulder_pitch: 100.0, shoulder_roll: 100.0, shoulder_yaw: 50.0, elbow: 50.0, wrist: 20.0}
+upper_kd: {waist: 3.0, shoulder_pitch: 2.0, shoulder_roll: 2.0, shoulder_yaw: 2.0, elbow: 2.0, wrist: 1.0}
+
+# Shared reference only: preparation-pose selection switches body angles.
+# Dex3 still uses deploy_upper_hold.yaml and requires its own explicit enable.
+hand_grasp:
+  left:
+    left_hand_thumb_0_joint: 0.0
+    left_hand_thumb_1_joint: 0.335606
+    left_hand_thumb_2_joint: 1.541224
+    left_hand_middle_0_joint: -1.218143
+    left_hand_middle_1_joint: -1.510416
+    left_hand_index_0_joint: -1.216925
+    left_hand_index_1_joint: -1.313455
+  right:
+    right_hand_thumb_0_joint: 0.0
+    right_hand_thumb_1_joint: -0.333515
+    right_hand_thumb_2_joint: -1.544997
+    right_hand_middle_0_joint: 1.213678
+    right_hand_middle_1_joint: 1.510667
+    right_hand_index_0_joint: 1.216925
+    right_hand_index_1_joint: 1.313455

@@ -1,0 +1,26 @@
+# The set of languages for which implicit dependencies are needed:
+set(CMAKE_DEPENDS_LANGUAGES
+  "CXX"
+  )
+# The set of files for implicit dependencies of each language:
+set(CMAKE_DEPENDS_CHECK_CXX
+  "/home/unitree/CWC/G1Deploy_BalanceHomie/cpp/dex3_type_support.cpp" "/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/g1_control.dir/cpp/dex3_type_support.cpp.o"
+  "/home/unitree/CWC/G1Deploy_BalanceHomie/cpp/g1_control.cpp" "/home/unitree/CWC/G1Deploy_BalanceHomie/build/CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o"
+  )
+set(CMAKE_CXX_COMPILER_ID "GNU")
+
+# The include file search paths:
+set(CMAKE_CXX_TARGET_INCLUDE_PATH
+  "../cpp"
+  "."
+  "../vendor/unitree_sdk2/include"
+  "../vendor/unitree_sdk2/thirdparty/include"
+  "../vendor/unitree_sdk2/thirdparty/include/ddscxx"
+  )
+
+# Targets to which this target links.
+set(CMAKE_TARGET_LINKED_INFO_FILES
+  )
+
+# Fortran module output directory.
+set(CMAKE_Fortran_TARGET_MODULE_DIR "")
