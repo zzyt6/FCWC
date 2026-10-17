@@ -63,13 +63,20 @@ class ExecutorTests(unittest.TestCase):
         self.status.close()
 
     def tick(self, velocity=None, *, enabled=True, reason=None, stamp=None):
+        # Model the web link continuously consuming status; otherwise a long
+        # synthetic run fills the kernel UDP queue and drops the newest report.
+        while True:
+            try:
+                self.status.recv(65535)
+            except BlockingIOError:
+                break
         if velocity is not None:
             self.sequence += 1
             reason = (COMMAND if enabled else GATE_CLOSED) if reason is None else reason
             stamp = self.now if stamp is None else stamp
             packet = VELOCITY_PACKET.pack(
                 VELOCITY_MAGIC, VELOCITY_VERSION, int(enabled), reason, self.sequence,
-                *velocity, round(stamp*1e9))
+                *velocity, self.executor.navigation_epoch, round(stamp*1e9))
             self.sender.sendto(packet, ('127.0.0.1', self.port))
         self.executor.step()
         self.now += .02

@@ -53,8 +53,8 @@ bt_navigator:
   ros__parameters:
     use_sim_time: false
     global_frame: map
-    robot_base_frame: base_nav
-    odom_topic: /Odometry_base
+    robot_base_frame: nav_control
+    odom_topic: /Odometry_navigation
     enable_groot_monitoring: false
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
@@ -89,13 +89,13 @@ controller_server:
   ros__parameters:
     use_sim_time: false
     controller_frequency: 15.0
-    odom_topic: /Odometry_base
+    odom_topic: /Odometry_navigation
     min_x_velocity_threshold: 0.01
     min_y_velocity_threshold: 0.01
     min_theta_velocity_threshold: 0.01
     progress_checker_plugin: "progress_checker"
     goal_checker_plugin: "goal_checker"
-    controller_plugins: ["FollowPath"]
+    controller_plugins: ["FollowPath", "CartPush"]
     progress_checker:
       plugin: "nav2_controller::PoseProgressChecker"
       required_movement_radius: 0.20
@@ -164,6 +164,56 @@ controller_server:
       RotateToGoal.slowing_factor: 5.0
       RotateToGoal.lookahead_time: -1.0
 
+    # Cart-frame velocities enter the existing high-level push policy. The
+    # launch file reads the actual axis limits from pushcart_navigation.json.
+    CartPush:
+      plugin: "unitree_nav2_core::ApproachDWBLocalPlanner"
+      trajectory_generator_name: "unitree_nav2_core::SpeedLimitedGenerator"
+      navigation_speed_mode: "auto"
+      navigation_speed: 0.35
+      approach_distance: 0.80
+      approach_speed: 0.10
+      min_vel_x: -0.20
+      max_vel_x: 0.60
+      min_vel_y: -0.15
+      max_vel_y: 0.15
+      max_vel_theta: 0.30
+      min_speed_xy: 0.0
+      max_speed_xy: 0.62
+      min_speed_theta: 0.0
+      acc_lim_x: 0.30
+      acc_lim_y: 0.20
+      acc_lim_theta: 0.40
+      decel_lim_x: -0.30
+      decel_lim_y: -0.20
+      decel_lim_theta: -0.40
+      vx_samples: 15
+      vy_samples: 11
+      vtheta_samples: 17
+      sim_time: 1.5
+      linear_granularity: 0.04
+      angular_granularity: 0.025
+      transform_tolerance: 0.30
+      xy_goal_tolerance: 0.15
+      trans_stopped_velocity: 0.05
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+      critics: ["ObstacleFootprint", "RotateToGoal", "Oscillation", "PathDist", "GoalDist", "CartLookahead", "CruiseSpeed"]
+      ObstacleFootprint.scale: 1.0
+      RotateToGoal.scale: 28.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+      PathDist.scale: 24.0
+      GoalDist.scale: 18.0
+      CartLookahead.class: "unitree_nav2_core::CartLookaheadCritic"
+      CartLookahead.scale: 12.0
+      CartLookahead.lookahead_base: 0.40
+      CartLookahead.lookahead_gain: 0.60
+      CartLookahead.lookahead_max: 1.00
+      CartLookahead.heading_weight: 0.40
+      CruiseSpeed.class: "unitree_nav2_core::CruiseSpeedCritic"
+      CruiseSpeed.scale: 18.0
+
 local_costmap:
   local_costmap:
     ros__parameters:
@@ -171,7 +221,7 @@ local_costmap:
       update_frequency: 8.0
       publish_frequency: 8.0
       global_frame: odom
-      robot_base_frame: base_nav
+      robot_base_frame: nav_control
       rolling_window: true
       width: 8
       height: 8
@@ -181,6 +231,8 @@ local_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
+        # Self returns are filtered upstream; preserve nearby external obstacles.
+        footprint_clearing_enabled: false
         observation_sources: scan
         scan:
           topic: /scan
@@ -209,7 +261,7 @@ global_costmap:
       update_frequency: 2.0
       publish_frequency: 1.0
       global_frame: map
-      robot_base_frame: base_nav
+      robot_base_frame: nav_control
       resolution: 0.05
       footprint: "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
       track_unknown_space: true
@@ -223,6 +275,8 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
+        # Self returns are filtered upstream; preserve nearby external obstacles.
+        footprint_clearing_enabled: false
         observation_sources: scan
         scan:
           topic: /scan
@@ -271,7 +325,7 @@ recoveries_server:
     wait:
       plugin: "nav2_recoveries/Wait"
     global_frame: odom
-    robot_base_frame: base_nav
+    robot_base_frame: nav_control
     transform_timeout: 0.20
     simulate_ahead_time: 1.5
     max_rotational_vel: 0.40

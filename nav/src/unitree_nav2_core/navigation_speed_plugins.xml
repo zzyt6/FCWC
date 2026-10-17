@@ -1,4 +1,7 @@
 <library path="navigation_speed">
+  <class type="unitree_nav2_core::CartLookaheadCritic" base_class_type="dwb_core::TrajectoryCritic">
+    <description>Cart tangent and adaptive lookahead tracking with lateral commands.</description>
+  </class>
   <class type="unitree_nav2_core::SpeedLimitedGenerator" base_class_type="dwb_core::TrajectoryGenerator">
     <description>Sample bounded navigation speeds before DWB trajectory checks.</description>
   </class>

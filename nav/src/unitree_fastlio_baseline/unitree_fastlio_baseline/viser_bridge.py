@@ -128,6 +128,8 @@ class ViserBridge(Node):
         self._full_handles: List[object] = []
         self._clear_full_requested = False
         self._full_load_in_progress = False
+        self._display_generation = 0
+        self._operation_error = ""
         self._next_full_chunk_time = 0.0
 
         self._server = viser.ViserServer(
@@ -198,6 +200,7 @@ class ViserBridge(Node):
             with self._lock:
                 self.color_mode = str(self._color_dropdown.value)
                 self._map_dirty = True
+                self._restart_full_display()
 
         @self._point_size_slider.on_update
         def _on_point_size_change(_) -> None:
@@ -205,6 +208,7 @@ class ViserBridge(Node):
                 self.point_size = float(self._point_size_slider.value)
                 self._map_dirty = True
                 self._scan_dirty = True
+                self._restart_full_display()
 
         @self._full_button.on_click
         def _on_full_map(_) -> None:
@@ -212,14 +216,7 @@ class ViserBridge(Node):
 
         @self._live_button.on_click
         def _on_live_map(_) -> None:
-            with self._lock:
-                self._full_mode = False
-                self._full_points = None
-                self._full_intensity = None
-                self._full_index = 0
-                self._clear_full_requested = True
-                self._map_dirty = True
-                self._status_message = "已返回实时地图模式"
+            self._return_live()
 
         sensor_qos = QoSProfile(
             depth=2,
@@ -391,54 +388,81 @@ class ViserBridge(Node):
         blue = np.clip(1.5 - np.abs(4.0 * value - 1.0), 0.0, 1.0)
         return (np.column_stack((red, green, blue)) * 255.0).astype(np.uint8)
 
-    def _request_save_and_load(self) -> None:
-        if self._full_load_in_progress:
-            return
-        if not self._map_save_client.service_is_ready():
-            self._status_message = "FAST-LIO /map_save 服务尚未就绪"
-            self.get_logger().warning(self._status_message)
-            return
-        self._full_load_in_progress = True
-        self._status_message = "正在请求 FAST-LIO 保存完整 PCD……"
-        future = self._map_save_client.call_async(Trigger.Request())
-        future.add_done_callback(self._save_finished)
+    def _restart_full_display(self) -> None:
+        # Called while holding _lock after changing color/size.
+        if self._full_mode:
+            self._full_index = 0
+            self._clear_full_requested = True
+            self._next_full_chunk_time = 0.0
 
-    def _save_finished(self, future) -> None:
+    def _return_live(self) -> None:
+        with self._lock:
+            self._display_generation += 1
+            self._full_mode = False
+            self._full_points = self._full_intensity = None
+            self._full_index = 0
+            self._clear_full_requested = True
+            self._map_dirty = True
+            self._operation_error = ""
+            self._status_message = "已返回实时地图模式；已提交的保存请求仍会完成"
+
+    def _request_save_and_load(self) -> None:
+        with self._lock:
+            if self._full_load_in_progress:
+                return
+            if not self._map_save_client.service_is_ready():
+                self._operation_error = "FAST-LIO /map_save 服务尚未就绪"
+                return
+            self._display_generation += 1
+            generation = self._display_generation
+            self._full_load_in_progress = True
+            self._operation_error = ""
+            self._status_message = "正在请求 FAST-LIO 保存完整 PCD……"
+        try:
+            future = self._map_save_client.call_async(Trigger.Request())
+            future.add_done_callback(lambda done: self._save_finished(done, generation))
+        except Exception as exc:
+            self._save_failed(generation, "地图保存调用失败：{}".format(exc))
+
+    def _save_failed(self, generation, message) -> None:
+        with self._lock:
+            self._full_load_in_progress = False
+            if generation == self._display_generation:
+                self._operation_error = message
+        self.get_logger().error(message)
+
+    def _save_finished(self, future, generation) -> None:
         try:
             response = future.result()
-        except Exception as exc:  # pylint: disable=broad-except
-            self._full_load_in_progress = False
-            self._status_message = "地图保存调用失败：{}".format(exc)
-            self.get_logger().error(self._status_message)
-            return
-        if not response.success:
-            self._full_load_in_progress = False
-            self._status_message = "FAST-LIO 保存失败：{}".format(response.message)
-            self.get_logger().error(self._status_message)
-            return
-        self._status_message = "PCD 已保存，正在读取完整地图……"
-        threading.Thread(target=self._load_pcd_worker, daemon=True).start()
-
-    def _load_pcd_worker(self) -> None:
-        try:
-            points, intensity = self._read_pcd(self.pcd_path)
-        except (OSError, ValueError) as exc:
-            with self._lock:
-                self._full_load_in_progress = False
-                self._status_message = "读取 PCD 失败：{}".format(exc)
-            self.get_logger().error(self._status_message)
+            if not response.success:
+                raise ValueError(response.message)
+        except Exception as exc:
+            self._save_failed(generation, "地图保存失败：{}".format(exc))
             return
         with self._lock:
+            if generation != self._display_generation or self._destroyed:
+                self._full_load_in_progress = False
+                return
+            self._status_message = "PCD 已保存，正在读取完整地图……"
+        threading.Thread(target=self._load_pcd_worker, args=(generation,), daemon=True).start()
+
+    def _load_pcd_worker(self, generation) -> None:
+        try:
+            points, intensity = self._read_pcd(self.pcd_path)
+        except Exception as exc:
+            self._save_failed(generation, "读取 PCD 失败：{}".format(exc))
+            return
+        with self._lock:
+            self._full_load_in_progress = False
+            if generation != self._display_generation or self._destroyed:
+                return
             self._full_points = points
             self._full_intensity = intensity
             self._full_index = 0
             self._full_mode = True
             self._clear_full_requested = True
-            self._full_load_in_progress = False
             self._next_full_chunk_time = 0.0
-            self._status_message = "开始按块显示完整 PCD（{:,} 点）".format(
-                points.shape[0]
-            )
+            self._status_message = "开始按块显示完整 PCD（{:,} 点）".format(points.shape[0])
 
     @staticmethod
     def _read_pcd(path: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -534,6 +558,7 @@ class ViserBridge(Node):
             color_mode = self.color_mode
             status_message = self._status_message
             full_load_in_progress = self._full_load_in_progress
+            operation_error = self._operation_error
             map_messages = self._map_messages
             scan_messages = self._scan_messages
             odom_messages = self._odom_messages
@@ -545,6 +570,8 @@ class ViserBridge(Node):
             full_total = 0 if self._full_points is None else self._full_points.shape[0]
             full_index = self._full_index
 
+        self._full_button.disabled = full_load_in_progress
+        self._live_button.disabled = not (full_mode or full_load_in_progress)
         if clear_full:
             for handle in self._full_handles:
                 handle.remove()
@@ -618,14 +645,16 @@ class ViserBridge(Node):
             if full_mode
             else "实时全局预览 {:,} 点".format(live_count)
         )
-        if full_mode:
+        if operation_error:
+            display_status = operation_error
+        elif full_load_in_progress:
+            display_status = status_message
+        elif full_mode:
             display_status = (
                 "正在渐进加载完整 PCD"
                 if full_index < full_total
                 else "完整 PCD 已全部显示"
             )
-        elif full_load_in_progress:
-            display_status = status_message
         else:
             scan_age = float("inf") if last_scan_time is None else now - last_scan_time
             odom_age = float("inf") if last_odom_time is None else now - last_odom_time

@@ -1,4 +1,5 @@
 import os
+import json
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
@@ -13,6 +14,9 @@ def generate_launch_description():
     share = get_package_share_directory("unitree_nav2_web")
     core_prefix = get_package_prefix("unitree_nav2_core")
     root = os.getcwd()
+    cart_config = os.path.join(root, "config", "pushcart_navigation.json")
+    with open(cart_config) as stream:
+        cart_limits = json.load(stream)["task_limits"]
     bt_xml = os.path.join(
         get_package_share_directory("nav2_bt_navigator"),
         "behavior_trees",
@@ -47,7 +51,11 @@ def generate_launch_description():
             executable="controller_server",
             name="controller_server",
             output="screen",
-            parameters=[nav2_params],
+            parameters=[nav2_params, {
+                "CartPush.min_vel_x": cart_limits[0][0], "CartPush.max_vel_x": cart_limits[0][1],
+                "CartPush.min_vel_y": cart_limits[1][0], "CartPush.max_vel_y": cart_limits[1][1],
+                "CartPush.max_vel_theta": max(abs(v) for v in cart_limits[2]),
+            }],
         ),
         Node(
             package="nav2_planner",
@@ -165,6 +173,7 @@ def generate_launch_description():
                     "--heading-mode", heading_mode,
                     "--command-port", command_port,
                     "--status-port", status_port,
+                    "--cart-config", cart_config,
                 ],
                 name="g1_locomotion_executor",
                 output="screen",
@@ -199,6 +208,10 @@ def generate_launch_description():
                         "max_vx": 0.60,
                         "max_vy": 0.20,
                         "max_vyaw": 0.50,
+                        "cart_min_vx": cart_limits[0][0],
+                        "cart_max_vx": cart_limits[0][1],
+                        "cart_max_vy": max(abs(v) for v in cart_limits[1]),
+                        "cart_max_vyaw": max(abs(v) for v in cart_limits[2]),
                         "command_timeout": 0.25,
                         # The web bridge renews motion authorization every
                         # 0.5 s.  Losing its lease closes the UDP gate even if
@@ -208,11 +221,18 @@ def generate_launch_description():
                 ],
             ),
             Node(
+                package="unitree_nav2_web",
+                executable="cart_navigation",
+                name="cart_navigation",
+                output="screen",
+                parameters=[{"config_file": cart_config}],
+            ),
+            Node(
                 package="fast_lio",
                 executable="fastlio_mapping",
                 name="laser_mapping",
                 output="screen",
-                parameters=[fastlio_config],
+                parameters=[fastlio_config, {"common.lid_topic": "/navigation/lidar"}],
             ),
             Node(
                 package="unitree_nav2_core",
@@ -246,7 +266,7 @@ def generate_launch_description():
                 executable="pointcloud_to_laserscan_node",
                 name="pointcloud_to_laserscan",
                 output="screen",
-                remappings=[("cloud_in", "/cloud_obstacles"), ("scan", "/scan")],
+                remappings=[("cloud_in", "/cloud_obstacles"), ("scan", "/scan_unmasked")],
                 parameters=[
                     {
                         "target_frame": "base_nav",
@@ -272,7 +292,7 @@ def generate_launch_description():
                 output="screen",
                 remappings=[
                     ("cloud_in", "/cloud_obstacles"),
-                    ("scan", "/scan_localization"),
+                    ("scan", "/scan_localization_unmasked"),
                 ],
                 parameters=[
                     {
@@ -327,6 +347,7 @@ def generate_launch_description():
                             get_package_prefix("nav2_amcl"), "lib", "nav2_amcl", "amcl"
                         ),
                         "nav2_params_file": nav2_params,
+                        "cart_bt_xml": os.path.join(share, "behavior_trees", "cart_push.xml"),
                         "speed_settings_file": LaunchConfiguration("speed_settings_file"),
                         "footprint": footprint,
                         "locomotion_command_port": ParameterValue(

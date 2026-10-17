@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import threading
 import time
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 from PIL import Image
@@ -31,7 +31,7 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformListener
 
-from unitree_nav2_web.locomotion import LocomotionLink
+from unitree_nav2_web.locomotion import LocomotionLink, CART_ACTIONS
 from unitree_nav2_web.navigation_speed import NavigationSpeedSettings
 
 FOOTPRINT = "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
@@ -62,6 +62,7 @@ class NavigationWebBridge(Node):
         self.declare_parameter("amcl_executable", "/opt/ros/foxy/lib/nav2_amcl/amcl")
         self.declare_parameter("nav2_params_file", "")
         self.declare_parameter("footprint", FOOTPRINT)
+        self.declare_parameter("cart_bt_xml", "")
         self.declare_parameter("locomotion_command_port", 39002)
         self.declare_parameter("locomotion_status_port", 39005)
         self.declare_parameter(
@@ -77,6 +78,9 @@ class NavigationWebBridge(Node):
         self.amcl_executable = self.get_parameter("amcl_executable").value
         self.nav2_params_file = self.get_parameter("nav2_params_file").value
         self.footprint = str(self.get_parameter("footprint").value)
+        self.cart_bt_xml = self.get_parameter("cart_bt_xml").value
+        self.navigation_reference = {}
+        self.reference_received = -float('inf')
         self.generated_maps_dir.mkdir(parents=True, exist_ok=True)
 
         self.lock = threading.RLock()
@@ -232,6 +236,7 @@ class NavigationWebBridge(Node):
             sensor_qos,
         )
         self.create_subscription(Bool, "/g1/motion_enabled", self._motion_callback, latched)
+        self.create_subscription(String, "/g1/navigation_reference", self._reference_callback, latched)
         self.create_subscription(
             NavigationPath,
             "/plan",
@@ -297,6 +302,40 @@ class NavigationWebBridge(Node):
             return [f"运控已{stage_text}，请先复位运控"]
         return [f"运控尚未进入策略运行：{stage_text}"]
 
+    def _reference_blockers(self, locomotion):
+        reference = self.navigation_reference
+        epoch = (locomotion.get('cart') or {}).get('epoch')
+        if (not 0 <= time.monotonic()-self.reference_received <= .5
+                or not reference.get('ready') or epoch != reference.get('epoch')):
+            return [reference.get('reason') or '导航参考点或车体过滤尚未就绪']
+        return []
+
+    def _reference_callback(self, message):
+        try:
+            reference = json.loads(message.data)
+            stamp = float(reference['sent_monotonic'])
+            if not 0 <= time.monotonic()-stamp <= .3 or stamp <= self.reference_received:
+                return
+        except (ValueError, KeyError, TypeError):
+            return
+        with self.lock:
+            changed = reference.get('epoch') != self.navigation_reference.get('epoch')
+            self.navigation_reference, self.reference_received = reference, stamp
+            if changed:
+                self.footprint_confirmed = False
+            close = (changed or not reference.get('ready')) and (self.motion_enabled or self.motion_requested)
+        if close:
+            self._set_motion(False)
+
+    def _cart_map_pose(self, cart):
+        if not cart.get('valid') or not self.current_pose:
+            return None
+        base = self.current_pose
+        x, y = cart['position'][:2]
+        c, s = math.cos(base['yaw']), math.sin(base['yaw'])
+        return dict(x=base['x']+c*x-s*y, y=base['y']+s*x+c*y,
+                    yaw=base['yaw']+cart['yaw'], position_source=cart.get('position_source'))
+
     def status(self):
         now = time.monotonic()
         locomotion = self.locomotion.snapshot()
@@ -323,6 +362,7 @@ class NavigationWebBridge(Node):
             if self.navigation_active:
                 gate_blockers.append("导航任务正在执行")
             gate_blockers.extend(self._locomotion_blockers(locomotion))
+            gate_blockers.extend(self._reference_blockers(locomotion))
             speed = self.navigation_speed.snapshot()
             if not speed["ready"] or speed["pending"]:
                 gate_blockers.append("导航速度设置尚未确认")
@@ -359,6 +399,9 @@ class NavigationWebBridge(Node):
                     "blockers": gate_blockers,
                 },
                 "locomotion": locomotion,
+                "sent_monotonic": now,
+                "navigation_reference": self.navigation_reference,
+                "cart_pose": self._cart_map_pose(locomotion.get('cart') or {}),
                 "navigation_active": self.navigation_active,
                 "navigation_distance": self.navigation_distance,
                 "navigation_speed": speed,
@@ -1237,6 +1280,10 @@ class NavigationWebBridge(Node):
         with self.lock:
             if self.footprint_confirmed:
                 return
+            reference = dict(self.navigation_reference)
+            if not reference.get('ready') or not reference.get('footprint'):
+                raise ValueError('导航轮廓尚未就绪')
+            footprint = json.dumps(reference['footprint'])
         deadline = time.monotonic() + timeout
         for name, client in (
             ("local_costmap", self.local_costmap_parameter_client),
@@ -1245,8 +1292,10 @@ class NavigationWebBridge(Node):
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 raise ValueError("等待两张 costmap footprint 确认超时")
-            self._set_costmap_footprint(name, client, self.footprint, remaining)
+            self._set_costmap_footprint(name, client, footprint, remaining)
         with self.lock:
+            if reference['epoch'] != self.navigation_reference.get('epoch'):
+                raise ValueError('导航模式已改变，请等待新轮廓就绪')
             self.footprint_confirmed = True
 
     def _motion_callback(self, message):
@@ -1320,6 +1369,7 @@ class NavigationWebBridge(Node):
             if self.amcl_process is None or self.amcl_process.poll() is not None:
                 raise ValueError("AMCL 定位进程未运行，不能启用运动安全门")
         blockers = self._locomotion_blockers(self.locomotion.snapshot())
+        blockers.extend(self._reference_blockers(self.locomotion.snapshot()))
         if blockers:
             raise ValueError("；".join(blockers))
 
@@ -1365,6 +1415,8 @@ class NavigationWebBridge(Node):
         status = self.locomotion.snapshot()
         if not status["online"]:
             raise ValueError("自研运控执行进程未连接（nav/locomotion）")
+        if kind == 'reset' and not status['actions'].get(kind):
+            raise ValueError('只有阻尼停止或故障后才能复位运控')
         if kind in ("zero", "stop", "reset"):
             # Leaving the running policy always closes navigation first.
             with self.lock:
@@ -1375,6 +1427,24 @@ class NavigationWebBridge(Node):
                 self._set_motion(False)
         elif not status["actions"].get(kind):
             raise ValueError(f"运控当前状态（{status['stage_text']}）不允许该操作")
+        if kind in CART_ACTIONS:
+            with self.lock:
+                if self.navigation_active:
+                    raise ValueError('请先停止导航并等待速度归零，再操作推车或抓握')
+            payload = {}
+            if kind == 'hand_edit':
+                payload = dict(joint=int(query.get('joint', [''])[0]), angle_rad=float(query.get('angle_rad', [''])[0]))
+                if not 0 <= payload['joint'] < 14 or not math.isfinite(payload['angle_rad']):
+                    raise ValueError('无效的抓握关节或角度')
+            elif kind == 'hand_compensation':
+                value = query.get('enabled', [''])[0].lower()
+                if value not in ('true', 'false'):
+                    raise ValueError('请明确选择启用或关闭抓握补偿')
+                payload = dict(enabled=value == 'true')
+            self._set_motion(False)
+            request_id = self.locomotion.request(kind, **payload)
+            self._publish_status()
+            return {'action': kind, 'request_id': request_id}
         if kind == "prepare_pose":
             pose = str(query.get("pose", [""])[0])
             if pose not in {item["value"] for item in status.get("prepare_pose_options", [])}:
@@ -1400,6 +1470,9 @@ class NavigationWebBridge(Node):
             if self.amcl_process is None or self.amcl_process.poll() is not None:
                 raise ValueError("AMCL 定位进程未运行，拒绝导航目标")
         locomotion = self.locomotion.snapshot()
+        blockers = self._reference_blockers(locomotion)
+        if blockers:
+            raise ValueError('；'.join(blockers))
         if not locomotion["ready"]:
             raise ValueError("自研运控未处于策略运行，拒绝导航目标")
         if locomotion.get("decelerating"):
@@ -1436,13 +1509,16 @@ class NavigationWebBridge(Node):
         pose.pose.orientation.w = math.cos(yaw * 0.5)
         goal = NavigateToPose.Goal()
         goal.pose = pose
-
         with self.lock:
             # Map, localization, sensor freshness or the independent motion
             # gate may have changed while waiting for the action server.
             # Keep the outer RLock through the state commit so a concurrent
             # stop/map request cannot slip between this check and ACTIVE.
             self._validate_navigation_start()
+            if self.navigation_reference.get('mode') == 'cart':
+                if not self.cart_bt_xml:
+                    raise ValueError('推车导航行为树未配置')
+                goal.behavior_tree = self.cart_bt_xml
 
             # Commit the guarded navigation state before sending the
             # asynchronous action request. Foxy can complete the goal-
@@ -1898,6 +1974,8 @@ class NavigationWebBridge(Node):
     def _status_timer(self):
         now = time.monotonic()
         locomotion = self.locomotion.snapshot()
+        if self._reference_blockers(locomotion) and (self.motion_enabled or self.motion_requested):
+            self._set_motion(False)
         with self.lock:
             sensor_lost = self.motion_enabled and (
                 now - self.last_cloud_time >= 1.5
@@ -2036,7 +2114,7 @@ class NavigationWebBridge(Node):
                 self.wfile.write(path.read_bytes())
 
             def do_GET(self):
-                parsed = urlparse(unquote(self.path))
+                parsed = urlparse(self.path)
                 query = parse_qs(parsed.query)
                 try:
                     if parsed.path == "/api/status":

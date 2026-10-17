@@ -13,6 +13,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/u_int32.hpp>
 
 #include "unitree_g1_kinematics/velocity_packet.hpp"
 
@@ -29,6 +30,20 @@ public:
     declare_parameter<double>("max_vyaw", 0.50);
     declare_parameter<double>("command_timeout", 0.25);
     declare_parameter<double>("motion_enable_timeout", 1.50);
+    declare_parameter<bool>("require_navigation_reference", true);
+    declare_parameter<double>("cart_min_vx", -0.2);
+    declare_parameter<double>("cart_max_vx", 0.6);
+    declare_parameter<double>("cart_max_vy", 0.15);
+    declare_parameter<double>("cart_max_vyaw", 0.3);
+    require_reference_ = get_parameter("require_navigation_reference").as_bool();
+    cart_min_vx_ = get_parameter("cart_min_vx").as_double();
+    cart_max_vx_ = get_parameter("cart_max_vx").as_double();
+    cart_max_vy_ = get_parameter("cart_max_vy").as_double();
+    cart_max_vyaw_ = get_parameter("cart_max_vyaw").as_double();
+    if (!std::isfinite(cart_min_vx_) || !std::isfinite(cart_max_vx_) ||
+      !std::isfinite(cart_max_vy_) || !std::isfinite(cart_max_vyaw_) ||
+      cart_min_vx_ >= 0.0 || cart_max_vx_ <= 0.0 || cart_max_vy_ <= 0.0 || cart_max_vyaw_ <= 0.0)
+      throw std::runtime_error("Invalid cart velocity limits");
     max_vx_ = get_parameter("max_vx").as_double();
     max_vy_ = get_parameter("max_vy").as_double();
     max_vyaw_ = get_parameter("max_vyaw").as_double();
@@ -49,13 +64,34 @@ public:
 
     enabled_status_publisher_ = create_publisher<std_msgs::msg::Bool>(
       "/g1/motion_enabled", rclcpp::QoS(1).transient_local().reliable());
+    epoch_subscription_ = create_subscription<std_msgs::msg::UInt32>(
+      "/g1/navigation_epoch", rclcpp::QoS(1).transient_local().reliable(),
+      [this](const std_msgs::msg::UInt32::SharedPtr message) {
+        if (message->data != reference_epoch_) {
+          reference_epoch_ = message->data;
+          enabled_ = command_received_ = false;
+          sendPacket(false, 0.0F, 0.0F, 0.0F);
+          publishEnabled();
+        }
+      });
+    reference_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/g1/navigation_reference_ready", rclcpp::QoS(1).transient_local().reliable(),
+      [this](const std_msgs::msg::Bool::SharedPtr message) {
+        reference_ready_ = message->data;
+        last_reference_ = std::chrono::steady_clock::now();
+        if (!reference_ready_ && require_reference_) {
+          enabled_ = command_received_ = false;
+          sendPacket(false, 0.0F, 0.0F, 0.0F);
+          publishEnabled();
+        }
+      });
     enable_subscription_ = create_subscription<std_msgs::msg::Bool>(
       "/g1/motion_enable", rclcpp::QoS(1).transient_local().reliable(),
       [this](const std_msgs::msg::Bool::SharedPtr message) {
         last_enable_command_ = std::chrono::steady_clock::now();
         enable_command_received_ = true;
         const bool changed = enabled_ != message->data;
-        enabled_ = message->data;
+        enabled_ = message->data && referenceFresh();
         if (changed || !enabled_)
         {
           command_received_ = false;
@@ -93,6 +129,12 @@ public:
   }
 
 private:
+  bool referenceFresh() const
+  {
+    return !require_reference_ || (reference_epoch_ != 0 && reference_ready_ &&
+      std::chrono::duration<double>(std::chrono::steady_clock::now()-last_reference_).count() <= 0.3);
+  }
+
   static float clamp(double value, double limit)
   {
     if (!std::isfinite(value)) return 0.0F;
@@ -117,6 +159,7 @@ private:
     packet.vx = vx;
     packet.vy = vy;
     packet.vyaw = vyaw;
+    packet.navigation_epoch = reference_epoch_;
     const auto stamp = command_received_ ? last_command_ : std::chrono::steady_clock::now();
     packet.command_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       stamp.time_since_epoch()).count();
@@ -131,7 +174,7 @@ private:
     const bool authorization_fresh = enable_command_received_ &&
       std::chrono::duration<double>(now - last_enable_command_).count() <=
       motion_enable_timeout_;
-    if (enabled_ && !authorization_fresh)
+    if (enabled_ && (!authorization_fresh || !referenceFresh()))
     {
       enabled_ = false;
       publishEnabled();
@@ -153,11 +196,13 @@ private:
           get_logger(), *get_clock(), 3000, "cmd_vel timed out; G1 stop command is active.");
       return;
     }
+    const bool cart = (reference_epoch_ & 1U) != 0;
+    const double vx = std::isfinite(command_.linear.x) ? command_.linear.x : 0.0;
     sendPacket(
       true,
-      clamp(command_.linear.x, max_vx_),
-      clamp(command_.linear.y, max_vy_),
-      clamp(command_.angular.z, max_vyaw_));
+      cart ? static_cast<float>(std::max(cart_min_vx_, std::min(cart_max_vx_, vx))) : clamp(vx, max_vx_),
+      clamp(command_.linear.y, cart ? cart_max_vy_ : max_vy_),
+      clamp(command_.angular.z, cart ? cart_max_vyaw_ : max_vyaw_));
   }
 
   int socket_ = -1;
@@ -166,6 +211,11 @@ private:
   bool enabled_ = false;
   bool enable_command_received_ = false;
   bool command_received_ = false;
+  bool require_reference_ = true;
+  bool reference_ready_ = false;
+  std::uint32_t reference_epoch_ = 0;
+  double cart_min_vx_ = -0.2, cart_max_vx_ = 0.6, cart_max_vy_ = 0.15, cart_max_vyaw_ = 0.3;
+  std::chrono::steady_clock::time_point last_reference_;
   double max_vx_ = 0.35;
   double max_vy_ = 0.20;
   double max_vyaw_ = 0.50;
@@ -178,6 +228,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr enabled_status_publisher_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_subscription_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_subscription_;
+  rclcpp::Subscription<std_msgs::msg::UInt32>::SharedPtr epoch_subscription_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr reference_subscription_;
 };
 
 int main(int argc, char **argv)

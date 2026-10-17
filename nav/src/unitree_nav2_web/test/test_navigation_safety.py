@@ -76,6 +76,7 @@ class _Locomotion:
             "stage": stage,
             "stage_text": stage,
             "healthy": True,
+            "cart": {"epoch": 2},
         }
         self.value["actions"] = locomotion_actions(self.value)
         self.requests = []
@@ -94,6 +95,7 @@ class _Harness:
     _abort_navigation_for_motion_gate = (
         NavigationWebBridge._abort_navigation_for_motion_gate
     )
+    _reference_blockers = NavigationWebBridge._reference_blockers
     _locomotion_blockers = NavigationWebBridge._locomotion_blockers
     _status_timer = NavigationWebBridge._status_timer
     _validate_navigation_start = NavigationWebBridge._validate_navigation_start
@@ -102,6 +104,8 @@ class _Harness:
 
     def __init__(self, locomotion=None):
         now = time.monotonic()
+        self.navigation_reference = {"ready": True, "epoch": 2}
+        self.reference_received = now
         self.lock = threading.RLock()
         self.logger = _Logger()
         self.locomotion = locomotion or _Locomotion()
@@ -597,7 +601,7 @@ def test_preparation_selection_requires_executor_permission_and_known_pose():
 def test_nav2_parameters_keep_acceleration_bounds_and_allow_web_speed_range():
     params = yaml.safe_load((PACKAGE / "config" / "nav2_foxy_g1.yaml").read_text())
     controller = params["controller_server"]["ros__parameters"]
-    assert controller["controller_plugins"] == ["FollowPath"]
+    assert controller["controller_plugins"] == ["FollowPath", "CartPush"]
     follow = controller["FollowPath"]
     # DWB prediction keeps its existing bounds; locomotion uses a 0.4 s filter.
     assert follow["acc_lim_x"] <= 0.3 and follow["acc_lim_y"] <= 0.2
@@ -612,3 +616,28 @@ def test_nav2_parameters_keep_acceleration_bounds_and_allow_web_speed_range():
     assert follow["approach_distance"] == 0.6 and follow["approach_speed"] == 0.1
     planner = params["planner_server"]["ros__parameters"]
     assert planner["planner_plugins"] == ["GridBased"]
+
+
+@pytest.mark.parametrize('failure', ['epoch', 'stale', 'unready'])
+def test_cart_reference_must_match_executor_before_opening_gate(failure):
+    harness = _Harness()
+    harness.navigation_active = False
+    if failure == 'epoch':
+        harness.navigation_reference['epoch'] += 2
+    elif failure == 'stale':
+        harness.reference_received -= 1.
+    else:
+        harness.navigation_reference['ready'] = False
+    with pytest.raises(ValueError, match='导航参考点'):
+        harness._validate_motion_enable()
+
+
+def test_cart_mode_change_closes_gate_and_invalidates_footprint_confirmation():
+    harness = _Harness()
+    harness._set_motion = NavigationWebBridge._set_motion.__get__(harness)
+    harness.footprint_confirmed = True
+    message = type('Message', (), {'data': json.dumps(dict(
+        epoch=3, ready=True, sent_monotonic=time.monotonic()))})()
+    NavigationWebBridge._reference_callback(harness, message)
+    assert not harness.footprint_confirmed
+    assert not harness.motion_enabled and not harness.navigation_active

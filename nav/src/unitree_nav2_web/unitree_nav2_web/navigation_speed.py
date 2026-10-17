@@ -85,6 +85,8 @@ class NavigationSpeedSettings:
         request.parameters = [
             Parameter("FollowPath.navigation_speed_mode", value=mode).to_parameter_msg(),
             Parameter("FollowPath.navigation_speed", value=speed).to_parameter_msg(),
+            Parameter("CartPush.navigation_speed_mode", value=mode).to_parameter_msg(),
+            Parameter("CartPush.navigation_speed", value=speed).to_parameter_msg(),
         ]
         self.pending = True
         self.error = ""

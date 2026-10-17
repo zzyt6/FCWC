@@ -36,15 +36,20 @@ import numpy as np
 WORKSPACE = Path(__file__).resolve().parents[2]
 VISER = WORKSPACE / 'Viser'
 sys.path.insert(0, str(VISER))
+sys.path.insert(0, str(WORKSPACE / 'nav/src/unitree_nav2_web'))
 
-from core.robot import RobotConfig, URDF_PATH, HAND_PD_PATH, UPPER_POSE_LABELS  # noqa: E402
+from core.robot import RobotConfig, URDF_PATH, HAND_PD_PATH, UPPER_POSE_LABELS, JOINT_NAMES  # noqa: E402
 from core.controller import Controller, STAGES  # noqa: E402
 from core.joint_monitor import limits, live_warnings, WarningBoard  # noqa: E402
+from core.pushcart import load_feature  # noqa: E402
+from core.hand_grasp import HAND_LOWER, HAND_UPPER  # noqa: E402
+from unitree_nav2_web.cart_geometry import CartGeometry, load_settings  # noqa: E402
+from unitree_nav2_web.locomotion import locomotion_actions  # noqa: E402
 
 # Must match nav/src/unitree_g1_kinematics/include/unitree_g1_kinematics/velocity_packet.hpp
-# Version 2 includes the original /cmd_vel host monotonic timestamp.
-VELOCITY_PACKET = struct.Struct('<IHBBQfff4xQ')
-VELOCITY_MAGIC, VELOCITY_VERSION = 0x47315643, 2
+# Version 3 uses the former padding for the navigation reference epoch.
+VELOCITY_PACKET = struct.Struct('<IHBBQfffIQ')
+VELOCITY_MAGIC, VELOCITY_VERSION = 0x47315643, 3
 COMMAND, GATE_CLOSED, COMMAND_EXPIRED = 0, 1, 2
 MOTION_CONFIG = Path(__file__).with_name('motion_config.json')
 # Lifecycle request from the nav web bridge (unitree_nav2_web/locomotion.py).
@@ -56,14 +61,28 @@ PREPARE_POSES = {0: 'original', 1: 'arms_down'}
 # Executor's single internal "browser" identity inside Viser's WebControl.
 CLIENT = 1
 COMMAND_TIMEOUT_S = 0.25
-STATUS_INTERVAL_S = 0.1
+STATUS_INTERVAL_S = 0.05
+NAV_CART_CONFIG = WORKSPACE / 'nav/config/pushcart_navigation.json'
+CART_ACTIONS = frozenset(('hand_toggle', 'hand_compensation', 'hand_edit', 'hand_load', 'hand_save',
+                          'cart_camera_start', 'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable',
+                          'cart_detach'))
 
 
 class Executor:
-    def __init__(self, controller, command_port, status_port, heading_source='NAVIGATION', clock=time.monotonic):
+    def __init__(self, controller, command_port, status_port, heading_source='NAVIGATION', clock=time.monotonic,
+                 cart_config=NAV_CART_CONFIG, geometry_port=None):
         self.control = controller
         self.clock = clock
         self.status_port = status_port
+        self.geometry_port = geometry_port
+        self.cart_settings = load_settings(cart_config)
+        self.cart_geometry = CartGeometry(self.cart_settings)
+        self.cart_limits = np.asarray(self.cart_settings['task_limits'])
+        if controller.high_policy is not None:
+            controller.high_policy.limits = self.cart_limits.copy()
+        self.cart_attached = False
+        self.navigation_epoch = (int(clock()*1e6) & 0xfffffffe) or 2
+        self.cart_error = ''
         if heading_source != 'NAVIGATION':
             raise ValueError('Navigation must use NAVIGATION; use heading_mode:=disabled to bypass feedback')
         self.heading_source = heading_source
@@ -86,6 +105,8 @@ class Executor:
         self.packets = self.rejected = 0
         self.last_status = -float('inf')
         self.last_request_sequence = -1
+        self.cart_request = {}
+        self.cart_request_tick = None
         self.last_claim = -float('inf')
         self.warning_lower, self.warning_upper = limits(controller.config)
         self.warning_board = WarningBoard(clock=clock)
@@ -93,7 +114,7 @@ class Executor:
     def _receive(self, now):
         for _ in range(64):
             try:
-                data, sender = self.sock.recvfrom(64)
+                data, sender = self.sock.recvfrom(4096)
             except BlockingIOError:
                 return
             now = self.clock()
@@ -101,12 +122,13 @@ class Executor:
                 self.rejected += 1
                 continue
             if len(data) == VELOCITY_PACKET.size:
-                magic, version, enabled, reason, _, vx, vy, wz, stamp_ns = VELOCITY_PACKET.unpack(data)
+                magic, version, enabled, reason, _, vx, vy, wz, epoch, stamp_ns = VELOCITY_PACKET.unpack(data)
                 velocity = np.asarray([vx, vy, wz], dtype=np.float32)
                 stamp = stamp_ns*1e-9
                 if (magic != VELOCITY_MAGIC or version != VELOCITY_VERSION
                         or enabled not in (0, 1) or reason not in (COMMAND, GATE_CLOSED, COMMAND_EXPIRED)
                         or (bool(enabled) != (reason == COMMAND))
+                        or (enabled and epoch != self.navigation_epoch)
                         or stamp > now + 1e-6 or not np.isfinite(velocity).all()):
                     self.rejected += 1
                     continue
@@ -135,6 +157,23 @@ class Executor:
                     continue
                 self.last_request_sequence = sequence
                 self.request(REQUESTS[request], pose=PREPARE_POSES[payload] if request == 7 else None)
+            elif data.startswith(b'{'):
+                try:
+                    request = json.loads(data)
+                    sequence = request['sequence']
+                    if (request.get('magic') != 'G1NAVCTL1' or request.get('action') not in CART_ACTIONS
+                            or type(sequence) is not int or sequence <= self.last_request_sequence
+                            or not 0 <= now-float(request['sent_monotonic']) <= .5
+                            or not isinstance(request.get('payload', {}), dict)):
+                        raise ValueError('Invalid cart control request')
+                    self.last_request_sequence = sequence
+                    self.cart_request_tick = (self.control.snapshot().get('state') or {}).get('tick')
+                    accepted = self.request(request['action'], **request.get('payload', {}))
+                    self.cart_request = dict(sequence=sequence, action=request['action'],
+                                             state='queued' if accepted else 'rejected', error=self.cart_error)
+                except (ValueError, KeyError, TypeError) as exc:
+                    self.rejected += 1
+                    self.cart_error = str(exc)
             else:
                 self.rejected += 1
 
@@ -145,9 +184,37 @@ class Executor:
             self.control.emit('zero', CLIENT)
         self.motion_active = False
 
-    def request(self, kind, *, pose=None):
+    def request(self, kind, *, pose=None, **payload):
         """Operator lifecycle request from the nav web page."""
-        if kind == 'prepare_pose':
+        if kind in CART_ACTIONS:
+            data = self.control.snapshot()
+            operator = dict(data, online=True, owned=data.get('owner') == CLIENT and data.get('source') == 'web',
+                            armed=bool(self.control.backend.armed), mode=self.control.mode,
+                            hands=data.get('dex3') or {}, cart=self._cart_status(data, self.clock()),
+                            velocity=np.asarray(data.get('velocity', [0, 0, 0])).tolist())
+            if not locomotion_actions(operator).get(kind):
+                self.cart_error = '当前状态不允许此操作，请检查抓握、航向和策略状态'
+                return False
+            if self.motion_active or data.get('decelerating') or np.any(data.get('velocity', [0, 0, 0])):
+                self.cart_error = '请先停止导航并等待速度归零'
+                return False
+            self.enabled = self.new_motion = False
+            self.accept_after = self.clock()
+            if kind == 'cart_detach':
+                high = data.get('high_policy') or {}
+                hands = data.get('dex3') or {}
+                if high.get('enabled') or high.get('motion_blocked') or hands.get('pose') in ('grasp', 'grasp_compensated'):
+                    self.cart_error = '先返回普通策略并松开抓握，再确认小车已移开'
+                    return False
+                self._set_attached(False)
+            else:
+                allowed = {'hand_edit': {'joint', 'angle_rad'}, 'hand_compensation': {'enabled'}}.get(kind, set())
+                if set(payload) != allowed:
+                    raise ValueError('Invalid cart action arguments')
+                self.control.emit(kind, CLIENT, **payload)
+            self.cart_error = ''
+            return True
+        elif kind == 'prepare_pose':
             if not isinstance(pose, str) or pose not in self.control.config.prepare_poses:
                 raise ValueError('请选择有效的准备姿态')
             # The shared Controller validates ownership and locks the choice
@@ -170,12 +237,42 @@ class Executor:
             self.accept_after = self.clock()
             self.enabled = self.new_motion = self.motion_active = False
 
+    def _set_attached(self, attached):
+        if self.cart_attached == attached:
+            return
+        self._stop_motion()
+        self.cart_attached = attached
+        self.navigation_epoch = ((((self.navigation_epoch & 0xfffffffe)+2) & 0xfffffffe) or 2) | int(attached)
+        self.accept_after = self.clock()
+        self.enabled = self.new_motion = False
+
+    def _cart_status(self, data, now):
+        high = data.get('high_policy') or {}
+        camera = high.get('camera') or {}
+        state = data.get('state') or {}
+        result = dict(attached=self.cart_attached, mode='cart' if self.cart_attached else 'walk',
+                      epoch=self.navigation_epoch, valid=False, error=self.cart_error,
+                      task_limits=self.cart_settings['task_limits'])
+        stamp = camera.get('captured_monotonic')
+        if (not data.get('healthy') or not camera.get('fresh') or stamp is None
+                or not 0 <= now-stamp <= camera.get('timeout_s', .3)):
+            return result
+        try:
+            result.update(self.cart_geometry.estimate(dict(zip(JOINT_NAMES, state['q'])), state['quat'], camera['yaw_rad']))
+            result.update(valid=True, captured_monotonic=stamp)
+        except (KeyError, ValueError, TypeError) as exc:
+            result['error'] = '小车位置估计不可用：' + str(exc)
+        return result
+
     def step(self):
         now = self.clock()
         self.new_motion = False
         self._receive(now)
         now = self.clock()
         data = self.control.snapshot()
+        high = data.get('high_policy') or {}
+        if high.get('enabled') or high.get('motion_blocked'):
+            self._set_attached(True)
         stopped = data.get('stage') in ('DAMPED', 'FAULT')
         if (data.get('state') is not None and not stopped
                 and (data.get('owner') != CLIENT or data.get('source') != 'web')
@@ -185,6 +282,10 @@ class Executor:
             self.last_claim = now
         fresh = self.enabled and 0 <= now - self.last_motion <= COMMAND_TIMEOUT_S
         running = data.get('stage') == 'POLICY' and data.get('source') == 'web' and data.get('owner') == CLIENT
+        if self.cart_attached:
+            running = running and high.get('enabled') and not high.get('motion_blocked') and self._cart_status(data, now)['valid']
+            if not running:
+                self._stop_motion()
         if not fresh:
             self._stop_motion()
         elif running and self.new_motion and not data.get('decelerating'):
@@ -218,6 +319,19 @@ class Executor:
         dex3 = data.get('dex3') or {}
         owned = data.get('source') == 'web' and data.get('owner') == CLIENT
         ready = stage == 'POLICY' and bool(data.get('healthy')) and owned
+        high = data.get('high_policy') or {}
+        cart = self._cart_status(data, now)
+        if self.cart_attached:
+            ready = ready and bool(high.get('enabled')) and not high.get('motion_blocked') and cart['valid'] and not data.get('upper_pd_transitioning')
+        # Keep the UDP status small; full inference outputs remain in the existing recorder.
+        high_status = {key: high.get(key) for key in ('enabled', 'motion_blocked', 'reason', 'enable_reason', 'zero_reason',
+                       'history_frames', 'history_required', 'warmup_error', 'zero_calibration', 'camera', 'camera_process')} if high else {}
+        hand_status = {key: dex3.get(key) for key in ('active', 'healthy', 'pose', 'moving', 'pending',
+                       'recovering', 'recovery_pending', 'blocking_reason', 'grasp', 'grasp_revision', 'grasp_dirty', 'editor_available', 'editor_message',
+                       'compensation_enabled', 'compensation_available', 'file_busy', 'q', 'ever_started')}
+        hand_status.update(lower=HAND_LOWER.tolist(), upper=HAND_UPPER.tolist())
+        if self.cart_request.get('state') == 'queued' and (data.get('state') or {}).get('tick') != self.cart_request_tick:
+            self.cart_request['state'] = 'handled'
         status = dict(
             magic='G1LOCO1', ready=ready, mode=self.control.mode, stage=stage,
             stage_text=STAGES.get(stage, stage), healthy=bool(data.get('healthy')),
@@ -237,11 +351,17 @@ class Executor:
             nav_target=[float(v) for v in self.target], nav_command_fresh=fresh,
             nav_packet_age_s=None if self.last_packet < 0 else round(now - self.last_packet, 3),
             heading=(data.get('heading') or {}).get('heading_state'),
+            high_policy=high_status, cart=cart, hands=hand_status,
+            cart_request=dict(self.cart_request), upper_pd_transitioning=bool(data.get('upper_pd_transitioning')),
+            pushcart_error=getattr(self.control.config, 'pushcart_error', ''),
             simulation=bool(data.get('simulation')),
             sent_monotonic=now)
         try:
-            self.sock.sendto(json.dumps(status, ensure_ascii=False).encode('utf-8'),
-                             ('127.0.0.1', self.status_port))
+            packet = json.dumps(status, ensure_ascii=False,
+                                default=lambda value: value.tolist() if isinstance(value, np.ndarray) else value.item()).encode('utf-8')
+            self.sock.sendto(packet, ('127.0.0.1', self.status_port))
+            if self.geometry_port:
+                self.sock.sendto(packet, ('127.0.0.1', self.geometry_port))
         except OSError:
             pass
 
@@ -265,16 +385,19 @@ def main():
     parser.add_argument('--dex3-pd-config', default=str(HAND_PD_PATH))
     parser.add_argument('--command-port', type=int, default=39002)
     parser.add_argument('--status-port', type=int, default=39005)
+    parser.add_argument('--geometry-port', type=int, default=39006)
+    parser.add_argument('--cart-config', default=str(NAV_CART_CONFIG))
     parser.add_argument('--record', action='store_true',
                         help='Archive this run in Viser/logs/sessions (shares its 5-session limit)')
     args = parser.parse_args()
-    if (not 1024 <= args.command_port <= 65535 or not 1024 <= args.status_port <= 65535
-            or args.command_port == args.status_port):
+    ports = (args.command_port, args.status_port, args.geometry_port)
+    if any(not 1024 <= port <= 65535 for port in ports) or len(set(ports)) != 3:
         parser.error('Invalid UDP ports')
 
     config = RobotConfig(URDF_PATH, args.motion_config, None, args.heading_kp,
                          None if args.heading_mode == 'config' else args.heading_mode,
                          hand_pd_config=args.dex3_pd_config)
+    high_policy = load_feature(config, args.mode, args.interface)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -287,8 +410,10 @@ def main():
         from core.backends import Bridge, build_bridge
         build_bridge()
         backend = Bridge(config, args.mode, args.interface)
-        controller = Controller(config, backend, args.mode, recorder=recorder, policy_mode=args.policy_mode)
-        executor = Executor(controller, args.command_port, args.status_port, args.heading_source)
+        controller = Controller(config, backend, args.mode, recorder=recorder, policy_mode=args.policy_mode,
+                                high_policy=high_policy)
+        executor = Executor(controller, args.command_port, args.status_port, args.heading_source,
+                            cart_config=args.cart_config, geometry_port=args.geometry_port)
         controller.start()
         print('G1 LOCOMOTION EXECUTOR READY mode=%s interface=%s heading=%s Kp=%.2f source=%s | '
               'cmd udp://127.0.0.1:%d status udp://127.0.0.1:%d'
@@ -301,8 +426,11 @@ def main():
     finally:
         if controller:
             controller.close()
-        elif backend:
-            backend.close()
+        else:
+            if backend:
+                backend.close()
+            if high_policy:
+                high_policy.close()
         if executor:
             executor.close()
         if recorder:

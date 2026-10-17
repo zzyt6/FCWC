@@ -193,8 +193,63 @@ double CruiseSpeedCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & tr
   return weight_ * std::max(0.0, 1.0 -
          std::hypot(trajectory.velocity.x, trajectory.velocity.y) / speed_);
 }
+
+void CartLookaheadCritic::onInit()
+{
+  const auto prefix = dwb_plugin_name_ + "." + name_ + ".";
+  for (const auto & item : std::vector<std::pair<std::string, double>>{
+      {"lookahead_base", 0.4}, {"lookahead_gain", 0.6}, {"lookahead_max", 1.0}, {"heading_weight", 0.4}})
+  {
+    nav2_util::declare_parameter_if_not_declared(nh_, prefix + item.first, rclcpp::ParameterValue(item.second));
+  }
+  base_ = nh_->get_parameter(prefix + "lookahead_base").as_double();
+  gain_ = nh_->get_parameter(prefix + "lookahead_gain").as_double();
+  maximum_ = nh_->get_parameter(prefix + "lookahead_max").as_double();
+  heading_weight_ = nh_->get_parameter(prefix + "heading_weight").as_double();
+  if (!(base_ > 0 && gain_ >= 0 && maximum_ >= base_ && heading_weight_ >= 0)) {
+    throw std::runtime_error("Invalid cart lookahead parameters");
+  }
+}
+
+bool CartLookaheadCritic::prepare(
+  const geometry_msgs::msg::Pose2D & pose, const nav_2d_msgs::msg::Twist2D & velocity,
+  const geometry_msgs::msg::Pose2D & goal, const nav_2d_msgs::msg::Path2D & plan)
+{
+  if (plan.poses.empty()) {return false;}
+  size_t nearest = 0;
+  double best = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < plan.poses.size(); ++i) {
+    const double distance = std::hypot(plan.poses[i].x-pose.x, plan.poses[i].y-pose.y);
+    if (distance < best) {best = distance; nearest = i;}
+  }
+  double remaining = std::min(maximum_, base_+gain_*std::hypot(velocity.x, velocity.y));
+  target_ = plan.poses.back();
+  for (size_t i = nearest; i+1 < plan.poses.size(); ++i) {
+    const auto & a = plan.poses[i];
+    const auto & b = plan.poses[i+1];
+    const double length = std::hypot(b.x-a.x, b.y-a.y);
+    if (length > 1e-6 && length >= remaining) {
+      target_.x = a.x+(b.x-a.x)*remaining/length;
+      target_.y = a.y+(b.y-a.y)*remaining/length;
+      target_.theta = std::atan2(b.y-a.y, b.x-a.x);
+      return true;
+    }
+    remaining -= length;
+  }
+  target_.theta = goal.theta;
+  return true;
+}
+
+double CartLookaheadCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory)
+{
+  if (trajectory.poses.empty()) {return 0.;}
+  const auto & end = trajectory.poses.back();
+  const double angle = std::atan2(std::sin(end.theta-target_.theta), std::cos(end.theta-target_.theta));
+  return std::hypot(end.x-target_.x, end.y-target_.y)+heading_weight_*std::abs(angle);
+}
 }  // namespace unitree_nav2_core
 
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::SpeedLimitedGenerator, dwb_core::TrajectoryGenerator)
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::CruiseSpeedCritic, dwb_core::TrajectoryCritic)
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::ApproachDWBLocalPlanner, nav2_core::Controller)
+PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::CartLookaheadCritic, dwb_core::TrajectoryCritic)

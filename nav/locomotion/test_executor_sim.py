@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src/unitree_nav2_web'))
 from unitree_nav2_web.locomotion import LocomotionLink  # noqa: E402
 
-VELOCITY = struct.Struct('<IHBBQfff4xQ')
+VELOCITY = struct.Struct('<IHBBQfffIQ')
 COMMAND_PORT, STATUS_PORT = 39102, 39105
 
 
@@ -33,7 +33,8 @@ def wait(link, predicate, timeout, what):
 def main():
     process = subprocess.Popen(
         ['bash', str(ROOT / 'locomotion/run_executor.sh'), '--mode', 'sim',
-         '--command-port', str(COMMAND_PORT), '--status-port', str(STATUS_PORT)],
+         '--command-port', str(COMMAND_PORT), '--status-port', str(STATUS_PORT),
+         '--geometry-port', '39106'],
         start_new_session=True)
     link = LocomotionLink(COMMAND_PORT, STATUS_PORT)
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -59,14 +60,14 @@ def main():
         assert status['velocity'] == [0.0, 0.0, 0.0], status
         # Disabled packets (motion gate closed) must not move the robot.
         for sequence in range(20):
-            sender.sendto(VELOCITY.pack(0x47315643, 2, 0, 1, sequence, .3, 0, 0,
+            sender.sendto(VELOCITY.pack(0x47315643, 3, 0, 1, sequence, .3, 0, 0, status["cart"]["epoch"],
                                        time.monotonic_ns()), ('127.0.0.1', COMMAND_PORT))
             time.sleep(.05)
         assert link.snapshot()['velocity'][0] == 0.0, link.snapshot()
         # Enabled packets use the training 0.4 s command filter through Viser.
         for sequence in range(40):
             command_time = time.monotonic_ns()
-            sender.sendto(VELOCITY.pack(0x47315643, 2, 1, 0, sequence, .3, 0, 0,
+            sender.sendto(VELOCITY.pack(0x47315643, 3, 1, 0, sequence, .3, 0, 0, status["cart"]["epoch"],
                                        command_time), ('127.0.0.1', COMMAND_PORT))
             time.sleep(.05)
         status = link.snapshot()

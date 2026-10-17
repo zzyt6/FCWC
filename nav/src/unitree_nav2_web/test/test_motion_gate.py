@@ -15,10 +15,10 @@ from geometry_msgs.msg import Twist
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, UInt32
 
 
-PACKET = struct.Struct('<IHBBQfff4xQ')
+PACKET = struct.Struct('<IHBBQfffIQ')
 
 
 @pytest.fixture
@@ -46,6 +46,14 @@ def gate(monkeypatch):
                 qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                                  durability=DurabilityPolicy.TRANSIENT_LOCAL)
                 enables = node.create_publisher(Bool, '/g1/motion_enable', qos)
+                epochs = node.create_publisher(UInt32, '/g1/navigation_epoch', qos)
+                references = node.create_publisher(Bool, '/g1/navigation_reference_ready', qos)
+                reference_state = {'epoch': 2, 'ready': True, 'publish': True}
+                def reference_tick():
+                    if reference_state['publish']:
+                        epochs.publish(UInt32(data=reference_state['epoch']))
+                        references.publish(Bool(data=reference_state['ready']))
+                node.create_timer(.04, reference_tick)
                 commands = node.create_publisher(Twist, '/cmd_vel', 1)
                 acknowledged = []
                 node.create_subscription(Bool, '/g1/motion_enabled',
@@ -72,9 +80,14 @@ def gate(monkeypatch):
                     def enable(self, enabled):
                         enables.publish(Bool(data=enabled))
 
-                    def velocity(self, vx=.4):
+                    def reference(self, **values):
+                        reference_state.update(values)
+
+                    def velocity(self, vx=.4, vy=0., wz=0.):
                         command = Twist()
                         command.linear.x = vx
+                        command.linear.y = vy
+                        command.angular.z = wz
                         commands.publish(command)
 
                     def wait(self, predicate, timeout=3.):
@@ -90,6 +103,7 @@ def gate(monkeypatch):
                 result = Gate()
                 result.wait(lambda _: enables.get_subscription_count() > 0
                             and commands.get_subscription_count() > 0 and acknowledged)
+                result.pump(.2)
                 yield result
             finally:
                 if process is not None and process.poll() is None:
@@ -120,10 +134,10 @@ def test_reopen_discards_cached_velocity_but_renewal_preserves_fresh_command(gat
     packets = gate.wait(lambda items: any(packet[2] for packet in items))
     moving = [packet for packet in packets if packet[2]][-1]
     assert moving[5] == pytest.approx(.4)
-    stamp = moving[8]
+    stamp = moving[9]
     for _ in range(3):
         gate.enable(True)
-        assert all(packet[2] and packet[8] == stamp for packet in gate.pump(.03))
+        assert all(packet[2] and packet[9] == stamp for packet in gate.pump(.03))
     # Authorizing motion again must not refresh the original command's age.
     gate.wait(lambda items: any(not packet[2] and packet[3] == 2 for packet in items))
 
@@ -152,3 +166,34 @@ def test_close_and_lost_authorization_block_continuing_velocity(gate):
             if expired:
                 assert not packet[2]
     assert expired
+
+
+def test_cart_epoch_clears_old_commands_and_clamps_all_three_axes(gate):
+    gate.enable(True)
+    gate.pump(.05)
+    gate.velocity()
+    gate.wait(lambda items: any(p[2] for p in items))
+    gate.reference(epoch=3)
+    gate.pump(.15)
+    gate.enable(True)
+    assert all(not p[2] for p in gate.pump(.10))
+    gate.velocity(-.8, .5, -.8)
+    packets = gate.wait(lambda items: any(p[2] for p in items))
+    active = [p for p in packets if p[2]][-1]
+    assert active[5:8] == pytest.approx((-.2, .15, -.3))
+    assert active[8] == 3
+    gate.velocity(.9, -.5, .8)
+    packets = gate.wait(lambda items: any(p[2] and p[5] > 0 for p in items))
+    active = [p for p in packets if p[2] and p[5] > 0][-1]
+    assert active[5:8] == pytest.approx((.6, -.15, .3))
+    gate.reference(publish=False)
+    deadline = time.monotonic()+.5
+    while time.monotonic() < deadline:
+        gate.enable(True)
+        gate.velocity()
+        gate.pump(.03)
+    assert all(not p[2] for p in gate.pump(.10))
+    gate.reference(publish=True, ready=False)
+    gate.enable(True)
+    gate.velocity()
+    assert all(not p[2] for p in gate.pump(.10))

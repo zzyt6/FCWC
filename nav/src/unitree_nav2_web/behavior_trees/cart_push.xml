@@ -1,0 +1,13 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="2" name="CartNavigation">
+      <PipelineSequence name="CartReplanning">
+        <RateController hz="1.0">
+          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        </RateController>
+        <FollowPath path="{path}" controller_id="CartPush"/>
+      </PipelineSequence>
+      <Wait wait_duration="1"/>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

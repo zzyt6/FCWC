@@ -22,14 +22,41 @@ let speedRequestBusy = false;
 let speedRequestError = '';
 let preparationPending = null;
 let preparationError = '';
+let cartBusy = false;
+let cartError = '';
+let cartPending = null;
+let lifecyclePending = null;
+let mapBusy = false;
+let poseBusy = false;
+let motionBusy = false;
+let lastStatusAt = -Infinity;
+let lastStatusStamp = -Infinity;
+let statusPolling = false;
 
 const $ = id => document.getElementById(id);
 const api = async path => {
-  const response = await fetch(path, { cache: 'no-store' });
-  const data = await response.json();
-  if (!data.ok) throw new Error(data.error || '请求失败');
-  return data;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(path, { cache: 'no-store', signal: controller.signal });
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.error || '请求失败');
+    return data;
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('请求超时，请核对当前状态后重试');
+    throw error;
+  } finally { clearTimeout(timer); }
 };
+function acceptStatus(next) {
+  const stamp = Number(next.sent_monotonic);
+  if (Number.isFinite(stamp) && stamp < lastStatusStamp) return;
+  if (Number.isFinite(stamp)) lastStatusStamp = stamp;
+  status = next;
+  lastStatusAt = performance.now();
+  updateUi();
+}
+function statusFresh() { return performance.now() - lastStatusAt < 2500; }
+async function refreshStatus() { acceptStatus((await api('/api/status')).status); }
 
 function connectRosbridge() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -73,8 +100,7 @@ function connectRosbridge() {
         draw();
       } catch (error) { console.warn(error); }
     } else if (topic === '/web/nav_status') {
-      status = JSON.parse(packet.msg.data);
-      updateUi();
+      try { acceptStatus(JSON.parse(packet.msg.data)); } catch (error) { console.warn(error); }
     } else if (topic === '/web/global_path' || topic === '/web/local_path') {
       try {
         const path = JSON.parse(packet.msg.data);
@@ -310,7 +336,10 @@ function draw() {
   if (visibility.scan) drawScanOverlay(candidatePose(), dpr);
   if (visibility.globalPath) drawPath(paths.global, '#28c8f2', 3 * dpr, [8 * dpr, 5 * dpr]);
   if (visibility.localPath) drawPath(paths.local, '#56f39a', 4 * dpr);
-  if (visibility.robot) drawArrow(robotPose, '#ffe35b', 20 * dpr, 'G1');
+  if (visibility.robot) {
+    drawArrow(robotPose, '#ffe35b', 20 * dpr, 'G1');
+    drawCart(dpr);
+  }
   drawArrow(goalPose, '#42ddff', 18 * dpr, 'Goal');
   if (dragStart && dragCurrent) {
     const a = worldToScreen(...dragStart), b = worldToScreen(...dragCurrent);
@@ -325,7 +354,7 @@ function pointerPosition(event) {
   return [(event.clientX - rect.left) * canvas.width / rect.width, (event.clientY - rect.top) * canvas.height / rect.height];
 }
 canvas.addEventListener('pointerdown', event => {
-  if (!layers.map) return;
+  if (!layers.map || poseBusy) return;
   canvas.setPointerCapture(event.pointerId);
   if (mode === 'view') {
     panDrag = { point: pointerPosition(event), panX: camera.panX, panY: camera.panY };
@@ -364,8 +393,11 @@ canvas.addEventListener('pointerup', async event => {
     yaw: Math.atan2(dragCurrent[1] - dragStart[1], dragCurrent[0] - dragStart[0]),
   };
   const params = new URLSearchParams(targetPose);
+  const requestedMode = mode;
+  poseBusy = true;
+  updateUi();
   try {
-    if (mode === 'initial') {
+    if (requestedMode === 'initial') {
       if (status.localized && !window.confirm('当前 AMCL 定位仍然有效。重新设置初始位姿会关闭运动门并重新定位，确定继续吗？')) {
         setMode('view');
         dragStart = dragCurrent = null;
@@ -375,14 +407,16 @@ canvas.addEventListener('pointerup', async event => {
       if (status.localized) params.set('replace', 'true');
       await api(`/api/initial_pose?${params}`);
       initialCandidate = targetPose;
-    } else if (mode === 'goal') {
+    } else if (requestedMode === 'goal') {
       paths = { global: [], local: [] };
       draw();
       await api(`/api/goal?${params}`);
       goalPose = targetPose;
     }
     setMode('view');
+    await refreshStatus();
   } catch (error) { alert(error.message); }
+  finally { poseBusy = false; updateUi(); }
   dragStart = dragCurrent = null; draw();
 });
 canvas.addEventListener('pointercancel', () => {
@@ -419,7 +453,11 @@ function resetCamera() {
 async function refreshMaps() {
   try {
     const result = await api('/api/maps');
-    $('mapSelect').innerHTML = result.maps.map(m => `<option value="${m.name}">${m.name} · ${m.size_mb} MB</option>`).join('');
+    $('mapSelect').replaceChildren(...result.maps.map(m => {
+      const option = document.createElement('option');
+      option.value = m.name; option.textContent = `${m.name} · ${m.size_mb} MB`; return option;
+    }));
+    updateUi();
   } catch (error) { $('statusText').textContent = error.message; }
 }
 
@@ -482,9 +520,10 @@ function updateLocomotionUi(loco) {
     warnings.some(item => item.level === 'error' && item.active !== false) ? 'bad' : 'warn');
   [['locoAcquire', 'acquire'], ['locoPrepare', 'prepare'], ['locoPolicy', 'policy'],
     ['locoZero', 'zero'], ['locoStop', 'stop'], ['locoReset', 'reset']].forEach(([id, action]) => {
-    $(id).disabled = !actions[action];
+    $(id).disabled = !statusFresh() || !actions[action] || (!!lifecyclePending && !['zero', 'stop'].includes(action));
   });
   updatePreparationUi(loco);
+  if (!statusFresh() || lifecyclePending) $('locoPreparePose').disabled = true;
   if (!loco.online) {
     setBadge('locoBadge', '未连接', 'bad');
     setNote('locoStatus', '运控执行进程未连接。确认 run_navigation.sh 已启动 nav/locomotion，且 Viser 网页没有占用底层桥接。', 'bad');
@@ -513,10 +552,11 @@ function updateUi() {
   goalPose = status.goal || goalPose;
   const loco = status.locomotion || { online: false, actions: {} };
   $('statusText').textContent = status.error ? `${status.message}：${status.error}` : (status.message || '等待状态');
-  const mapOperationAllowed = !status.processing && !status.navigation_active;
-  const initialAllowed = !!status.map_ready && !status.processing && !status.navigation_active;
+  const fresh = statusFresh();
+  const mapOperationAllowed = fresh && !mapBusy && !!$('mapSelect').value && !status.processing && !status.navigation_active;
+  const initialAllowed = fresh && !poseBusy && !!status.map_ready && !status.processing && !status.navigation_active;
   const speed = status.navigation_speed || {};
-  const goalAllowed = !!status.localized && !!status.motion_enabled && !status.navigation_active && !loco.decelerating && speed.ready && !speed.pending;
+  const goalAllowed = fresh && !poseBusy && !!status.localized && !!status.motion_enabled && !!loco.ready && !status.navigation_active && !loco.decelerating && speed.ready && !speed.pending;
   $('processMap').disabled = !mapOperationAllowed;
   $('processMap').textContent = status.map_ready ? '切换 / 重新处理所选 PCD' : '处理并装载所选 PCD';
   $('initialMode').disabled = !initialAllowed;
@@ -524,11 +564,12 @@ function updateUi() {
   $('toolbarInitial').disabled = !initialAllowed;
   $('toolbarGoal').disabled = !goalAllowed;
   const gate = status.motion_gate || {};
-  $('motionButton').disabled = status.motion_enabled ? false : !gate.can_enable;
+  $('motionButton').disabled = motionBusy || (fresh && status.motion_enabled ? false : !fresh || !gate.can_enable);
   $('motionButton').textContent = status.motion_enabled ? '关闭 G1 运动安全门' : '启用 G1 运动安全门';
   $('motionButton').classList.toggle('enabled', !!status.motion_enabled);
-  const blockers = gate.blockers || [];
-  $('gateBlockers').hidden = !!status.motion_enabled || !blockers.length;
+  const blockers = fresh ? (gate.blockers || []) : ['导航状态已过期，等待连接恢复'];
+  if (!fresh) $('statusText').textContent = '导航状态已过期，等待连接恢复；停止按钮仍可用';
+  $('gateBlockers').hidden = (fresh && !!status.motion_enabled) || !blockers.length;
   $('gateBlockers').textContent = blockers.length ? `运动门等待：\n· ${blockers.join('\n· ')}` : '';
   // The stop endpoint is idempotent; keep the safety control always available.
   $('stopButton').disabled = false;
@@ -552,6 +593,7 @@ function updateUi() {
   setBadge('navBadge', status.navigation_active ? '导航中' : status.motion_enabled ? '可下发目标' : '运动门关闭',
     status.navigation_active ? 'busy' : status.motion_enabled ? 'ok' : '');
   updateLocomotionUi(loco);
+  updateCartUi(loco);
   updateSpeedUi();
 
   const task = status.navigation_task || {};
@@ -583,9 +625,107 @@ function updateUi() {
     : '/scan: waiting';
 }
 
+function drawCart(dpr) {
+  const pose = status.cart_pose;
+  const reference = status.navigation_reference || {};
+  if (!pose || reference.mode !== 'cart' || !reference.ready) return;
+  const points = (reference.footprint || []).map(([x, y]) => worldToScreen(
+    pose.x + Math.cos(pose.yaw) * x - Math.sin(pose.yaw) * y,
+    pose.y + Math.sin(pose.yaw) * x + Math.cos(pose.yaw) * y));
+  if (points.length && points.every(Boolean)) {
+    ctx.beginPath();
+    points.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255, 159, 67, 0.12)'; ctx.fill();
+    ctx.strokeStyle = '#ff9f43'; ctx.lineWidth = 2 * dpr; ctx.stroke();
+  }
+  drawArrow(pose, '#ff9f43', 18 * dpr, '小车（估计）');
+}
+
+const handLabels = ['拇指旋转', '拇指近端', '拇指远端', '中指近端', '中指远端', '食指近端', '食指远端'];
+for (let joint = 0; joint < 14; joint++) {
+  const label = document.createElement('label'); label.className = 'field';
+  label.textContent = `${joint < 7 ? '左' : '右'}手 ${handLabels[joint % 7]}（rad）`;
+  const input = document.createElement('input');
+  input.id = `cartJoint${joint}`; input.type = 'number'; input.step = 'any'; input.disabled = true;
+  input.onchange = () => {
+    if (input.reportValidity() && Number.isFinite(input.valueAsNumber))
+      cartRequest('hand_edit', { joint, angle_rad: input.valueAsNumber });
+  };
+  label.appendChild(input); $('cartHandEditor').appendChild(label);
+}
+function updateCartUi(loco) {
+  const high = loco.high_policy || {}, hands = loco.hands || {}, cart = loco.cart || {};
+  const reference = status.navigation_reference || {}, camera = high.camera || {};
+  const actions = loco.actions || {};
+  const reply = loco.cart_request || {};
+  if (cartPending && reply.sequence === cartPending.id && reply.state !== 'queued') {
+    cartError = reply.state === 'rejected' ? reply.error || '操作未执行' : '';
+    cartPending = null;
+  } else if (cartPending && Date.now() - cartPending.started > 5000) {
+    cartError = '操作未确认，请核对当前抓握及策略状态后重试';
+    cartPending = null;
+  }
+  const busy = cartBusy || !!cartPending || !statusFresh();
+  setBadge('cartBadge', cart.attached ? '小车中心导航' : '普通导航', cart.attached ? 'ok' : '');
+  document.querySelectorAll('[data-cart-action]').forEach(button => {
+    button.disabled = busy || !!status.navigation_active || !actions[button.dataset.cartAction];
+  });
+  $('cartCompensation').disabled = busy || !!status.navigation_active || !actions.hand_compensation;
+  $('cartCompensation').textContent = hands.compensation_enabled ? '关闭抓握补偿' : '启用抓握补偿';
+  for (let joint = 0; joint < 14; joint++) {
+    const input = $(`cartJoint${joint}`), side = joint < 7 ? 0 : 1, index = joint % 7;
+    input.disabled = busy || !!status.navigation_active || !actions.hand_edit;
+    if (hands.lower?.[side]) input.min = hands.lower[side][index];
+    if (hands.upper?.[side]) input.max = hands.upper[side][index];
+    if ((document.activeElement !== input || input.dataset.revision !== String(hands.grasp_revision)) && hands.grasp?.[side]) {
+      input.value = String(hands.grasp[side][index]);
+      input.dataset.revision = String(hands.grasp_revision);
+    }
+  }
+  const handButton = document.querySelector('[data-cart-action="hand_toggle"]');
+  handButton.textContent = !hands.active ? (hands.ever_started ? '重新使能 Dex3 并归零' : '使能 Dex3 并抓握')
+    : ['grasp', 'grasp_compensated'].includes(hands.pose) ? '松手 / 手指归零' : '抓握小车';
+  const lines = [high.enabled ? '推车高层运行中' : '推车高层未启用',
+    `Dex3：${hands.pose || '未连接'}${hands.moving ? '（动作中）' : ''}`];
+  if (high.history_required) lines.push(`策略观测 ${high.history_frames || 0}/${high.history_required}`);
+  lines.push(camera.fresh && Number.isFinite(camera.yaw_rad)
+    ? `小车相对机身航向 ${(camera.yaw_rad * 180 / Math.PI).toFixed(1)}°（实测）` : '等待新鲜的小车航向');
+  if (cart.valid && cart.position) lines.push(`小车中心相对机身：${cart.position.slice(0, 2).map(v => v.toFixed(2)).join(', ')} m（抓握几何估计）`);
+  if (reference.mode === 'cart') lines.push(`车体过滤：${reference.removed_points || 0} 点；${reference.ready ? '导航参考已就绪' : reference.reason || '等待参考点'}`);
+  const calibration = high.zero_calibration || {};
+  const zeroLines = [calibration.message || high.zero_reason || '等待航向标定'];
+  if (calibration.status === 'collecting') zeroLines.push(`正在采集 ${calibration.samples || 0}/${calibration.required || 30} 帧`);
+  if (Number.isFinite(camera.yaw_offset_rad)) zeroLines.push(`当前零位偏置 ${(camera.yaw_offset_rad * 180 / Math.PI).toFixed(2)}°`);
+  setNote('cartZeroStatus', zeroLines.join('\n'), calibration.status === 'collecting' ? 'warn' : calibration.status === 'done' ? 'ok' : '');
+  setNote('cartHandStatus', hands.editor_message || (hands.grasp_dirty ? '当前抓握修改尚未保存' : hands.blocking_reason || '抓握参数沿用当前 Viser 配置'), hands.file_busy || hands.grasp_dirty ? 'warn' : '');
+  if (cartPending) lines.push('操作已发送，等待运控确认…');
+  if (loco.upper_pd_transitioning) lines.push('上肢增益正在切换，完成后可启动导航');
+  const issue = cartError || cart.error || loco.pushcart_error || high.camera_process?.error || high.warmup_error || high.reason || high.enable_reason;
+  if (issue) lines.push(issue);
+  setNote('cartStatus', lines.join('\n'), issue ? 'warn' : high.enabled ? 'ok' : '');
+  $('goalMode').textContent = cart.attached ? '设置小车中心导航目标' : '设置导航目标';
+}
+async function cartRequest(action, values = {}) {
+  if (cartBusy || cartPending || !statusFresh()) return;
+  cartBusy = true; cartError = ''; updateCartUi(status.locomotion || {});
+  try {
+    const result = await api(`/api/locomotion?${new URLSearchParams({ action, ...values })}`);
+    cartPending = { id: result.request_id, started: Date.now() };
+    await refreshStatus();
+  } catch (error) { cartError = error.message; }
+  finally { cartBusy = false; updateUi(); draw(); }
+}
+document.querySelectorAll('[data-cart-action]').forEach(button => {
+  button.onclick = () => cartRequest(button.dataset.cartAction);
+});
+$('cartCompensation').onclick = () => cartRequest('hand_compensation', {
+  enabled: !status.locomotion?.hands?.compensation_enabled,
+});
+
 function updateSpeedUi() {
   const speed = status.navigation_speed || {};
-  const busy = speedRequestBusy || speed.pending;
+  const busy = speedRequestBusy || speed.pending || !statusFresh();
   if (!speedDirty && !speedRequestBusy && speed.mode) {
     const shown = speed.requested || speed;
     $('speedMode').value = shown.mode;
@@ -597,10 +737,11 @@ function updateSpeedUi() {
   $('speedSlider').disabled = !!busy;
   $('applySpeed').disabled = !!busy || !speed.mode;
   const fixed = $('speedMode').value === 'fixed';
+  const approach = status.locomotion?.cart?.attached ? '0.8' : '0.6';
   $('speedLabel').textContent = fixed ? '巡航速度（m/s）' : '速度上限（m/s）';
   $('speedHint').textContent = fixed
-    ? '普通路段优先保持设定速度；末段 0.6 m 内减速，到达 15 cm / 10° 范围后归零。转弯或遇障碍时允许减速、停车。'
-    : '由 Nav2 根据路径和障碍自动调速，不超过设定上限；末段 0.6 m 内进一步减速，到达 15 cm / 10° 范围后归零。';
+    ? `普通路段优先保持设定速度；末段 ${approach} m 内减速，到达 15 cm / 10° 范围后归零。转弯或遇障碍时允许减速、停车。`
+    : `由 Nav2 根据路径和障碍自动调速，不超过设定上限；末段 ${approach} m 内进一步减速，到达 15 cm / 10° 范围后归零。`;
   const lines = [];
   if (speed.ready) lines.push(`已应用：${speed.mode === 'fixed' ? '固定巡航' : '自动调速上限'} ${Number(speed.speed).toFixed(2)} m/s`);
   if (busy) lines.push('正在等待 Nav2 确认…');
@@ -623,6 +764,7 @@ $('speedMode').onchange = () => editSpeed('mode');
 $('speedValue').oninput = () => editSpeed('value');
 $('speedSlider').oninput = () => editSpeed('slider');
 $('applySpeed').onclick = async () => {
+  if (speedRequestBusy || !statusFresh()) return;
   if (!$('speedValue').reportValidity() || !Number.isFinite($('speedValue').valueAsNumber)) return;
   const params = new URLSearchParams({ mode: $('speedMode').value, speed: $('speedValue').value });
   speedRequestBusy = true;
@@ -637,6 +779,9 @@ $('applySpeed').onclick = async () => {
 };
 
 $('processMap').onclick = async () => {
+  if (mapBusy || !statusFresh() || !$('mapSelect').value) return;
+  if (!['resolution', 'minHeight', 'maxHeight', 'obstacleRadius', 'freeRadius'].every(id => $(id).reportValidity())) return;
+  if (Number($('maxHeight').value) <= Number($('minHeight').value)) { alert('障碍物高度上限必须大于下限'); return; }
   const replacing = !!status.map_ready;
   if (replacing && !window.confirm('切换或重新处理 PCD 会清除当前 AMCL 定位、路径和运动门状态，确定继续吗？')) return;
   const params = new URLSearchParams({
@@ -645,12 +790,15 @@ $('processMap').onclick = async () => {
     obstacle_radius: $('obstacleRadius').value, free_radius: $('freeRadius').value,
   });
   if (replacing) params.set('replace', 'true');
+  mapBusy = true; updateUi();
   try {
+    await api(`/api/map/process?${params}`);
     robotPose = null; initialCandidate = null; goalPose = null;
     paths = { global: [], local: [] };
     resetCamera();
-    await api(`/api/map/process?${params}`);
+    await refreshStatus();
   } catch (error) { alert(error.message); }
+  finally { mapBusy = false; updateUi(); }
 };
 
 const locomotionConfirm = {
@@ -660,7 +808,8 @@ const locomotionConfirm = {
   stop: '阻尼停止会立即卸掉支撑力，机器人可能倒下。确认已吊装或扶稳吗？',
 };
 async function locomotionRequest(action) {
-  if (action === 'prepare' && preparationPending) return;
+  if (!statusFresh() || (action === 'prepare' && preparationPending)) return;
+  if (lifecyclePending && !['zero', 'stop'].includes(action)) return;
   const pose = status.locomotion?.prepare_pose;
   const label = status.locomotion?.prepare_pose_options?.find(item => item.value === pose)?.label;
   const confirmation = action === 'prepare' && label
@@ -671,10 +820,11 @@ async function locomotionRequest(action) {
     preparationPending = { action, started: Date.now() };
     updateLocomotionUi(status.locomotion || {});
   }
+  const pending = { action };
+  lifecyclePending = pending; updateUi();
   try {
     await api(`/api/locomotion?action=${action}`);
-    status = (await api('/api/status')).status;
-    updateUi();
+    await refreshStatus();
   } catch (error) {
     if (action === 'prepare') {
       preparationPending = null;
@@ -682,6 +832,9 @@ async function locomotionRequest(action) {
       updateLocomotionUi(status.locomotion || {});
     }
     alert(error.message);
+  } finally {
+    if (lifecyclePending === pending) lifecyclePending = null;
+    updateUi();
   }
 }
 $('locoPreparePose').onchange = async () => {
@@ -692,7 +845,7 @@ $('locoPreparePose').onchange = async () => {
   updateLocomotionUi(status.locomotion || {});
   try {
     await api(`/api/locomotion?action=prepare_pose&pose=${encodeURIComponent(pose)}`);
-    status = (await api('/api/status')).status;
+    await refreshStatus();
   } catch (error) {
     preparationPending = null;
     preparationError = error.message;
@@ -719,15 +872,28 @@ document.querySelectorAll('[data-display]').forEach(input => {
   input.onchange = () => { visibility[input.dataset.display] = input.checked; draw(); };
 });
 $('motionButton').onclick = async () => {
-  try { await api(`/api/motion?enabled=${status.motion_enabled ? 'false' : 'true'}`); } catch (error) { alert(error.message); }
+  if (motionBusy || !statusFresh()) return;
+  const enabled = !status.motion_enabled;
+  motionBusy = true; updateUi();
+  try { await api(`/api/motion?enabled=${enabled}`); await refreshStatus(); }
+  catch (error) { alert(error.message); }
+  finally { motionBusy = false; updateUi(); }
 };
-$('stopButton').onclick = async () => { try { await api('/api/stop'); } catch (error) { alert(error.message); } };
+$('stopButton').onclick = async () => {
+  try { await api('/api/stop'); await refreshStatus(); } catch (error) { alert(error.message); }
+};
 window.addEventListener('resize', draw);
 setInterval(async () => {
-  try { status = (await api('/api/status')).status; updateUi(); } catch (_) {}
+  if (!statusPolling) {
+    statusPolling = true;
+    try { await refreshStatus(); } catch (_) {} finally { statusPolling = false; }
+  }
+}, 500);
+setInterval(() => {
+  if (!statusFresh()) updateUi();
   if (liveScan.receivedAt && performance.now() - liveScan.receivedAt > 1500) {
     $('scanStats').textContent = '实时雷达数据超时，请检查 /scan 与点云高度切片';
   }
   draw();
-}, 1000);
+}, 500);
 refreshMaps(); connectRosbridge(); setMode('view'); draw();

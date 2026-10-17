@@ -16,6 +16,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
+        (os.path.join("share", package_name, "behavior_trees"), glob("behavior_trees/*.xml")),
         (os.path.join("share", package_name, "web"), glob("web/*")),
     ],
     install_requires=["setuptools"],
@@ -28,6 +29,7 @@ setup(
     entry_points={
         "console_scripts": [
             "nav_web_bridge = unitree_nav2_web.nav_web_bridge:main",
+            "cart_navigation = unitree_nav2_web.cart_navigation:main",
         ],
     },
 )

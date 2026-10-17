@@ -60,5 +60,20 @@ private:
   double weight_{0.0};
 };
 
+// A holonomic cart follows the path tangent while translating toward a
+// speed-dependent lookahead point. This only scores collision-checked samples.
+class CartLookaheadCritic : public dwb_core::TrajectoryCritic
+{
+public:
+  void onInit() override;
+  bool prepare(const geometry_msgs::msg::Pose2D & pose,
+    const nav_2d_msgs::msg::Twist2D & velocity, const geometry_msgs::msg::Pose2D & goal,
+    const nav_2d_msgs::msg::Path2D & plan) override;
+  double scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory) override;
+private:
+  geometry_msgs::msg::Pose2D target_;
+  double base_{0.4}, gain_{0.6}, maximum_{1.0}, heading_weight_{0.4};
+};
+
 }  // namespace unitree_nav2_core
 #endif

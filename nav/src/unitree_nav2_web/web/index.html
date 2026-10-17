@@ -32,12 +32,12 @@
           <div class="cardBody">
             <label class="field">已保存地图<select id="mapSelect"></select></label>
             <div class="grid2">
-              <label class="field">分辨率 m<input id="resolution" type="number" value="0.03" min="0.02" max="0.3" step="0.005"></label>
+              <label class="field">分辨率 m<input id="resolution" type="number" value="0.03" min="0.02" max="0.3" step="0.005" required></label>
               <label class="field">地面 Z<input id="groundZ" value="auto"></label>
-              <label class="field">障碍下限 m<input id="minHeight" type="number" value="0.15" step="0.05"></label>
-              <label class="field">障碍上限 m<input id="maxHeight" type="number" value="1.80" step="0.10"></label>
-              <label class="field">轮廓半径 m<input id="obstacleRadius" type="number" value="0.04" min="0" max="0.4" step="0.01"></label>
-              <label class="field">地面补洞 m<input id="freeRadius" type="number" value="0.15" min="0" max="0.8" step="0.01"></label>
+              <label class="field">障碍下限 m<input id="minHeight" type="number" value="0.15" min="0.02" max="1" step="any" required></label>
+              <label class="field">障碍上限 m<input id="maxHeight" type="number" value="1.80" min="0.3" max="3" step="any" required></label>
+              <label class="field">轮廓半径 m<input id="obstacleRadius" type="number" value="0.04" min="0" max="0.4" step="0.01" required></label>
+              <label class="field">地面补洞 m<input id="freeRadius" type="number" value="0.15" min="0" max="0.8" step="0.01" required></label>
             </div>
             <button id="processMap" class="block primary">处理并装载所选 PCD</button>
             <div id="mapStats" class="stats">尚未处理地图</div>
@@ -75,6 +75,34 @@
               <button id="locoReset" disabled>复位（只读）</button>
             </div>
             <p class="hint">导航速度直接交给我们自己的 Balance/Homie 策略执行（含骨盆航向外环）。接管底层后没有姿态支撑，需吊装或扶稳；实体遥控器 L2 随时可停止。</p>
+          </div>
+        </details>
+
+        <details class="card" open>
+          <summary><span>推车策略</span><em id="cartBadge" class="badge">普通导航</em></summary>
+          <div class="cardBody">
+            <div id="cartStatus" class="note">等待推车策略状态…</div>
+            <p class="hint">先启动混合策略站稳，放入小车并抓握。小车摆正后校准航向，再启动推车策略。推车模式下地图目标指向小车中心。</p>
+            <div class="buttonGrid">
+              <button data-cart-action="hand_toggle" disabled>抓握 / 松手</button>
+              <button id="cartCompensation" disabled>启用抓握补偿</button>
+              <button data-cart-action="cart_camera_start" disabled>启动航向相机</button>
+              <button data-cart-action="cart_yaw_zero" disabled>小车航向归零</button>
+              <button data-cart-action="pushcart_enable" class="accent" disabled>启动推车策略</button>
+              <button data-cart-action="pushcart_disable" disabled>退出推车策略</button>
+            </div>
+            <div id="cartZeroStatus" class="note" aria-live="polite"></div>
+            <details>
+              <summary>Dex3 抓握设置</summary>
+              <div id="cartHandStatus" class="note" aria-live="polite"></div>
+              <div id="cartHandEditor" class="grid2"></div>
+              <div class="buttonGrid">
+                <button data-cart-action="hand_load" disabled>加载抓握设置</button>
+                <button data-cart-action="hand_save" disabled>保存抓握设置</button>
+              </div>
+            </details>
+            <button data-cart-action="cart_detach" class="block" disabled>已松手并移开小车，恢复普通导航</button>
+            <p class="hint">速度范围：vx −0.20～0.60、vy −0.15～0.15 m/s，wz −0.30～0.30 rad/s。切换后需重新打开运动门。</p>
           </div>
         </details>
 

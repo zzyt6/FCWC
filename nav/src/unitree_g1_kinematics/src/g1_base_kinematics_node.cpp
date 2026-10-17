@@ -100,6 +100,21 @@ public:
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(
         get_parameter("base_odom_topic").as_string(), 20);
     joint_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", 20);
+    mount_pub_ = create_publisher<geometry_msgs::msg::TransformStamped>("/g1/lidar_mount", 3);
+    mount_timer_ = create_wall_timer(std::chrono::milliseconds(50), [this]() {
+      KinematicState state;
+      { std::lock_guard<std::mutex> lock(state_mutex_); state = state_; }
+      if (!state.received || std::chrono::steady_clock::now()-state.receipt_time >
+          std::chrono::milliseconds(300)) return;
+      for (const auto q : state.q) if (!std::isfinite(q)) return;
+      const auto chain = localUrdfChain(state, isRevisionModel(state.mode_machine),
+        hasThreeDofWaist(state.mode_machine), isWaistLocked(state.mode_machine));
+      auto mount = Eigen::Isometry3d::Identity();
+      for (std::size_t i = 0; i+1 < chain.size(); ++i) mount = mount * chain[i];
+      std_msgs::msg::Header header;
+      header.stamp = now();
+      mount_pub_->publish(toTransform(mount, header, base_frame_, "livox_frame"));
+    });
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         get_parameter("fastlio_odom_topic").as_string(), 20,
@@ -428,6 +443,8 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr mount_pub_;
+  rclcpp::TimerBase::SharedPtr mount_timer_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 };
 

@@ -44,7 +44,7 @@ def test_profile_changes_only_after_ack_and_survives_restart(tmp_path):
     settings.request("fixed", 0.6)
     assert settings.snapshot()["mode"] == "auto"
     assert not path.exists()
-    assert len(client.requests[-1].parameters) == 2
+    assert len(client.requests[-1].parameters) == 4
     client.complete()
     assert settings.snapshot()["mode"] == "fixed"
     assert json.loads(path.read_text()) == {"mode": "fixed", "speed": 0.6}

@@ -174,3 +174,36 @@ TEST_F(NavigationSpeedTest, CruisePreferenceReleasesForArrivalAndAutomaticMode)
   critic.prepare(pose, velocity, goal, path);
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(slow), 0.0);
 }
+
+TEST_F(NavigationSpeedTest, CartLookaheadRewardsLateralCorrectionAndIncreasesWithSpeed)
+{
+  unitree_nav2_core::CartLookaheadCritic critic;
+  std::string name = "CartLookahead", ns = "CartPush";
+  critic.initialize(node, name, ns, nullptr);
+  nav_2d_msgs::msg::Path2D path;
+  for (double x : {0., 1., 2.}) {
+    geometry_msgs::msg::Pose2D point;
+    point.x = x;
+    point.y = 0.3;
+    path.poses.push_back(point);
+  }
+  geometry_msgs::msg::Pose2D pose, goal;
+  goal.x = 2.; goal.y = .3;
+  nav_2d_msgs::msg::Twist2D velocity;
+  dwb_msgs::msg::Trajectory2D corrected, uncorrected, farther;
+  geometry_msgs::msg::Pose2D end;
+  end.x = .4; end.y = .3;
+  corrected.poses.push_back(end);
+  corrected.velocity.y = .15;
+  end.y = 0.; uncorrected.poses.push_back(end);
+  end.x = .76; end.y = .3; farther.poses.push_back(end);
+  ASSERT_TRUE(critic.prepare(pose, velocity, goal, path));
+  EXPECT_LT(critic.scoreTrajectory(corrected), critic.scoreTrajectory(uncorrected));
+  EXPECT_LT(critic.scoreTrajectory(corrected), critic.scoreTrajectory(farther));
+  velocity.x = .6;
+  ASSERT_TRUE(critic.prepare(pose, velocity, goal, path));
+  EXPECT_LT(critic.scoreTrajectory(farther), critic.scoreTrajectory(corrected));
+  EXPECT_DOUBLE_EQ(corrected.velocity.y, .15);  // The critic never rewrites DWB velocity.
+  path.poses.clear();
+  EXPECT_FALSE(critic.prepare(pose, velocity, goal, path));
+}
