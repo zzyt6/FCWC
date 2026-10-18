@@ -45,15 +45,13 @@ Walk/Homie 与 Balance 的选择、减速、PD 和 DDS 下发均由原 Viser 管
 
 推车学生的 30 维动作包含 3 维机器人速度残差、15 维腰 yaw/双臂修正和 12 维腿部残差。
 小车任务参考与速度残差经过高层自身滤波后生成机器人侧速度指令，两者通常不相等。
-这条指令在 Viser 中标为 `PUSHCART`，进入同一骨盆航向外环后再交给 Walk/Balance。
-按用户最新要求，Viser 发布配置恢复 `run_mode=active`，启用行走和推车共用的航向纠偏外环，关节 PD 不受影响。
-使用 Kp=1.0 s⁻¹、Ki=Kd=0、纠偏上限 ±0.15 rad/s；归零后可选择 `shadow` 或 `disabled`。
-启用航向纠偏时，推车参考航向从当前骨盆朝向开始，按上一拍高层输出的**机器人侧 wz** 推进，
-不是按小车任务 wz，也不是按叠加纠偏后的 wz 推进。Kp 修正参考航向与骨盆 IMU 航向的误差，
-仅修改机器人 wz，vx/vy 保持高层给定值。参考误差限制为 ±0.2 rad，沿用原纠偏渐入、限幅和变化率限制。
-这样既能纠正 Homie 执行偏差，也不会把高层主动转弯误当作偏航、拉回旧朝向。
-最终修正后实际选中的速度写入下一拍低层与高层历史。
-航向 Kp 用于转向纠偏；归零减速采用独立的 `command_filter_tau_s=0.4` 一阶滤波，期间不追加航向修正。
+这条指令在 Viser 中标为 `PUSHCART`，直接交给 Walk/Balance，下层不再叠加骨盆航向修正。
+小车航向保持放在任务参考滤波和学生之前：限幅后的原始任务 wz 按实际 monotonic 控制间隔积分为参考，
+测量取骨盆 IMU yaw 加相机已标零的相对 yaw（短暂丢帧使用保持值）。起步捕获当前小车航向，零指令/暂停复位。
+使用 Kp=1.0、修正上限 ±0.15 rad/s、误差限幅 ±0.3 rad 并拖动参考；修正加到任务 wz 后限于 ±0.6 rad/s。
+vx/vy 保持原值，任务参考仍用原一阶滤波，当前不加积分或额外低通。
+普通行走的骨盆航向参数独立控制原行走环。正常 Homie 执行时 `velocity` 和 `filtered_velocity` 等于学生的 `homie_command`，
+实际选中的命令写入下一拍低层与高层历史。归零减速采用原 `command_filter_tau_s=0.4` 滤波，期间不追加航向修正。
 
 持续发送严格零小车指令、点击速度归零或松手超时，都会截断高层内部残留的速度输出，
 让 Viser 从上一拍机器人指令按 `v += min(1, dt/0.4) * (0-v)` 减速。
@@ -123,15 +121,16 @@ yaw 来自 `raw_fused_cart_heading.yaw_rad`，必须有有效骨盆补偿和 `pe
 两套底层下一拍都使用选中动作（Homie 加实际残差，再按训练裁剪），不使用未执行输出。
 原始网络输出和高层状态写入现有 Viser 会话日志，不复制模型或完整输入历史。
 
-`Viser/logs/sessions/` 中的新版 `telemetry.jsonl.gz`（schema 19）逐帧记录：
+`Viser/logs/sessions/` 保留最近 10 段有本体反馈的会话。新版 `telemetry.jsonl.gz`（schema 20）逐帧记录：
 
 | 字段 | 用途 |
 |---|---|
 | `model_set` / `high_policy.model_release` | 当前整套模型选择（v81/v82）及高层版本；对应元数据 model_sets 中的文件与哈希 |
-| `high_policy.task_command` / `task_reference` | 实际进入高层的小车命令 / 本拍更新后的滤波参考，顺序 vx/vy/wz |
+| `high_policy.raw_task_command` / `task_command` / `task_reference` | 原始限幅任务 / 航向修正后的任务 / 本拍更新后的滤波参考，顺序 vx/vy/wz |
+| `high_policy.heading_hold` | `ref`、`err` 为 rad，`corr` 为 rad/s；`dt_s` 为实际控制间隔，`imu_yaw_rad`、`cart_yaw_rad` 为该拍测量；零任务复位 |
 | `high_policy.homie_command` | 高层生成的机器人候选速度，尚未经过 Viser 的零速拦截和滤波 |
-| `input_velocity` → `filtered_velocity` → `velocity` | 拦截后输入 → Viser 航向纠偏/归零滤波结果 → 当前选中运控的命令；选择 Balance 时最后一项为零 |
-| `heading` | 推车 `command_source=PUSHCART`，记录参考航向、IMU 航向、误差、Kp、修正量及最终 wz；`pushcart_tracking` 标明推车参考跟踪状态 |
+| `input_velocity` → `filtered_velocity` → `velocity` | 拦截后输入 → 归零滤波结果 → 当前选中运控的命令；正常推车 Homie 执行时三者等于 `homie_command`，Balance 时最后一项为零 |
+| `heading` | 推车 `command_source=PUSHCART`，保留 IMU 信息和最终 wz；`correction_rad_s=0`、`pushcart_tracking=false`，下层不做推车航向修正 |
 | `high_policy.gate` / `raw_actions` / `estimator` | 任务门控、30 维原始动作、学生 19 维估计输出 |
 | `high_policy.leg_residual` / `applied_leg_residual` | 高层候选 / 选中叠加到 Homie 的 12 维腿部残差，单位为网络动作值，后续还有动作裁剪和关节/PD 限制 |
 | `high_policy.upper_delta_rad` / `upper_target_selected` | 相对训练保持姿态的 15 维腰臂候选偏移 / 是否合入 Python 请求目标，不代表电机已执行 |

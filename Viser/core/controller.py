@@ -754,14 +754,14 @@ class Controller:
                     high_sampled = self.clock()
                     input_velocity, failed = high.command(
                         state, raw_command, self.observations.models['homie'].previous_action,
-                        now_motion, moving=moving, previous_state=getattr(self.backend, 'previous_state', None))
+                        now_motion, moving=moving, dt=dt,
+                        previous_state=getattr(self.backend, 'previous_state', None))
                     moving = moving and not failed
                 else:
                     input_velocity = np.zeros(3)
                     moving = False
-                # Follow the student's robot yaw-rate reference with the shared
-                # pelvis heading loop, then select Walk/Balance. Its raw cart
-                # command remains the motion/stop intent, not the yaw reference.
+                # Cart heading feedback is applied before the student. Pass its
+                # Homie command through unchanged, retaining Viser's stop path.
                 command_source = 'PUSHCART'
                 if not moving:
                     raw_command.fill(0)

@@ -17,7 +17,7 @@ from core.robot import ROOT
 from core.policy import output_metadata
 from core.joint_tracking import metadata as joint_metadata
 
-MAX_SESSIONS = 5
+MAX_SESSIONS = 10
 
 
 def retain_recent_sessions(directory, limit=MAX_SESSIONS):
@@ -53,7 +53,7 @@ class SessionRecorder:
         tag = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
         self.path = Path(directory or ROOT / 'logs/sessions') / (tag + '_' + arguments['mode'] + '_' + uuid.uuid4().hex[:8])
         self.path.mkdir(parents=True, exist_ok=False)
-        metadata = dict(schema=19, has_robot_data=False, config_token=config.token,
+        metadata = dict(schema=20, has_robot_data=False, config_token=config.token,
                         initial_model_set=getattr(config, 'model_set', 'v81'),
                         model_sets=deepcopy(getattr(config, 'model_sets_metadata', {})),
                         model_set_selection='telemetry.model_set identifies the active model set; '

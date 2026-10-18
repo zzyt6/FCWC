@@ -198,8 +198,8 @@ class IntegrationTests(unittest.TestCase):
         self.control.request = p.RUN
         self.tick()
 
-    def tick(self, yaw=.2, valid=True):
-        self.now += .02
+    def tick(self, yaw=.2, valid=True, dt=.02):
+        self.now += dt
         self.bridge.state.received_ns = int((self.now - .000001) * 1e9)
         self.bridge.state.sequence += 1
         if self.refresh:
@@ -243,6 +243,7 @@ class IntegrationTests(unittest.TestCase):
                 self.bridge.previous_state = replace(
                     state, received_ns=int((self.now + .02 - .000001) * 1e9) - 5_000_000,
                     applied_q=state.q + .02, applied_kp=np.full(29, 10.), applied_kd=np.zeros(29))
+                state.quaternion = np.array([np.cos(.05/2), 0., 0., np.sin(.05/2)])
                 moving = self.event('move', [.3, 0, 0])
                 high = moving['high_policy']
                 inputs = high['inference_inputs']
@@ -277,8 +278,13 @@ class IntegrationTests(unittest.TestCase):
             high = moving['high_policy']
             np.testing.assert_allclose(high['inference_inputs']['upper_torque_pd_estimate'], .2)
             self.assertAlmostEqual(high['torque_sample_age_ms'], 5.)
-            np.testing.assert_allclose(high['task_command'], [.3, 0., 0.], atol=1e-7)
+            np.testing.assert_allclose(high['raw_task_command'], [.3, 0., 0.], atol=1e-7)
+            np.testing.assert_allclose(high['task_command'], [.3, 0., -.05], atol=1e-7)
+            self.assertAlmostEqual(high['heading_hold']['err'], -.05)
+            self.assertAlmostEqual(high['heading_hold']['corr'], -.05)
             np.testing.assert_allclose(high['homie_command'], moving['input_velocity'])
+            np.testing.assert_allclose(high['homie_command'], moving['filtered_velocity'])
+            np.testing.assert_allclose(high['homie_command'], moving['velocity'])
             np.testing.assert_allclose(high['leg_residual'], high['applied_leg_residual'])
             np.testing.assert_allclose(np.asarray(moving['requested_target'])[UPPER],
                                        self.high.core.hold + high['upper_delta_rad'], atol=1e-6)
@@ -295,6 +301,8 @@ class IntegrationTests(unittest.TestCase):
             zero = indexed[zero['state']['tick']]
             self.assertTrue(np.any(zero['high_policy']['homie_command']))
             np.testing.assert_array_equal(zero['high_policy']['task_command'], 0.)
+            self.assertIsNone(zero['high_policy']['heading_hold']['ref'])
+            self.assertEqual(zero['high_policy']['heading_hold']['corr'], 0.)
             np.testing.assert_array_equal(zero['input_velocity'], 0.)
             np.testing.assert_array_equal(zero['high_policy']['applied_leg_residual'], 0.)
             self.assertFalse(zero['high_policy']['upper_target_selected'])
@@ -304,7 +312,7 @@ class IntegrationTests(unittest.TestCase):
             np.testing.assert_array_equal(standing['velocity'], 0.)
             self.assertTrue(indexed[lost_camera['state']['tick']]['high_policy']['motion_blocked'])
             self.assertEqual(rows[-1]['stage'], 'DAMPED')
-            inference_fields = ('raw_actions', 'estimator', 'inference_inputs', 'task_command',
+            inference_fields = ('raw_actions', 'estimator', 'inference_inputs', 'raw_task_command', 'heading_hold', 'task_command',
                                 'task_reference', 'homie_command', 'gate', 'leg_residual',
                                 'upper_delta_rad', 'upper_target_selected', 'applied_leg_residual',
                                 'inference_started_monotonic', 'inference_finished_monotonic')
@@ -319,7 +327,9 @@ class IntegrationTests(unittest.TestCase):
                                      high['camera']['captured_monotonic'])
                     self.assertLessEqual(high['inference_started_monotonic'], high['inference_finished_monotonic'])
             metadata = json.loads((recorder.path / 'metadata.json').read_text())
-            self.assertEqual(metadata['schema'], 19)
+            self.assertEqual(metadata['schema'], 20)
+            self.assertEqual(metadata['high_policy']['cart_heading_hold'],
+                             dict(kp=1., max_corr=.15, max_err=.3, task_wz_limit=.6))
             self.assertEqual(metadata['high_policy']['upper_pd']['target_interpolation_s'], .02)
             self.assertEqual(metadata['high_policy']['telemetry']['upper_sdk_indices'], UPPER.tolist())
             with gzip.open(recorder.path / 'events.jsonl.gz', 'rt') as stream:
@@ -725,12 +735,12 @@ class IntegrationTests(unittest.TestCase):
                            applied_q=state.q + .1, applied_kp=np.full(29, 20.),
                            applied_kd=np.zeros(29))
         self.high.command(state, [.3, 0, 0], np.zeros(12), self.now,
-                          moving=True, previous_state=previous)
+                          moving=True, dt=.02, previous_state=previous)
         np.testing.assert_allclose(self.high.core.frames[-1, 79:94], .04, atol=1e-6)
         self.assertAlmostEqual(self.high.torque_sample_age_ms, 5.)
         stale = replace(previous, received_ns=state.received_ns - 50_000_000)
         self.high.command(state, [.3, 0, 0], np.zeros(12), self.now,
-                          moving=True, previous_state=stale)
+                          moving=True, dt=.02, previous_state=stale)
         self.assertEqual(self.high.torque_sample_age_ms, 0.)
         np.testing.assert_array_equal(self.high.core.frames[-1, 79:94], 0)
 
@@ -750,36 +760,76 @@ class IntegrationTests(unittest.TestCase):
         np.testing.assert_array_equal(self.high.applied_residual, 0)
         np.testing.assert_allclose(self.high.core.applied, data['model_actions']['balance'], atol=1e-6)
 
-    def test_pushcart_heading_correction_reaches_homie_and_executed_histories(self):
+    def test_cart_heading_corrects_task_and_homie_passes_unchanged_into_histories(self):
         self.assertEqual(self.control.heading.settings['run_mode'], 'active')
         self.enable()
         previous = np.zeros(3)
-        corrected = False
         scale = np.asarray(self.config.contracts['homie']['input']['command_scale'][:3])
         for i in range(100):
-            # The real student can ask the robot to turn while the cart task is
-            # straight. Heading feedback follows that robot command, and both
-            # next-frame histories must retain what was actually selected.
+            # Simulate leftward cart drift while the user requests straight
+            # pushing. Only the input to the task-reference filter is corrected.
             yaw = min(i * .002, .1)
             self.bridge.state.quaternion = np.array([np.cos(yaw/2), 0., 0., np.sin(yaw/2)])
             self.bridge.state.omega = np.array([0., 0., .1 if i < 50 else 0.])
             data = self.event('move', [.3, 0., 0.])
             self.assertEqual(data['heading']['command_source'], 'PUSHCART')
-            self.assertTrue(data['heading']['correction_enabled'])
-            self.assertTrue(data['heading']['pushcart_tracking'])
+            self.assertFalse(data['heading']['correction_enabled'])
+            self.assertFalse(data['heading']['pushcart_tracking'])
+            self.assertEqual(data['heading']['correction_rad_s'], 0.)
+            high = data['high_policy']
+            hold = high['heading_hold']
+            self.assertAlmostEqual(hold['imu_yaw_rad'], data['heading']['imu_yaw_rad'])
+            self.assertAlmostEqual(hold['cart_yaw_rad'], yaw + high['camera']['yaw_rad'])
+            self.assertAlmostEqual(hold['err'], -yaw)
+            self.assertAlmostEqual(hold['corr'], -yaw)
+            np.testing.assert_allclose(high['raw_task_command'], [.3, 0., 0.], atol=1e-7)
+            np.testing.assert_allclose(high['task_command'], [.3, 0., -yaw], atol=1e-7)
+            old_ref = high['inference_inputs']['previous_task_reference']
+            np.testing.assert_allclose(high['task_reference'],
+                                       old_ref + self.high.core.ref_alpha * (high['task_command'] - old_ref))
             np.testing.assert_allclose(data['input_velocity'], self.high.output.cmd_homie)
+            np.testing.assert_allclose(data['filtered_velocity'], self.high.output.cmd_homie, atol=1e-7)
             np.testing.assert_allclose(self.high.core.frames[-1, :3], previous * scale, atol=1e-7)
+            np.testing.assert_allclose(high['inference_inputs']['previous_homie_command'], previous, atol=1e-7)
             if data['selected_model'] == 'homie':
-                np.testing.assert_allclose(data['velocity'][:2], self.high.output.cmd_homie[:2], atol=1e-7)
+                np.testing.assert_allclose(data['velocity'], self.high.output.cmd_homie, atol=1e-7)
                 self.assertAlmostEqual(data['velocity'][2], data['heading']['wz_final_applied'], places=6)
-                delta = data['velocity'][2] - self.high.output.cmd_homie[2]
-                corrected |= abs(delta) > 1e-5
-                self.assertLessEqual(abs(delta), .150001)
                 np.testing.assert_allclose(self.control.observations.models['homie'].history[-1, :3],
                                            data['velocity'] * scale, atol=1e-7)
             previous = data['velocity'].copy()
         self.assertEqual(data['selected_model'], 'homie')
-        self.assertTrue(corrected)
+        self.assertAlmostEqual(data['high_policy']['heading_hold']['corr'], -.1)
+
+    def test_cart_reference_integrates_raw_task_wz_using_actual_control_dt(self):
+        self.enable()
+        self.camera.set_offset(.1)
+        expected_ref = .1
+        for index, dt in enumerate([.013, .037, .011, .029] * 5):
+            wz = .3 if index < 10 else -.3
+            self.control.emit('move', 1, [.3, 0., wz])
+            data = self.tick(dt=dt)
+            high = data['high_policy']
+            expected_ref += wz * dt
+            self.assertAlmostEqual(high['heading_hold']['dt_s'], dt)
+            self.assertAlmostEqual(high['heading_hold']['ref'], expected_ref, places=7)
+            self.assertAlmostEqual(high['heading_hold']['cart_yaw_rad'], .1)
+            self.assertAlmostEqual(high['task_command'][2], wz + expected_ref - .1, places=7)
+
+    def test_cart_hold_uses_held_camera_yaw_and_releases_on_timeout(self):
+        self.enable()
+        self.move()
+        self.refresh = False
+        for i in range(5):
+            yaw = .01 * (i + 1)
+            self.bridge.state.quaternion = np.array([np.cos(yaw/2), 0., 0., np.sin(yaw/2)])
+            data = self.event('move', [.3, 0., 0.])
+            self.assertTrue(data['high_policy']['camera']['fresh'])
+            self.assertAlmostEqual(data['high_policy']['heading_hold']['corr'], -yaw)
+        for _ in range(20):
+            data = self.tick()
+        self.assertTrue(data['high_policy']['motion_blocked'])
+        self.assertIsNone(self.high.hold.ref)
+        self.assertEqual(self.high.hold.corr, 0.)
 
     def test_pushcart_starts_at_zero_with_active_heading_feedback(self):
         self.assertEqual(self.control.heading.settings['run_mode'], 'active')
@@ -793,6 +843,8 @@ class IntegrationTests(unittest.TestCase):
                 np.testing.assert_array_equal(data[key], 0.)
             self.assertFalse(data['heading']['correction_enabled'])
             self.assertEqual(data['heading']['correction_rad_s'], 0.)
+            self.assertIsNone(data['high_policy']['heading_hold']['ref'])
+            self.assertEqual(data['high_policy']['heading_hold']['corr'], 0.)
             np.testing.assert_array_equal(data['high_policy']['applied_leg_residual'], 0.)
             self.assertFalse(data['high_policy']['upper_target_selected'])
 

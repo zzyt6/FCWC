@@ -155,7 +155,8 @@ class Viewer:
             with client.gui.add_folder('航向参数（先归零再应用）', expand_by_default=False):
                 settings = controller.heading.settings
                 client.gui.add_markdown('disabled 关闭 · shadow 仅记录 · active 应用纠偏')
-                client.gui.add_markdown('行走与推车共用这些参数；推车时跟随策略要求的转向修正骨盆航向。')
+                client.gui.add_markdown('这些参数用于普通行走的骨盆航向保持。推车使用独立的小车航向保持：'
+                                        'Kp 1.0、修正上限 ±0.15 rad/s、误差限幅 0.3 rad。')
                 gain = client.gui.add_slider('航向 Kp (1/s)', 0., 2., .05, settings['heading_kp'])
                 limit = client.gui.add_slider('纠偏上限 (rad/s)', 0., .3, .01, settings['max_correction_rad_s'])
                 smoothing = client.gui.add_slider('角速度滤波截止频率 (Hz)', .1, 10., .1,

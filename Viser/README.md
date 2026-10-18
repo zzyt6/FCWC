@@ -170,12 +170,13 @@ Homie 模型内部已经包含 HIM 速度估计器：6 帧历史生成 3 维速�
 - 手动“速度归零”、网页松手和导航停车均使用部署配置的 0.4 秒命令滤波；B、急停、断线和共享 IMU 故障优先立即停止。
 - 姿态参考跳变或超出反馈小倾角范围：释放参考，受限退出纠偏；健康数据恢复并回零后才能重新锁定。
 
-[`config/motion_config.json`](config/motion_config.json) 按用户最新要求恢复 `run_mode=active`，启用行走和推车共用的航向纠偏外环。`shadow` 只记录建议，不改变策略命令；`disabled` 关闭纠偏。使用 Kp=1.0 s⁻¹、Ki=Kd=0、纠偏上限 0.15 rad/s；关节 PD 不受影响。网页在速度归零后可修改模式、Kp、上限和角速度截止频率；设置只影响本次运行。显式 `--heading-mode` 优先于配置，单独 `--heading-kp` 不覆盖模式。
+[`config/motion_config.json`](config/motion_config.json) 默认 `run_mode=active`，用于普通行走的骨盆航向环。`shadow` 只记录建议，不改变策略命令；`disabled` 关闭该纠偏。使用 Kp=1.0 s⁻¹、Ki=Kd=0、纠偏上限 0.15 rad/s；关节 PD 不受影响。网页在速度归零后可修改模式、Kp、上限和角速度截止频率；设置只影响本次运行。显式 `--heading-mode` 优先于配置，单独 `--heading-kp` 不覆盖模式。推车使用下面的独立任务航向环。
 
-推车命令来源为 `PUSHCART`，骨盆参考航向跟随高层给出的机器人角速度推进，再叠加 Kp 纠偏送入 Walk/Balance。
-参考使用上一拍纠偏前的机器人 wz，不能用小车任务 wz 或纠偏后的 wz 积分；保持高层主动转向，同时纠正执行偏差。
-vx/vy 不旋转；推车参考误差最多 ±0.2 rad，纠偏仍受原幅值与变化率限制。零指令/减速期间清除参考并停止追加纠偏。
-日志 `heading.pushcart_tracking`、`yaw_ref`、`imu_yaw_rad`、`correction_rad_s`、`wz_feedforward` 与 `wz_final_applied` 可查看这条链路。
+推车命令来源为 `PUSHCART`，处理顺序为：原始任务限幅 → 小车航向保持 → 原任务参考一阶滤波 → 学生 → HOMIE。
+小车航向为骨盆 IMU yaw 加相机已标零的相对 yaw；短暂丢帧沿用相机保持值，超时沿用原暂停流程。
+起步锁定当前小车朝向，参考按原始任务 wz 和实际 monotonic 控制间隔积分。Kp=1.0、修正上限 ±0.15 rad/s、误差限幅 ±0.3 rad 并拖动参考；修正加到任务 wz 后限于 ±0.6 rad/s，vx/vy 保持原值。当前不加积分或额外低通。零指令/暂停复位。
+正常 Homie 执行期间 `velocity`、`filtered_velocity` 等于 `high_policy.homie_command`；下层不再叠加航向修正，`heading.correction_rad_s=0`。归零减速和 Balance 零命令规则仍生效，实际执行命令回写下一拍历史。
+日志 `high_policy.raw_task_command`、`task_command`、`task_reference` 分别记录原始限幅任务、修正后任务及滤波参考；`high_policy.heading_hold` 保存 `ref`、`err`、`corr`、`dt_s`、`imu_yaw_rad` 和 `cart_yaw_rad`。
 
 ```bash
 # 纯离线网页，合成状态，不连接机器人
@@ -192,7 +193,7 @@ bash Viser/run.sh --mode sim --heading-mode shadow
 
 左侧面板的下发值取自 C++ 最近一次成功写入 DDS 的电机指令，包含准备／手部切换的插值和所选按钮的补偿；不是 Python 请求值或最终姿态目标，也不代表电机已确认接收。只读或尚未下发时指令显示 `—`；Kp=0 阻尼、反馈异常或记录过期时不计算误差。离线模式明确标注合成数据。
 
-`observe`、`control` 自动保存机器人本体运行数据，合并只保留最近 5 次有反馈的会话，第 6 次有数据后删除最旧一次。空启动不占名额。
+`observe`、`control` 自动保存机器人本体运行数据，合并只保留最近 10 次有反馈的会话，第 11 次有数据后删除最旧一次。空启动不占名额。
 
 ```text
 logs/sessions/UTC时间_模式_编号/
@@ -203,7 +204,7 @@ logs/sessions/UTC时间_模式_编号/
 └── summary.json        # 正常退出时写入条数、耗时和错误
 ```
 
-不保存模型文件、源码、URDF、网格或配置文件快照，不保存每帧网络完整输入历史；模型输出必须保留。记录采用压缩后台写盘，按每次 Python 策略采样记录，不是全部 200 Hz DDS 报文；实际频率见日志中的 `timing`。当前 schema 18（含实际 Homie 估计器来源及推车候选/采用命令），`dex3` 保存左右手健康状态、目标姿态、过渡进度、14 维实测 q/dq 与指令 target（左手在前），并区分 `open`（全零）、`grasp`（原抓握）、`open_compensated`（补偿归零）与 `grasp_compensated`（补偿抓握）；保留的旧会话仍按原 schema 解释，未正常结束的会话没有 summary。
+不保存模型文件、源码、URDF、网格或配置文件快照，不保存每帧网络完整输入历史；模型输出必须保留。记录采用压缩后台写盘，按每次 Python 策略采样记录，不是全部 200 Hz DDS 报文；实际频率见日志中的 `timing`。当前 schema 20（含模型组合、学生前小车航向保持及修正前后任务命令），`dex3` 保存左右手健康状态、目标姿态、过渡进度、14 维实测 q/dq 与指令 target（左手在前），并区分 `open`（全零）、`grasp`（原抓握）、`open_compensated`（补偿归零）与 `grasp_compensated`（补偿抓握）；保留的旧会话仍按原 schema 解释，未正常结束的会话没有 summary。
 
 推车时 `homie_estimator_source=pushcart_finetuned`，退出推车为 `homie_original`。
 `homie_estimator.velocity_raw` 记录实际输入 Homie actor 的三维速度估计，`velocity_original_raw` 记录同帧原 HIM 估计；
@@ -234,7 +235,7 @@ logs/sessions/UTC时间_模式_编号/
 
 旧记录中已经清理掉的原始模型输出无法从关节目标准确还原，过去未采集的 Homie 估计输出也没有补写；上述字段从新版运行开始记录。
 
-`--record-dir` 可修改会话目录，仍仅保留最近五次。sim 默认不记录；明确需要时用 `--record-sim --record-dir /tmp/viser-sim`，不得混入真机 logs。`--log /tmp/viser-export.jsonl` 可显式导出调试数据，默认不产生重复日志。
+`--record-dir` 可修改会话目录，仍仅保留最近十次。sim 默认不记录；明确需要时用 `--record-sim --record-dir /tmp/viser-sim`，不得混入真机 logs。`--log /tmp/viser-export.jsonl` 可显式导出调试数据，默认不产生重复日志。
 
 ```bash
 PYTHON=~/miniconda3/envs/CWC/bin/python

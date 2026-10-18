@@ -11,11 +11,11 @@ from core.recording import SessionRecorder
 from core.robot import RobotConfig
 
 class RecordingTests(unittest.TestCase):
-    def test_compact_archives_keep_latest_five_runs(self):
+    def test_compact_archives_keep_latest_ten_runs(self):
         config = RobotConfig()
         with tempfile.TemporaryDirectory() as directory:
             paths = []
-            for i in range(7):
+            for i in range(12):
                 recorder = SessionRecorder(config, {'mode': 'control' if i % 2 else 'observe'}, directory)
                 recorder.record('telemetry', {'state': {'q': np.arange(29)}, 'run': i, 'model_actions': {'balance': np.arange(12), 'homie': np.arange(12)},
                                               'homie_estimator_source': 'pushcart_finetuned',
@@ -28,8 +28,8 @@ class RecordingTests(unittest.TestCase):
                 paths.append(recorder.path)
                 self.assertEqual(summary['records'], {'telemetry': 1, 'events': 1})
                 self.assertEqual(summary['recorder_error'], '')
-            self.assertEqual(sorted(Path(directory).iterdir()), paths[-5:])
-            for i, path in enumerate(paths[-5:], start=2):
+            self.assertEqual(sorted(Path(directory).iterdir()), paths[-10:])
+            for i, path in enumerate(paths[-10:], start=2):
                 self.assertEqual({f.name for f in path.iterdir()},
                                  {'metadata.json', 'telemetry.jsonl.gz', 'events.jsonl.gz', 'summary.json'})
                 with gzip.open(path / 'telemetry.jsonl.gz', 'rt') as stream:
@@ -45,7 +45,7 @@ class RecordingTests(unittest.TestCase):
                 metadata = json.loads((path / 'metadata.json').read_text())
                 self.assertEqual(metadata['motion_settings'], config.motion_settings)
                 self.assertNotIn('snapshot_sha256', metadata)
-                self.assertEqual(metadata['schema'], 19)
+                self.assertEqual(metadata['schema'], 20)
                 self.assertEqual(metadata['preparation_poses'],
                                  {key: str(path) for key, path in config.upper_pose_paths.items()})
                 self.assertEqual(metadata['dex3_pd']['active'], config.hand_pd)
@@ -57,7 +57,7 @@ class RecordingTests(unittest.TestCase):
             empty = SessionRecorder(config, {'mode': 'control'}, directory)
             empty.close()
             self.assertFalse(empty.path.exists())
-            self.assertEqual(sorted(Path(directory).iterdir()), paths[-5:])
+            self.assertEqual(sorted(Path(directory).iterdir()), paths[-10:])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

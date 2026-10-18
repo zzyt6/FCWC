@@ -21,6 +21,5 @@
   "settle_max_s": 0.6,
   "residual_stop_rad_s": 0.8,
   "engage_ramp_s": 0.3,
-  "rate_control_enabled": false,
-  "pushcart_max_heading_error_rad": 0.2
+  "rate_control_enabled": false
 }

@@ -119,7 +119,14 @@ class NavPushcartTests(unittest.TestCase):
     def test_three_axis_task_limits_and_camera_loss_smooth_stop(self):
         for _ in range(80):
             data = self.send([.9, -.4, .6])
-        np.testing.assert_allclose(data['high_policy']['task_command'], [.6, -.15, .3], atol=1e-6)
+        high = data['high_policy']
+        np.testing.assert_allclose(high['raw_task_command'], [.6, -.15, .3], atol=1e-6)
+        # Fixed fake cart heading cannot follow the requested turn. The new
+        # task heading loop saturates its correction before the student.
+        self.assertAlmostEqual(high['heading_hold']['corr'], .15)
+        np.testing.assert_allclose(high['task_command'], [.6, -.15, .45], atol=1e-6)
+        np.testing.assert_allclose(data['velocity'], high['homie_command'], atol=1e-6)
+        self.assertEqual(data['heading']['correction_rad_s'], 0.)
         self.assertEqual(data['selected_model'], 'homie')
         self.assertEqual(data['heading']['command_source'], 'PUSHCART')
         self.assertTrue(self.executor._cart_status(data, self.now)['valid'])

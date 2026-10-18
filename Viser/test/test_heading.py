@@ -221,7 +221,7 @@ class HeadingTests(unittest.TestCase):
             np.testing.assert_array_equal(out,np.asarray([.2,.1,.02],dtype=np.float32))
             self.assertEqual(rig.control.integral,0)
 
-    def test_pushcart_tracks_student_turn_even_when_cart_requests_straight(self):
+    def test_pushcart_passes_student_turn_without_pelvis_feedback(self):
         for requested in (.002, -.002, .2, -.2):
             with self.subTest(robot_wz=requested):
                 rig=Rig(heading_kd=.2)
@@ -233,24 +233,26 @@ class HeadingTests(unittest.TestCase):
                     yaw=wrap_angle(yaw+previous*.02)
                     out,h=rig.tick((.2,.1,requested), yaw=yaw, omega=(0,0,previous),
                                    source='PUSHCART', raw_command=(.3,0,0))
-                    self.assertTrue(h['pushcart_tracking'])
+                    self.assertFalse(h['pushcart_tracking'])
                     self.assertFalse(h['navigation_tracking'])
-                    self.assertLess(abs(h['heading_error']),.001)
+                    self.assertEqual(h['heading_state'], 'PUSHCART')
+                    self.assertIsNone(h['heading_error'])
+                    self.assertEqual(h['correction_rad_s'], 0.)
                     self.assertGreater(out[2]*requested,0)
                     previous=requested
                 np.testing.assert_allclose(out,[.2,.1,requested],atol=1e-6)
-                self.assertAlmostEqual(h['heading_D'],0,places=5)
+                self.assertIsNone(h['heading_D'])
 
-    def test_pushcart_corrects_drift_bounds_reference_and_suppresses_stop_feedback(self):
+    def test_pushcart_drift_does_not_modify_homie_and_stop_still_decelerates(self):
         rig=Rig(heading_ki=.1)
         rig.tick((.2,0,0),source='PUSHCART')
         for i in range(70):
             out,h=rig.tick((.2,0,0),yaw=min(i*.002,.1),source='PUSHCART')
-        self.assertLess(out[2],0)
-        self.assertLessEqual(abs(out[2]),.15)
+        np.testing.assert_allclose(out,[.2,0,0],atol=1e-7)
         for _ in range(500):out,h=rig.tick((0,0,.2),yaw=.1,source='PUSHCART')
-        self.assertLessEqual(abs(h['heading_error']),.200001)
-        self.assertLessEqual(abs(rig.control.integral),.04)
+        np.testing.assert_allclose(out,[0,0,.2],atol=1e-7)
+        self.assertIsNone(h['heading_error'])
+        self.assertEqual(rig.control.integral,0.)
         previous=out.copy()
         for _ in range(150):
             out,h=rig.tick(yaw=.1,source='PUSHCART',smooth_zero=True)
@@ -265,12 +267,15 @@ class HeadingTests(unittest.TestCase):
 
     def test_pushcart_handoff_and_mode_controls(self):
         rig=Rig();rig.tick((.2,0,0))
-        _,h=rig.tick((.2,0,.02),yaw=.05,source='PUSHCART')
-        self.assertAlmostEqual(h['yaw_ref'],.05)
+        for _ in range(30):rig.tick((.2,0,0),yaw=.05)
+        self.assertNotEqual(rig.control.applied_correction,0.)
+        out,h=rig.tick((.2,0,.02),yaw=.05,source='PUSHCART')
+        self.assertIsNone(h['yaw_ref'])
+        np.testing.assert_allclose(out,[.2,0,.02],atol=1e-7)
         _,h=rig.tick((.2,0,0),yaw=.06)
         self.assertEqual(h['heading_state'],'HOLD')
         self.assertAlmostEqual(h['yaw_ref'],.06)
-        for mode in ('disabled','shadow'):
+        for mode in ('disabled','shadow','active'):
             rig.control.stop('test')
             rig.control.configure(dict(DEFAULTS,run_mode=mode,heading_ki=.1),quaternion())
             for _ in range(20):rig.tick()

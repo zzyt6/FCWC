@@ -5,6 +5,7 @@ This module loads the student and its paired Homie estimator/actor; no DDS or LC
 """
 import hashlib
 import json
+import math
 from pathlib import Path
 import time
 
@@ -16,6 +17,35 @@ from .homie_adapter import PushcartHomie
 
 ACTIVE = np.array(list(range(13)) + list(range(15, 29)))
 UPPER = ACTIVE[12:]
+
+
+class CartHeadingHold:
+    """Cart yaw feedback on the task command, before the training reference filter."""
+    def __init__(self, kp=1.0, max_corr=0.15, max_err=0.3):
+        self.kp, self.max_corr, self.max_err = kp, max_corr, max_err
+        self.reset()
+
+    def reset(self):
+        self.ref, self.err, self.corr = None, 0.0, 0.0
+
+    def __call__(self, task_cmd, imu_yaw, cam_rel_yaw, dt):
+        vx, vy, wz = task_cmd
+        if not all(math.isfinite(x) for x in (vx, vy, wz, imu_yaw, cam_rel_yaw, dt)) or dt < 0:
+            raise ValueError('Invalid cart heading input or control interval')
+        if abs(vx) < 1e-6 and abs(vy) < 1e-6 and abs(wz) < 1e-6:
+            self.reset()
+            return task_cmd
+        cart_yaw = imu_yaw + cam_rel_yaw
+        if self.ref is None:
+            self.ref = cart_yaw
+        self.ref += wz * dt
+        error = math.atan2(math.sin(self.ref - cart_yaw), math.cos(self.ref - cart_yaw))
+        if abs(error) > self.max_err:
+            error = math.copysign(self.max_err, error)
+            self.ref = cart_yaw + error
+        self.err = error
+        self.corr = max(-self.max_corr, min(self.max_corr, self.kp * error))
+        return (vx, vy, max(-0.6, min(0.6, wz + self.corr)))
 
 
 class StudentModel:
@@ -95,6 +125,7 @@ class ViserPushPolicy:
             estimator_checkpoint_sha256=cfg['provenance']['homie_velocity_estimator_sha256'],
             velocity_frame='pelvis body frame, x/y/z', velocity_scale=cfg['obs_scales']['lin_vel'])
         self.core = V81Controller(cfg, self.model)
+        self.hold = CartHeadingHold()
         self.camera = camera if camera is not None else CarmerYaw(
             cam['udp_port'], cam['timeout_s'], cam['yaw_offset_rad'], cam['tag_ids'])
         self.camera.allowed_ids = frozenset(cam['tag_ids'])
@@ -111,17 +142,26 @@ class ViserPushPolicy:
                              low_level='Viser auto Balance/Homie; paired tuned HIM velocity while pushcart is enabled or paused',
                              homie=self.homie_model.metadata,
                              upper_torque='PD estimate from preceding 2..8 ms bridge sample when available, otherwise latest; not measured torque',
-                             heading_feedback='PUSHCART: shared Viser mode/gains; integrate student robot wz as pelvis yaw reference, '
-                                              'correct before Walk/Balance selection; no correction during zero/stop',
+                             heading_feedback='PUSHCART: integrate raw clipped task wz with actual control dt; '
+                                              'measure IMU yaw + calibrated camera relative yaw; '
+                                              'P correction before the task-reference filter/student; '
+                                              'no pelvis heading correction on the student Homie command',
+                             cart_heading_hold=dict(kp=self.hold.kp, max_corr=self.hold.max_corr,
+                                                    max_err=self.hold.max_err, task_wz_limit=.6),
                              task_frame='cart forward/left; no extra XY rotation',
                              history='126 x 5 and 126 x 32; previous selected/executed leg action',
                              preparation='valid camera/body frames collected before activation; shadow predictions are not committed as actions',
                              settings_path=str(path))
         self.metadata['telemetry'] = dict(
-            task_command='clipped cart vx/vy/wz entering the task-reference filter; zero when motion is blocked',
+            raw_task_command='clipped cart vx/vy/wz before cart heading feedback and motion gating',
+            task_command='cart vx/vy/wz after cart heading feedback, entering the task-reference filter; zero when motion is blocked',
+            heading_hold='ref/err in rad, corr in rad/s; imu_yaw_rad + camera.yaw_rad = cart_yaw_rad; '
+                         'dt_s is actual monotonic control interval; reset on zero/stop',
             task_reference='filtered cart reference after this tick update; inference_inputs.previous_task_reference is before update',
             homie_command='high-level robot vx/vy/wz candidate before Viser zero interception and command filtering',
-            velocity_chain='high_policy.homie_command -> input_velocity -> filtered_velocity (Viser heading correction/stop filter) -> velocity; '
+            velocity_chain='raw_task_command -> cart heading hold -> task_command -> task_reference -> student Homie command; '
+                           'high_policy.homie_command -> input_velocity -> filtered_velocity -> velocity, without heading correction; '
+                           'zero/stop uses Viser deceleration and Balance receives zero; '
                            'velocity is the selected policy command, not measured robot speed',
             raw_actions=dict(shape=[30], slices=dict(command=[0, 3], upper=[3, 18], legs=[18, 30])),
             gate='dimensionless task-reference norm / gate_speed, clamped to [0, 1]',
@@ -171,6 +211,9 @@ class ViserPushPolicy:
         self.warm_error = ''
         self.torque_sample_age_ms = None
         self.inference_inputs = None
+        self.hold.reset()
+        self.heading_hold = None
+        self.raw_task_command = None
         self.task_command = None
         self.upper_target_selected = False
         self.applied_residual = np.zeros(12)
@@ -351,14 +394,14 @@ class ViserPushPolicy:
         self.core.cmd_homie.fill(0)
         self.core.upper_delta = state.applied_q[UPPER].copy() - self.core.hold
 
-    def command(self, state, task, previous_action, now, *, moving, previous_state=None):
+    def command(self, state, task, previous_action, now, *, moving, dt, previous_state=None):
         if not self.camera.fresh(now):
             self.reset('carmer 航向超时；已退出高层，请归零后重新启用', blocked=True)
             return np.zeros(3), True
-        self._predict(state, task, previous_action, now, moving=moving, previous_state=previous_state)
+        self._predict(state, task, previous_action, now, moving=moving, dt=dt, previous_state=previous_state)
         return self.output.cmd_homie.copy() if moving else np.zeros(3), False
 
-    def _predict(self, state, task, previous_action, now, *, moving, previous_state=None):
+    def _predict(self, state, task, previous_action, now, *, moving, dt=0., previous_state=None):
         if now - self.history_time > self.robot_config.deployment['state_timeout_s']:
             self._forget_history()
         # Use the preceding 200 Hz bridge sample when it was received. Record
@@ -380,7 +423,14 @@ class ViserPushPolicy:
         frame[-12:] = previous_action
         # Even a held zero command must use Viser's stop path, never a residual
         # generated from a previously nonzero task reference.
-        command = np.clip(task, self.limits[:, 0], self.limits[:, 1]) if moving else np.zeros(3)
+        self.raw_task_command = np.clip(task, self.limits[:, 0], self.limits[:, 1])
+        command = self.raw_task_command if moving else np.zeros(3)
+        # Same normalized SDK wxyz yaw as Viser heading.imu_yaw_rad. Camera yaw
+        # is calibrated and held between frames; command() checks its timeout.
+        imu_yaw = math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+        command = np.asarray(self.hold(command, imu_yaw, self.camera.yaw, dt))
+        self.heading_hold = dict(ref=self.hold.ref, err=self.hold.err, corr=self.hold.corr,
+                                 dt_s=dt, imu_yaw_rad=imu_yaw, cart_yaw_rad=imu_yaw + self.camera.yaw)
         inputs = dict(input_state_tick=(state.session, state.sequence),
                       input_state_received_ns=state.received_ns,
                       camera_captured_monotonic=self.camera.stamp, camera_yaw_rad=self.camera.yaw,
@@ -442,6 +492,8 @@ class ViserPushPolicy:
                     inference_inputs={k: v.copy() if isinstance(v, np.ndarray) else v
                                       for k, v in self.inference_inputs.items()} if self.inferred else None,
                     torque_sample_age_ms=self.torque_sample_age_ms if self.inferred else None,
+                    raw_task_command=self.raw_task_command.copy() if self.inferred else None,
+                    heading_hold=self.heading_hold.copy() if self.inferred else None,
                     task_command=self.task_command.copy() if self.inferred else None,
                     task_reference=self.output.cmd_ref.copy() if self.inferred else None,
                     homie_command=self.output.cmd_homie.copy() if self.inferred else None,

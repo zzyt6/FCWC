@@ -45,7 +45,7 @@ Viser 手动模式以 IMU 处理、实时命令接入为主：前进、后退、
 | TURNING | 使用补偿前原命令判定转弯，立即释放旧参考及 I/D；原地旋转也属于该状态 |
 | REACQUIRE | 转向回零去抖，角速度减小后重锁；最大等待 0.6 s，慢漂不会导致无限等待；异常残余转速请求原安全停止 |
 | TRACKING（NAVIGATION） | 非零导航命令进入；参考 yaw 按导航角速度推进，不使用手动转向死区；来源改变重新捕获参考 |
-| TRACKING（PUSHCART） | 推车运动时，参考 yaw 按高层生成的机器人角速度推进；Kp 修正骨盆执行误差后送入 Walk/Balance |
+| PUSHCART | 学生之前已完成小车任务航向修正；下层原样传递 HOMIE 指令，继续提供 IMU 检查和停车减速 |
 | EXTERNAL / UNKNOWN | 不启用航向补偿，wz=0 也按来源保留；返回 MANUAL 捕获当前朝向 |
 | RECOVERING | 释放旧参考，按 wz 变化率退出附加修正；健康窗口完成并回零后重新使能 |
 
@@ -53,14 +53,17 @@ Viser 手动模式以 IMU 处理、实时命令接入为主：前进、后退、
 
 TRACKING 先以当前 yaw 建立参考，之后 `yaw_ref += previous_wz_nav * dt`，其中 `wz_nav` 是前级斜坡后的导航角速度。最短角误差限于 ±`navigation_max_heading_error_rad`（默认 0.20 rad），避免不可执行的参考持续累积。补偿为 `Kp*e_eff + I + Kd*(wz_nav-filtered_yaw_rate)`，加回 `wz_nav` 后限幅并约束最终变化率；沿用 HOLD 的接入过渡和抗积分饱和。跟上导航转弯时误差接近零，不用固定的旧航向抵消 DWB。小倾角近似和训练定义限制仍适用，不等同于精确角速度执行环。停车和来源切换清除参考与积分。
 
-PUSHCART 按同一跟踪逻辑工作，前馈取高层经过自身滤波后输出的机器人 wz，参考用上一拍纠偏前的该值推进。
-小车任务 wz 只属于上层任务意图，不能直接拿来推进骨盆参考；纠偏后的 wz 也不能反馈到参考积分中。
-参考误差由 `pushcart_max_heading_error_rad` 限制为 ±0.20 rad。最终选择的速度回写高层和低层执行历史；
-零速启动不生成纠偏，停止时沿原 0.4 秒滤波并清除参考，Balance 接管后当前命令严格为零。
+PUSHCART 的独立 `CartHeadingHold` 位于 `G1_high_policy_deploy/robot/pushcart_v81/viser_policy.py`，在任务参考滤波和学生之前执行。
+测量为骨盆 IMU yaw 加已标零的相机相对 yaw，短暂丢帧使用保持值，超时继续走原暂停流程。
+起步捕获当前小车朝向，参考按限幅后的原始小车任务 wz 乘实际 monotonic 控制间隔推进。
+最短角误差限幅 ±0.3 rad，达到限幅时参考跟随测量拖动；Kp=1.0，修正限幅 ±0.15 rad/s，修正后的任务 wz 限于 ±0.6。
+不加积分或额外低通；零任务/暂停复位。普通行走的网页/启动参数只控制骨盆环，不改变这个任务环。
+正常推车 Homie 执行时 `filtered_velocity` 和 `velocity` 等于学生的 `homie_command`，下层修正为零。
+实际选择的命令回写高层和低层历史；停止沿原 0.4 秒滤波减速，Balance 接管后当前命令严格为零。
 
 速度命令 vx/vy/wz 均沿用前级 0.4 秒滤波，不重复过滤。active 航向分支仅对附加纠偏使用 0.4 rad/s² 变化率限制，再与已滤波的 wz 相加；disabled/shadow 原样返回前级命令。安全停止直接覆盖。
 
-行走与推车共用 `config/motion_config.json`，按用户最新要求恢复默认 active；导航独立使用 `nav/locomotion/motion_config.json`，默认 active，Kp=1、Ki=Kd=0。范围在 `heading.validate_settings` 校验：
+普通行走使用 `config/motion_config.json`，默认 active；导航骨盆环独立使用 `nav/locomotion/motion_config.json`，默认 active，Kp=1、Ki=Kd=0。范围在 `heading.validate_settings` 校验：
 
 | 参数 | 初始配置 | 单位/目的 |
 | --- | ---: | --- |
@@ -77,7 +80,6 @@ PUSHCART 按同一跟踪逻辑工作，前馈取高层经过自身滤波后输�
 | engage_ramp_s | 0.3 | s，接入修正过渡 |
 | rate_control_enabled | false | 训练语义未确认，拒绝启用 |
 | navigation_max_heading_error_rad | 0.20 | rad，仅导航移动参考使用 |
-| pushcart_max_heading_error_rad | 0.20 | rad，仅推车移动参考使用 |
 
 命令范围和滤波时间常数读取部署 `deploy.json`：vx [-0.8,1.2]，vy ±0.5，wz ±0.8，`command_filter_tau_s=0.4`。`command_slew_per_s[2]=0.4` 只约束附加航向纠偏，不再代替命令滤波。Kp=1.0、纠偏上限 0.15 沿用当前参数，实机效果仍需验证。
 
@@ -103,7 +105,7 @@ $PYTHON Viser/test/test_web.py
 
 回放输出到独立 系统临时目录 `/tmp/viser_replay_时间/`（可用 `--output` 指定项目外目录）：`heading.jsonl`、`summary.json`、`heading.png`，图含连续展开的航向、误差、三种角速度、建议/实际 wz、状态和时间/限制事件。`--no-plot` 只需 NumPy；本机系统 Python 已有 matplotlib。文件脚本不导入 Bridge、不创建通信。
 
-每次 observe/control 仍自动独立存档，只保留最近 5 次有本体反馈的会话；sim 需指定项目外 `--record-sim --record-dir /tmp/viser-sim`。telemetry.heading 保存处理量；raw state 保留原四元数/gyro。null 表示未提供或不适用，不能当成零测量。`wz_final_applied` 是航向环输出、送去选模的物理指令；最终选中运控的命令看同帧 `velocity`（Balance 会置零），`wz_suggested` 是建议。`correction_rad_s` 是主动模式的附加修正请求，受变化率约束时不等于瞬时实际输出差值。推车还有 `pushcart_tracking` 和 `command_source=PUSHCART` 标明参考来源。`inspect_session.py 会话目录` 可读旧/新日志。
+每次 observe/control 仍自动独立存档，只保留最近 10 次有本体反馈的会话；sim 需指定项目外 `--record-sim --record-dir /tmp/viser-sim`。telemetry.heading 保存处理量；raw state 保留原四元数/gyro。null 表示未提供或不适用，不能当成零测量。`wz_final_applied` 是航向环输出、送去选模的物理指令；最终选中运控的命令看同帧 `velocity`（Balance 会置零），`wz_suggested` 是建议。`correction_rad_s` 是主动模式的附加修正请求，受变化率约束时不等于瞬时实际输出差值。推车 `command_source=PUSHCART`、`pushcart_tracking=false`、`correction_rad_s=0`；任务环数据见 `high_policy.heading_hold` 的 `ref/err/corr/dt_s/imu_yaw_rad/cart_yaw_rad`，修正前后任务见 `raw_task_command` / `task_command`。`inspect_session.py 会话目录` 可读旧/新日志。
 
 ## 5. 真机步骤（仅供操作者执行，本次未执行）
 
