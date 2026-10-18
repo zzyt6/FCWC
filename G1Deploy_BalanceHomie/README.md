@@ -1,6 +1,6 @@
 # G1 Balance + Homie 混合部署包
 
-零速／小速度命令时使用上传的 `models/balance.zip` 内 Balance（`model_68600.pt` 导出的 ONNX），行走使用 Homie 60000 轮 ONNX。Balance 的原始导出配置保存在 `models/balance/config.json`，两套 ONNX 均保留各自导出文件的原始字节。
+零速／小速度命令时使用上传的 `models/balance.zip` 内 Balance（`model_68600.pt` 导出的 ONNX）。行走默认使用 `models/homie/` 的 Homie 60000 轮；Viser 准备前也可选 `models/homie_68000/` 的 68000 轮，分别与高层 V8.1、V8.2 配套。两套完整模型、契约、来源和校验向量独立保留，清单分别为 `models/manifest.json` 和 `models/manifest_v82.json`；ONNX 保留原始字节。Balance 的原始导出配置在 `models/balance/config.json`，两套组合共用同一 Balance、机身配置和 PD。
 
 ## 启动与网页操作
 
@@ -121,6 +121,8 @@ python tools/verify_telemetry.py reports/control_hybrid.jsonl
 Viser may request one Dex3 finger to return inside its software limits while the body is still waiting for preparation. The request uses the existing official HandCmd position mode, with a 0.15 rad maximum initial excursion, Kp ramping from 0.5 to 2 over 1 s (Kd=0.1), a 3 s timeout, measured arrival checks, and feedback/command watchdogs. It does not reset motor errors or change the joint limits. Dex3 position excursions are warnings and do not block preparation or stop body control. Recovery failure cancels only that hand attempt and emits a DEX3 RECOVERY warning; it does not fault the body core. Hand SDK/feedback faults and hand-only DDS channel initialization or write failures are local warnings: pause both hand trajectories, attempt Kp=0/Kd=0.1 hand damping, and keep publishing body commands. Body preparation is independent of hand availability and cancels any ongoing finger recovery. It never enables or zeroes Dex3. In the normal startup flow, no hand motor commands are published until the first explicit pose-button click after body preparation; that click enables both hands and grasps from fresh measured angles, respecting the compensation checkbox. Subsequent clicks alternate open/grasp. Explicit single-finger recovery remains a separate manual action. Reconnection alone cannot resume hand motion: the client acknowledges suspension with hand_pose=0, then explicitly requests a pose using fresh feedback as the interpolation start. Viser exposes this as a 3-second re-enable-and-open action respecting the compensation checkbox. Body health/communication checks and explicit stops remain required. `cpp/hand_core.hpp` contains the recovery bounds; `tests/test_hand_recovery.cpp` and `tests/test_hand_dds.cpp` cover recovery and the generated motor messages.
 
 Local protocol v6 appends a selected recovery joint to commands and recovery availability/status to telemetry. Rebuild the bridge and use the accompanying Python protocol together. The shipped runtime manifest omits the absent, unused training archive `models/homie/params.zip`; ONNX and deployment contract hashes remain checked.
+
+Dex3 DDS samples with a motor count other than seven are discarded without refreshing the last complete sample's timestamp. A single empty sample therefore does not release grasp PD; repeated malformed samples still expire the existing 200 ms watchdog. Explicit hand/motor errors and overheating invalidate feedback immediately, including errors carried by incomplete samples. The bridge logs discarded samples per hand/topic, at most once per second. Feedback recovery after an actual suspension never rearms the hands automatically.
 
 ## 推车上肢模式
 

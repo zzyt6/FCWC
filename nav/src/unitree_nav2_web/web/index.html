@@ -21,8 +21,8 @@
       <div class="sidebarScroll">
         <ol class="steps" aria-label="执行顺序">
           <li id="stepMap"><span>1</span><b>地图</b></li>
-          <li id="stepLoc"><span>2</span><b>定位</b></li>
-          <li id="stepLoco"><span>3</span><b>运控</b></li>
+          <li id="stepLoco"><span>2</span><b>站立</b></li>
+          <li id="stepLoc"><span>3</span><b>定位</b></li>
           <li id="stepMotion"><span>4</span><b>运动门</b></li>
           <li id="stepNav"><span>5</span><b>导航</b></li>
         </ol>
@@ -44,20 +44,17 @@
           </div>
         </details>
 
-        <details class="card" open>
-          <summary><span>定位</span><em id="locBadge" class="badge">等待地图</em></summary>
-          <div class="cardBody">
-            <div id="scanStats" class="note info">等待实时 /scan…</div>
-            <button id="initialMode" class="block" disabled>设置初始位姿</button>
-            <p class="hint">在地图上按住并拖动，青色扫描轮廓会跟随候选位置和朝向，用墙角和走廊与静态地图对齐。</p>
-          </div>
-        </details>
-
         <details class="card locomotionCard" open>
           <summary><span>运控（Balance / Homie）</span><em id="locoBadge" class="badge">未连接</em></summary>
           <div class="cardBody">
             <div id="locoStatus" class="note">等待运控执行进程…</div>
             <div id="locoWarnings" class="note warn" role="status" hidden></div>
+            <label class="field">模型组合
+              <select id="locoModelSet" disabled>
+                <option value="">等待运控连接</option>
+              </select>
+            </label>
+            <p id="locoModelSetStatus" class="hint">默认 60000 轮 + V8.1；准备前可切换，开始准备后锁定。</p>
             <label class="field">上半身准备姿态
               <select id="locoPreparePose" disabled>
                 <option value="">等待运控连接</option>
@@ -75,6 +72,17 @@
               <button id="locoReset" disabled>复位（只读）</button>
             </div>
             <p class="hint">导航速度直接交给我们自己的 Balance/Homie 策略执行（含骨盆航向外环）。接管底层后没有姿态支撑，需吊装或扶稳；实体遥控器 L2 随时可停止。</p>
+          </div>
+        </details>
+
+        <details class="card" open>
+          <summary><span>定位（落地站稳后）</span><em id="locBadge" class="badge">等待地图</em></summary>
+          <div class="cardBody">
+            <div id="scanStats" class="note info">等待实时 /scan…</div>
+            <div id="gantryStatus" class="note warn" role="status" hidden></div>
+            <p id="initialPoseHint" class="hint">先完成准备姿态、启动混合策略，确认机器人落地站稳后再设置初始位姿。</p>
+            <button id="initialMode" class="block" disabled>设置初始位姿</button>
+            <p class="hint">在地图上按住并拖动，青色扫描轮廓会跟随候选位置和朝向，用墙角和走廊与静态地图对齐。</p>
           </div>
         </details>
 
@@ -140,6 +148,8 @@
             <label><input type="checkbox" data-display="globalPath" checked><i class="layerDot pathDot"></i>全局路径</label>
             <label><input type="checkbox" data-display="localPath" checked><i class="layerDot localPathDot"></i>Local Plan</label>
             <label><input type="checkbox" data-display="robot" checked><i class="layerDot robotDot"></i>G1 位姿 / 朝向</label>
+            <label><input type="checkbox" data-display="cart" checked><i class="layerDot cartDot"></i>小车轮廓 / 航向</label>
+            <label><input type="checkbox" data-display="footprint" checked><i class="layerDot footprintDot"></i>组合碰撞轮廓</label>
             <label><input type="checkbox" data-display="radar" checked><i class="layerDot scanDot"></i>局部雷达窗</label>
           </div>
         </details>
@@ -164,6 +174,8 @@
         <span><i class="local"></i>局部障碍</span>
         <span><i class="scan"></i>实时雷达</span>
         <span><i class="path"></i>规划路径</span>
+        <span><i class="cart"></i>小车 / 航向</span>
+        <span><i class="footprint"></i>组合轮廓</span>
       </div>
       <div id="modeBadge">平移 / 缩放模式</div>
       <div class="viewerStatus">

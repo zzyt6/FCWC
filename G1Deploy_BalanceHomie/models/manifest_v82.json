@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "profile": "hybrid_balance_homie_456_456",
+  "model_files": {
+    "balance": "models/balance/policy.onnx",
+    "homie": "models/homie_68000/policy.onnx"
+  },
+  "model_sha256": {
+    "balance": "337a51066937b9b0ac8e72b14fd1763d232e17fcdeaacc5d06210e6e5f78349c",
+    "homie": "301cabafabc9d0a1fb3eb6bfd467da97e1b2be225300d2f3ff65107982022de1"
+  },
+  "artifact_sha256": {
+    "models/balance/deployment_contract.json": "04b64755444585c007f99515a80c12ffc8661b5bbe60f590b8fa59f47d995541",
+    "models/balance/verification_vectors.npz": "902705d4617d03689f07c3c6455e4e4bcba24e27bd3776d32c329429f10a6cc9",
+    "models/balance/manifest.json": "093b4d61bddc40c4ca72f77a54bd603d03c26889e0eac49174325b3d96655c93",
+    "models/balance/policy.onnx": "337a51066937b9b0ac8e72b14fd1763d232e17fcdeaacc5d06210e6e5f78349c",
+    "models/homie_68000/deployment_contract.json": "8518642591ab1f175b71bafa4c9ecd97eff09a82c8b9416dfe9f85ebcd961097",
+    "models/homie_68000/verification_vectors.npz": "f09f9fb3bbfed1e536df513c10feb9f5e54dda1e9b0e9850dc2607020423505d",
+    "models/homie_68000/training_g1.urdf": "449b618e3c0e640d600e73e6cc9072d06b62a8c56c393bbb83aa46b32a9e2153",
+    "models/homie_68000/policy_jit.pt": "993adb7e4af701561a7c2830a6f55ae6c318b919073a191df5be08bcb685238d",
+    "models/homie_68000/physics_config.json": "4c7fde3dc7202c7f94d569931aafde0dfea11abce34abd09f98660c4cc2f5715",
+    "models/homie_68000/manifest.json": "6a52a375f2aba6b0527c58c03addf75d7797453bc77dc190f89b99ad153c6bbe",
+    "models/homie_68000/policy.onnx": "301cabafabc9d0a1fb3eb6bfd467da97e1b2be225300d2f3ff65107982022de1",
+    "reference_adapters/balance_policy.py": "04121ad9aa707f511cf31995bc395effba9bd5fec293806db332dac91a61d7e1",
+    "reference_adapters/homie_policy.py": "cd97f27fc857d0f1e4e4aa22e8e5843ef464276a338c8ecaf5daf8ef83921c0e",
+    "models/balance/config.json": "ab69a066d23468cd9d488442c9df5a054ef3c2b4bf6c658d30d4433b691456b4"
+  },
+  "sources": {
+    "balance": "models/balance.zip",
+    "homie": "logs/rsl_rl/homie_g1_v3/2026-10-16_13-22-44_v3_fric_ent005_from64000/model_68000.pt"
+  },
+  "model_bytes_unchanged": true
+}

@@ -13,7 +13,8 @@ import numpy as np
 from core.robot import JOINT_NAMES, URDF_PATH, HAND_PD_PATH, UPPER_POSE_LABELS, RobotConfig
 from core.controller import Controller, STAGES
 from core.heading import CONFIG_PATH
-from core.pushcart import CONFIG as PUSHCART_CONFIG, load_feature
+from core.pushcart import CONFIG as PUSHCART_CONFIG
+from core.model_sets import ModelSets, MODEL_SET_LABELS
 from Vender.joint_panel import JointMonitorPanel, joint_label
 from Vender.hand_panel import HandGraspPanel
 from Vender.robot_display import UrdfDisplayUpdater, load_display_robot, feedback_configuration, current_grasp_reference
@@ -86,6 +87,19 @@ class Viewer:
                         controller.emit(kind, event.client_id)
                     button.on_click(clicked)
                     buttons[kind] = button
+                    if kind == 'claim':
+                        model_selector = client.gui.add_dropdown(
+                            '模型组合', tuple(MODEL_SET_LABELS.values()),
+                            initial_value=MODEL_SET_LABELS[controller.model_set], disabled=True)
+                        client.gui.add_markdown('先选择模型组合，再接管底层、准备和启动。进入准备后锁定本次选择。')
+                        async def change_model_set(event):
+                            if event.client_id is not None:
+                                key = next((key for key, label in MODEL_SET_LABELS.items()
+                                            if label == event.target.value), None)
+                                if key is not None:
+                                    controller.emit('model_set', event.client_id, model_set=key)
+                        model_selector.on_update(change_model_set)
+                        buttons['model_set'] = model_selector
                     if kind == 'acquire':
                         pose_selector = client.gui.add_dropdown(
                             '上半身准备姿态', tuple(UPPER_POSE_LABELS.values()),
@@ -234,6 +248,9 @@ class Viewer:
             hands = data.get('dex3', {})
             recovering = hands.get('recovering') or hands.get('recovery_pending')
             buttons['prepare'].disabled = not (owned and healthy and stage == 'ZERO')
+            model_selector = buttons['model_set']
+            model_selector.disabled = not (owned and healthy and data.get('model_set_selectable', False))
+            model_selector.value = MODEL_SET_LABELS[data.get('model_set', self.control.model_set)]
             pose_selector = buttons['prepare_pose']
             pose_selector.disabled = not (owned and healthy and stage in ('WAITING', 'ZERO')
                                           and data.get('prepare_pose_selectable', False))
@@ -303,6 +320,7 @@ class Viewer:
                 status += '\n\n**正在平滑减速至零**'
             if data.get('preparation_warning'):
                 status += '\n\n**准备超时，继续保持姿态；未到位关节见左侧告警。**'
+            status += '\n\n模型：' + MODEL_SET_LABELS[data.get('model_set', self.control.model_set)]
             status += '\n\n上半身：' + UPPER_POSE_LABELS[data.get('prepare_pose', 'original')]
             hands = data.get('dex3', {})
             hand_text = {'grasp': '抓握', 'open_compensated': '补偿归零（松开）',
@@ -387,7 +405,7 @@ def main():
     parser.add_argument('--command-frame', choices=('body',), help='Body axes for vx/vy; IMU corrects only wz')
     parser.add_argument('--heading-kp', type=float, help='Override heading Kp (0..2 per second)')
     parser.add_argument('--heading-mode', choices=('disabled','shadow','active'),
-                        help='Pelvis heading feedback; default from config (active)')
+                        help='Pelvis heading feedback; default from config')
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not np.isfinite(args.duration) or args.duration < 0:
         parser.error('Invalid port or duration')
@@ -399,7 +417,7 @@ def main():
             parser.error('Synthetic recordings must be outside Viser/logs')
     config = RobotConfig(args.urdf, args.motion_config, args.command_frame, args.heading_kp, args.heading_mode,
                          hand_pd_config=args.dex3_pd_config)
-    backend = controller = viewer = log = recorder = bridge_log = high_policy = None
+    backend = controller = viewer = log = recorder = bridge_log = model_sets = None
     exit_error = None
     stop = False
     def request_stop(*_):
@@ -408,9 +426,7 @@ def main():
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     try:
-        high_policy = load_feature(config, args.mode, args.interface, args.pushcart_config)
-        if config.pushcart_error:
-            print('推车功能未加载，普通混合策略继续可用：' + config.pushcart_error, flush=True)
+        model_sets = ModelSets(config, args.mode, args.interface, args.pushcart_config, args.policy_mode)
         if args.mode in ('observe', 'control') or args.record_sim:
             from core.recording import SessionRecorder
             recorder = SessionRecorder(config, vars(args), args.record_dir)
@@ -426,7 +442,7 @@ def main():
             bridge_log = (recorder.path / 'bridge.log').open('x', buffering=1)
         backend = Bridge(config, args.mode, args.interface, output=bridge_log)
         controller = Controller(config, backend, args.mode, recorder=recorder, policy_mode=args.policy_mode,
-                                high_policy=high_policy)
+                                model_sets=model_sets)
         viewer = Viewer(controller, args.host, args.port)
         controller.start()
         print('READY mode=%s | http://127.0.0.1:%d | 局域网用本机 IP:%d' %
@@ -448,8 +464,8 @@ def main():
             viewer.close()
         if backend and not controller:
             backend.close()
-        if high_policy and not controller:
-            high_policy.close()
+        if model_sets and not controller:
+            model_sets.close()
         if bridge_log:
             bridge_log.close()
         if log:

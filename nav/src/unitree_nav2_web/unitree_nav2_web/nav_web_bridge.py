@@ -17,7 +17,7 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from lifecycle_msgs.msg import Transition
 from lifecycle_msgs.srv import ChangeState
 from nav2_msgs.action import NavigateToPose
-from nav2_msgs.srv import ManageLifecycleNodes
+from nav2_msgs.srv import ClearEntireCostmap, ManageLifecycleNodes
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavigationPath
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
@@ -38,6 +38,8 @@ FOOTPRINT = "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
 # The motion gate refuses to open unless our own locomotion executor reports
 # a running policy within this age.  It is also re-checked every status tick.
 LOCOMOTION_READY_GRACE_S = 0.6
+REFERENCE_READY_GRACE_S = 0.6
+AMCL_REFRESH_AFTER_S = 0.5
 
 
 def _valid_navigation_pose(pose):
@@ -65,6 +67,7 @@ class NavigationWebBridge(Node):
         self.declare_parameter("cart_bt_xml", "")
         self.declare_parameter("locomotion_command_port", 39002)
         self.declare_parameter("locomotion_status_port", 39005)
+        self.declare_parameter("initial_pose_requires_policy", True)
         self.declare_parameter(
             "speed_settings_file", str(Path.cwd() / "config" / "navigation_speed.json")
         )
@@ -79,8 +82,10 @@ class NavigationWebBridge(Node):
         self.nav2_params_file = self.get_parameter("nav2_params_file").value
         self.footprint = str(self.get_parameter("footprint").value)
         self.cart_bt_xml = self.get_parameter("cart_bt_xml").value
+        self.initial_pose_requires_policy = self.get_parameter("initial_pose_requires_policy").value
         self.navigation_reference = {}
         self.reference_received = -float('inf')
+        self.reference_not_ready_since = None
         self.generated_maps_dir.mkdir(parents=True, exist_ok=True)
 
         self.lock = threading.RLock()
@@ -104,6 +109,13 @@ class NavigationWebBridge(Node):
         # A bridge-only restart cannot infer the live costmap footprint left
         # by a previous process; it is re-acknowledged before motion.
         self.footprint_confirmed = False
+        self.footprint_preparing = False
+        self.footprint_error = ""
+        self.next_footprint_attempt = 0.0
+        self.footprint_thread = None
+        self.costmap_updates = {}
+        self.costmap_stamps = {}
+        self.costmap_clear_pending = {}
         self.navigation_task_state = "IDLE"
         self.navigation_result_code = None
         self.navigation_completed_count = 0
@@ -138,6 +150,7 @@ class NavigationWebBridge(Node):
         self.localization_quality = None
         self.last_safety_event = ""
         self.last_navigation_guard = None
+        self.last_navigation_diagnostic = None
         self.goal_handle = None
         self.amcl_process = None
         self.pending_amcl_map = None
@@ -259,6 +272,10 @@ class NavigationWebBridge(Node):
         self.global_costmap_parameter_client = self.create_client(
             SetParameters, "/global_costmap/global_costmap/set_parameters"
         )
+        self.costmap_clear_clients = {
+            name: self.create_client(ClearEntireCostmap, f'/{name}_costmap/clear_entirely_{name}_costmap')
+            for name in ('local', 'global')
+        }
         self.localization_manager_client = self.create_client(
             ManageLifecycleNodes, "/lifecycle_manager_localization/manage_nodes"
         )
@@ -276,6 +293,7 @@ class NavigationWebBridge(Node):
         self.create_timer(0.2, self._amcl_supervisor_timer)
         self.create_timer(0.2, self._nomotion_update_timer)
         self.create_timer(0.5, self._status_timer)
+        self.create_timer(0.5, self._prepare_reference_timer)
         self.http_server = self._start_http_server()
         self._set_motion(False)
 
@@ -300,6 +318,16 @@ class NavigationWebBridge(Node):
         stage_text = locomotion["stage_text"]
         if locomotion["stage"] in ("DAMPED", "FAULT"):
             return [f"运控已{stage_text}，请先复位运控"]
+        if locomotion["stage"] == "POLICY":
+            high = locomotion.get('high_policy') or {}
+            cart = locomotion.get('cart') or {}
+            if high.get('motion_blocked'):
+                return [high.get('reason') or '推车策略已暂停，请检查抓握和相机状态']
+            if cart.get('attached') and not high.get('enabled'):
+                return ['小车仍处于连接状态，请完成抓握并启用推车策略；结束推车时请解除小车连接']
+            if cart.get('attached') and not cart.get('valid'):
+                return [cart.get('reason') or '等待有效的小车位置和航向']
+            return [locomotion.get('reason') or '混合策略已运行，等待运控反馈或上肢切换完成']
         return [f"运控尚未进入策略运行：{stage_text}"]
 
     def _reference_blockers(self, locomotion):
@@ -309,6 +337,27 @@ class NavigationWebBridge(Node):
                 or not reference.get('ready') or epoch != reference.get('epoch')):
             return [reference.get('reason') or '导航参考点或车体过滤尚未就绪']
         return []
+
+    def _check_reference_gate(self, locomotion):
+        """Keep authorization through brief gaps; the UDP node stops velocity immediately."""
+        reason = None
+        with self.lock:
+            blockers = self._reference_blockers(locomotion)
+            gate_open = self.motion_enabled or self.motion_requested
+            if not gate_open or not blockers:
+                self.reference_not_ready_since = None
+                return
+            epoch = (locomotion.get('cart') or {}).get('epoch')
+            if epoch != self.navigation_reference.get('epoch'):
+                reason = '导航参考模式已切换'
+            else:
+                now = time.monotonic()
+                if self.reference_not_ready_since is None:
+                    self.reference_not_ready_since = now
+                if now-self.reference_not_ready_since >= REFERENCE_READY_GRACE_S:
+                    reason = '导航参考持续不可用：' + '；'.join(blockers)
+        if reason:
+            self._stop_for_navigation_reference(reason)
 
     def _reference_callback(self, message):
         try:
@@ -323,9 +372,54 @@ class NavigationWebBridge(Node):
             self.navigation_reference, self.reference_received = reference, stamp
             if changed:
                 self.footprint_confirmed = False
-            close = (changed or not reference.get('ready')) and (self.motion_enabled or self.motion_requested)
+                self.footprint_error = ""
+                self.next_footprint_attempt = 0.0
+            close = changed and (self.motion_enabled or self.motion_requested)
         if close:
+            self._stop_for_navigation_reference('导航参考模式已切换')
+        self._check_reference_gate(self.locomotion.snapshot())
+
+    def _stop_for_navigation_reference(self, reason):
+        # Preserve the first failed dependency. Waiting for the missing cart
+        # scan to become an AMCL timeout hides the actual cause of the stop.
+        with self.lock:
+            active = self.navigation_active
+        if active:
+            self._abort_navigation_for_motion_gate(reason)
+        else:
+            self._record_navigation_failure(reason)
+            self.last_safety_event = reason
+            self.get_logger().error(reason)
             self._set_motion(False)
+
+    def _navigation_diagnostic(self):
+        now = time.monotonic()
+        locomotion = self.locomotion.snapshot()
+        camera = (locomotion.get('high_policy') or {}).get('camera') or {}
+        def age(stamp):
+            return round(now-stamp, 3) if stamp and math.isfinite(stamp) else None
+        with self.lock:
+            return dict(
+                monotonic=now, mode=self.navigation_reference.get('mode'),
+                cloud_age_s=age(self.last_cloud_time), odom_age_s=age(self.last_odom_time),
+                scan_age_s=age(self.last_localization_scan_time), pose_age_s=age(self.last_pose_time),
+                camera_age_s=age(camera.get('captured_monotonic')),
+                odom_speed=self.last_odom_speed, odom_angular_speed=self.last_odom_angular_speed,
+                reference_ready=self.navigation_reference.get('ready'),
+                reference_reason=self.navigation_reference.get('reason'),
+                observations=self.navigation_reference.get('observations'),
+                locomotion_stage=locomotion.get('stage'), locomotion_reason=locomotion.get('reason'),
+                amcl_alive=self.amcl_process is not None and self.amcl_process.poll() is None,
+                update_requested=self.nomotion_update_inflight)
+
+    def _record_navigation_failure(self, reason):
+        try:
+            diagnostic = dict(reason=reason, **self._navigation_diagnostic())
+            self.last_navigation_diagnostic = diagnostic
+            self.get_logger().error('Navigation diagnostic: ' + json.dumps(diagnostic, ensure_ascii=False))
+        except Exception:
+            # Diagnostics must never prevent cancellation or gate closure.
+            pass
 
     def _cart_map_pose(self, cart):
         if not cart.get('valid') or not self.current_pose:
@@ -363,6 +457,10 @@ class NavigationWebBridge(Node):
                 gate_blockers.append("导航任务正在执行")
             gate_blockers.extend(self._locomotion_blockers(locomotion))
             gate_blockers.extend(self._reference_blockers(locomotion))
+            if self.footprint_preparing:
+                gate_blockers.append("正在更新导航轮廓和障碍图")
+            elif self.footprint_error:
+                gate_blockers.append("导航障碍图等待重建：" + self.footprint_error)
             speed = self.navigation_speed.snapshot()
             if not speed["ready"] or speed["pending"]:
                 gate_blockers.append("导航速度设置尚未确认")
@@ -376,12 +474,14 @@ class NavigationWebBridge(Node):
                 "metadata": self.map_metadata,
                 "sensors_ready": sensors_ready,
                 "localized": self.localized,
+                "initial_pose_requires_policy": self.initial_pose_requires_policy,
                 "localization_updates": self.localization_updates,
                 "localization_refinement_attempts": self.localization_refinement_attempts,
                 "localization_fault": self.localization_fault,
                 "localization_quality": self.localization_quality,
                 "last_safety_event": self.last_safety_event,
                 "last_navigation_guard": self.last_navigation_guard,
+                "last_navigation_diagnostic": self.last_navigation_diagnostic,
                 "localization_scan": {
                     "points": self.localization_scan_points,
                     "bins": self.localization_scan_bins,
@@ -397,10 +497,15 @@ class NavigationWebBridge(Node):
                 "motion_gate": {
                     "can_enable": not gate_blockers,
                     "blockers": gate_blockers,
+                    "suspended": self.motion_enabled and bool(
+                        self._reference_blockers(locomotion) or self._locomotion_blockers(locomotion)),
                 },
                 "locomotion": locomotion,
                 "sent_monotonic": now,
                 "navigation_reference": self.navigation_reference,
+                "costmap_preparation": dict(ready=self.footprint_confirmed,
+                                            pending=self.footprint_preparing,
+                                            error=self.footprint_error),
                 "cart_pose": self._cart_map_pose(locomotion.get('cart') or {}),
                 "navigation_active": self.navigation_active,
                 "navigation_distance": self.navigation_distance,
@@ -791,7 +896,9 @@ class NavigationWebBridge(Node):
             self.nomotion_update_inflight = False
             self.map_metadata = pending["metadata"]
             self.phase = "WAITING_INITIAL_POSE"
-            self.message = "AMCL 地图已装载；请拖拽指定机器人初始位置和朝向"
+            self.message = ("AMCL 地图已装载；先完成准备姿态、启动混合策略，落地站稳后再设置初始位姿"
+                            if self.initial_pose_requires_policy else
+                            "AMCL 地图已装载；请拖拽指定机器人初始位置和朝向")
             self.error = ""
         self._set_motion(False)
         self._publish_status()
@@ -818,6 +925,16 @@ class NavigationWebBridge(Node):
                 raise ValueError("AMCL 二维地图尚未装载")
             if self.navigation_active:
                 raise ValueError("导航执行中不能重新设置初始位姿，请先停止导航")
+            if self.initial_pose_requires_policy:
+                locomotion = self.locomotion.snapshot()
+                # Body policy state is independent of cart/camera readiness.
+                # It cannot establish foot contact: the operator still checks
+                # that the robot is standing on the ground before submitting.
+                if not (locomotion.get('online') and locomotion.get('healthy')
+                        and locomotion.get('stage') == 'POLICY'):
+                    raise ValueError("请先完成准备姿态并启动混合策略，待机器人落地站稳后再设置初始位姿")
+                if locomotion.get('decelerating'):
+                    raise ValueError("请等待机器人停止并站稳后再设置初始位姿")
             replace_confirmed = query.get("replace", ["false"])[0].lower() in (
                 "1",
                 "true",
@@ -906,22 +1023,28 @@ class NavigationWebBridge(Node):
                 self.navigation_last_motion_time = now
 
     def _nomotion_update_timer(self):
+        now = time.monotonic()
         with self.lock:
             localization_request = (
                 self.phase == "LOCALIZING"
                 and self.localization_refinement_active
             )
-            # A stationary, already-converged Foxy AMCL does not periodically
-            # publish /amcl_pose.  At goal start request one official scan
-            # update and judge freshness from a post-goal sequence number,
-            # never from the old wall-clock age of the converged pose.
+            # AMCL publishes on displacement, not on a timer. A humanoid can
+            # sway above our velocity threshold without exceeding AMCL's
+            # 2 cm / .02 rad displacement thresholds. Ask for a real scan
+            # update during waiting/slow motion too; never fabricate a pose
+            # heartbeat or extend the 1.5 s lost-localization deadline.
             navigation_request = (
-                self.navigation_active and not self.navigation_pose_received
+                self.navigation_active
+                and (not self.navigation_pose_received or now-self.last_pose_time >= AMCL_REFRESH_AFTER_S)
+                and now-self.last_cloud_time < 1.5
+                and now-self.last_odom_time < 1.5
+                and now-self.last_localization_scan_time < 1.5
             )
             should_request = (
                 (localization_request or navigation_request)
                 and not self.nomotion_update_inflight
-                and time.monotonic() >= self.next_nomotion_update_time
+                and now >= self.next_nomotion_update_time
             )
         if not should_request or not self.nomotion_update_client.service_is_ready():
             return
@@ -1188,7 +1311,7 @@ class NavigationWebBridge(Node):
                     self.localization_fault = ""
                     if not self.navigation_active:
                         self.phase = "READY"
-                        self.message = "AMCL 定位稳定；运控进入策略运行后可启用运动门"
+                        self.message = "AMCL 定位稳定"
             if self.localized and (hard_jump or self.bad_localization_updates >= 3):
                 if hard_jump:
                     fault = (
@@ -1208,6 +1331,7 @@ class NavigationWebBridge(Node):
             self._handle_localization_fault(fault)
 
     def _handle_localization_fault(self, reason):
+        self._record_navigation_failure(reason)
         with self.lock:
             handle = self.goal_handle
             if self.navigation_active:
@@ -1275,8 +1399,106 @@ class NavigationWebBridge(Node):
         if outcome.get("error"):
             raise ValueError(f"{name} footprint 切换失败：{outcome['error']}")
 
-    def _confirm_footprint(self, timeout=3.0):
-        """Acknowledge the robot footprint on both costmaps once per session."""
+    def _reset_navigation_costmaps(self, epoch, deadline):
+        """Rebuild stock Nav2 obstacle layers while motion is unauthorized."""
+        if any(not future.done() for future in self.costmap_clear_pending.values()):
+            raise ValueError('上一轮清图请求尚未完成，运动门保持关闭')
+        for name, client in self.costmap_clear_clients.items():
+            with self.lock:
+                if self.motion_enabled or self.motion_requested or self.navigation_active:
+                    raise ValueError('清理模式切换前的障碍缓存时，运动门必须关闭')
+                if epoch != self.navigation_reference.get('epoch'):
+                    raise ValueError('清图期间导航参考模式发生变化')
+            remaining = deadline-time.monotonic()
+            if remaining <= 0 or not client.wait_for_service(timeout_sec=min(1., remaining)):
+                raise ValueError(f'{name} costmap 清图服务未就绪')
+            future = client.call_async(ClearEntireCostmap.Request())
+            # A timed-out service can still execute on the Nav2 node later.
+            # Do not allow a subsequent enable to overtake that mutation.
+            self.costmap_clear_pending[name] = future
+            completed = threading.Event()
+            future.add_done_callback(lambda _done, event=completed: event.set())
+            if not completed.wait(max(0., deadline-time.monotonic())):
+                raise ValueError(f'{name} costmap 清图超时，运动门保持关闭')
+            future.result()
+
+        reset_time = time.monotonic()
+        reset_stamp = self.get_clock().now().nanoseconds
+        after_scan = None
+        pause = threading.Event()
+        while time.monotonic() < deadline:
+            with self.lock:
+                reference = self.navigation_reference
+                if epoch != reference.get('epoch'):
+                    raise ValueError('等待障碍地图重建时，导航参考模式已切换')
+                if not reference.get('ready'):
+                    after_scan = None
+                observations = reference.get('observations') or {}
+                age = observations.get('obstacle_scan_age_s')
+                scan_time = reference.get('sent_monotonic', 0.)-(age if age is not None else float('inf'))
+                if reference.get('ready') and after_scan is None and scan_time > reset_time:
+                    after_scan = {name: self.costmap_updates.get(name, 0) for name in ('local', 'global')}
+                # Two newly published maps after the fresh scan leave a full
+                # update cycle for observation callbacks and inflation. Never
+                # open the gate on the just-cleared, empty dynamic map.
+                if after_scan is not None and all(
+                    self.costmap_updates.get(name, 0) >= count+2
+                    # Foxy's Costmap2DPublisher leaves OccupancyGrid stamps
+                    # at zero. For those maps, use the post-scan receive
+                    # counters; reject stale stamped maps when supplied.
+                    and (self.costmap_stamps.get(name, 0) == 0
+                         or self.costmap_stamps[name] > reset_stamp)
+                    for name, count in after_scan.items()
+                ):
+                    return
+            pause.wait(min(.05, max(0., deadline-time.monotonic())))
+        raise ValueError('等待新扫描和两张障碍地图重建超时，运动门保持关闭')
+
+    def _prepare_reference_timer(self):
+        """Remove pre-attachment cart returns before the operator opens the gate."""
+        with self.lock:
+            reference = self.navigation_reference
+            if (self.footprint_confirmed or self.footprint_preparing
+                    or time.monotonic() < self.next_footprint_attempt
+                    or self.motion_enabled or self.motion_requested or self.navigation_active
+                    or not self.map_ready or not self.localized or self.processing
+                    or not reference.get('ready') or not reference.get('footprint')
+                    or time.monotonic()-self.reference_received > .3):
+                return
+            generation = self.motion_request_generation
+            epoch = reference.get('epoch')
+            self.footprint_preparing = True
+
+        def prepare():
+            try:
+                # Share the existing enable/goal lock: a clear cannot run
+                # concurrently with a request that starts navigation.
+                with self.navigation_start_lock:
+                    with self.lock:
+                        if (generation != self.motion_request_generation
+                                or epoch != self.navigation_reference.get('epoch')
+                                or self.motion_enabled or self.motion_requested or self.navigation_active
+                                or not self.map_ready or not self.localized or self.processing):
+                            return
+                    self._validate_motion_enable()
+                    self._confirm_footprint()
+                    with self.lock:
+                        self.footprint_error = ""
+            except Exception as error:
+                with self.lock:
+                    if epoch == self.navigation_reference.get('epoch'):
+                        self.footprint_error = str(error)
+                self.get_logger().warning("导航障碍图准备未完成：" + str(error))
+            finally:
+                with self.lock:
+                    self.footprint_preparing = False
+                    self.next_footprint_attempt = time.monotonic()+2.0
+
+        self.footprint_thread = threading.Thread(target=prepare, daemon=True)
+        self.footprint_thread.start()
+
+    def _confirm_footprint(self, timeout=6.0):
+        """Confirm geometry and rebuild existing Nav2 layers once per mode."""
         with self.lock:
             if self.footprint_confirmed:
                 return
@@ -1293,23 +1515,31 @@ class NavigationWebBridge(Node):
             if remaining <= 0.0:
                 raise ValueError("等待两张 costmap footprint 确认超时")
             self._set_costmap_footprint(name, client, footprint, remaining)
+        self._reset_navigation_costmaps(reference['epoch'], deadline)
         with self.lock:
             if reference['epoch'] != self.navigation_reference.get('epoch'):
                 raise ValueError('导航模式已改变，请等待新轮廓就绪')
             self.footprint_confirmed = True
+            self.footprint_error = ""
 
     def _motion_callback(self, message):
         force_disable = False
         abort_reason = None
-        locomotion_ready = self.locomotion.snapshot()["ready"]
+        idle_close_reason = None
+        locomotion = self.locomotion.snapshot()
+        locomotion_ready = locomotion["ready"]
         with self.lock:
             acknowledged = bool(message.data)
+            was_authorized = self.motion_requested or self.motion_enabled
             if acknowledged and (
                 not self.motion_requested
                 or not self.map_ready
                 or not self.localized
                 or bool(self.localization_fault)
-                or not locomotion_ready
+                or (not locomotion_ready and not (
+                    self.motion_enabled and locomotion.get('online')
+                    and locomotion.get('healthy') and locomotion.get('stage') == 'POLICY'
+                    and not (locomotion.get('high_policy') or {}).get('motion_blocked')))
             ):
                 # Never allow a delayed enable acknowledgement to reopen the
                 # independent UDP gate after a localization fault/map reset.
@@ -1319,19 +1549,32 @@ class NavigationWebBridge(Node):
             else:
                 self.motion_enabled = acknowledged
                 self.motion_requested = acknowledged
+            if not acknowledged and was_authorized:
+                # Acknowledge the downstream fault latch even without an
+                # active goal. Only a later operator request may reopen it.
+                force_disable = True
+                blockers = self._reference_blockers(locomotion)
+                if blockers and not self.navigation_active:
+                    idle_close_reason = '导航参考持续不可用：' + '；'.join(blockers)
             if not self.motion_enabled and self.navigation_active:
-                abort_reason = "G1 运动安全门在导航执行中关闭"
+                blockers = self._reference_blockers(self.locomotion.snapshot())
+                abort_reason = ('导航参考持续不可用：' + '；'.join(blockers) if blockers else
+                                "G1 运动安全门在导航执行中关闭")
         if force_disable:
             command = Bool()
             command.data = False
             self.motion_enable_pub.publish(command)
         if abort_reason is not None:
             self._abort_navigation_for_motion_gate(abort_reason)
+        elif idle_close_reason:
+            self._record_navigation_failure(idle_close_reason)
+            self.last_safety_event = idle_close_reason
 
     def _abort_navigation_for_motion_gate(self, reason):
         with self.lock:
             if not self.navigation_active:
                 return
+            self._record_navigation_failure(reason)
             handle = self.goal_handle
             self.navigation_generation += 1
             self.navigation_active = False
@@ -1374,6 +1617,14 @@ class NavigationWebBridge(Node):
             raise ValueError("；".join(blockers))
 
     def _set_motion(self, enabled):
+        # Serialize enabling/rebuilding with other enables and goal submission.
+        # Stops bypass this lock and can invalidate the transaction at any time.
+        if enabled:
+            with self.navigation_start_lock:
+                return self._set_motion_transaction(True)
+        return self._set_motion_transaction(False)
+
+    def _set_motion_transaction(self, enabled):
         message = Bool()
         message.data = bool(enabled)
         abort_reason = None
@@ -1445,7 +1696,12 @@ class NavigationWebBridge(Node):
             request_id = self.locomotion.request(kind, **payload)
             self._publish_status()
             return {'action': kind, 'request_id': request_id}
-        if kind == "prepare_pose":
+        if kind == "model_set":
+            key = str(query.get("model_set", [""])[0])
+            if key not in {item["value"] for item in status.get("model_set_options", [])}:
+                raise ValueError("请选择有效的模型组合")
+            self.locomotion.request(kind, model_set=key)
+        elif kind == "prepare_pose":
             pose = str(query.get("pose", [""])[0])
             if pose not in {item["value"] for item in status.get("prepare_pose_options", [])}:
                 raise ValueError("请选择有效的准备姿态")
@@ -1760,6 +2016,10 @@ class NavigationWebBridge(Node):
         self._publish_status()
 
     def _grid_callback(self, layer, message):
+        if layer in ('local', 'global'):
+            with self.lock:
+                self.costmap_updates[layer] = self.costmap_updates.get(layer, 0)+1
+                self.costmap_stamps[layer] = message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec
         interval = 0.0 if layer == "map" else (1.0 if layer == "global" else 0.10)
         now = time.monotonic()
         if now - self.bitmap_last_publish.get(layer, 0.0) < interval:
@@ -1974,13 +2234,13 @@ class NavigationWebBridge(Node):
     def _status_timer(self):
         now = time.monotonic()
         locomotion = self.locomotion.snapshot()
-        if self._reference_blockers(locomotion) and (self.motion_enabled or self.motion_requested):
-            self._set_motion(False)
+        self._check_reference_gate(locomotion)
         with self.lock:
             sensor_lost = self.motion_enabled and (
                 now - self.last_cloud_time >= 1.5
                 or now - self.last_odom_time >= 1.5
             )
+            scan_lost = self.motion_enabled and now-self.last_localization_scan_time >= 1.5
             navigation_waiting_for_first_pose = (
                 self.navigation_active
                 and not self.navigation_pose_received
@@ -2027,6 +2287,8 @@ class NavigationWebBridge(Node):
             )
         if sensor_lost:
             self._handle_localization_fault("点云或里程计数据超时")
+        elif scan_lost:
+            self._handle_localization_fault("AMCL 输入扫描 /scan_localization 连续超时 1.5 秒")
         elif navigation_waiting_for_first_pose:
             self._handle_localization_fault(
                 "导航开始 3 秒仍未收到目标下发后的 AMCL 位姿"
@@ -2040,9 +2302,7 @@ class NavigationWebBridge(Node):
                 "AMCL 连续修正 30 秒仍未收敛，请重新指定更准确的初始位姿"
             )
         elif locomotion_lost:
-            reason = "自研运控已离开策略运行（{}），运动门已关闭".format(
-                locomotion["stage_text"]
-            )
+            reason = '；'.join(self._locomotion_blockers(locomotion)) + '；运动门已关闭'
             with self.lock:
                 navigation_active = self.navigation_active
                 self.last_safety_event = reason

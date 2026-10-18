@@ -60,7 +60,7 @@ PUSHCART 按同一跟踪逻辑工作，前馈取高层经过自身滤波后输�
 
 速度命令 vx/vy/wz 均沿用前级 0.4 秒滤波，不重复过滤。active 航向分支仅对附加纠偏使用 0.4 rad/s² 变化率限制，再与已滤波的 wz 相加；disabled/shadow 原样返回前级命令。安全停止直接覆盖。
 
-行走与推车共用 `config/motion_config.json`，按用户最新要求默认 active；导航独立使用 `nav/locomotion/motion_config.json`，默认 active，Kp=1、Ki=Kd=0。范围在 `heading.validate_settings` 校验：
+行走与推车共用 `config/motion_config.json`，按用户最新要求恢复默认 active；导航独立使用 `nav/locomotion/motion_config.json`，默认 active，Kp=1、Ki=Kd=0。范围在 `heading.validate_settings` 校验：
 
 | 参数 | 初始配置 | 单位/目的 |
 | --- | ---: | --- |

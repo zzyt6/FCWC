@@ -3521,6 +3521,8 @@ chrono
 -
 csignal
 -
+hand_feedback.hpp
+/home/unitree/CWC/G1Deploy_BalanceHomie/cpp/hand_feedback.hpp
 iostream
 -
 memory
@@ -3549,6 +3551,10 @@ stdexcept
 -
 string
 -
+
+/home/unitree/CWC/G1Deploy_BalanceHomie/cpp/hand_feedback.hpp
+hand_core.hpp
+/home/unitree/CWC/G1Deploy_BalanceHomie/cpp/hand_core.hpp
 
 /home/unitree/CWC/G1Deploy_BalanceHomie/cpp/protocol.hpp
 array

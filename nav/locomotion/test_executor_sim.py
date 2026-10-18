@@ -40,6 +40,18 @@ def main():
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         wait(link, lambda s: s['online'] and s['stage'] == 'WAITING' and s['healthy'], 60, 'executor online')
+        wait(link, lambda s: s['actions']['model_set'], 3, 'model selection available')
+        assert link.snapshot()['model_set'] == 'v81'
+        assert {item['value'] for item in link.snapshot()['model_set_options']} == {'v81', 'v82'}
+        for key, expected_hash in (
+            ('v81', '676765c20e3df7c838cb3d1cdf054cd0376158dab41e176949e9a4cdfd049f0c'),
+            ('v82', '301cabafabc9d0a1fb3eb6bfd467da97e1b2be225300d2f3ff65107982022de1')):
+            link.request('model_set', model_set=key)
+            chosen = wait(link, lambda s: s['model_set'] == key, 3, 'model set selected')
+            assert chosen['model_sha256']['homie'] == expected_hash
+            assert chosen['model_warmup']['balance_homie'] and chosen['model_warmup']['pushcart']
+            assert chosen['stage'] == 'WAITING' and not chosen['armed']
+            assert chosen['velocity'] == [0., 0., 0.] and not chosen['high_policy']['enabled']
         assert not link.snapshot()['actions']['policy']
         wait(link, lambda s: s['actions']['prepare_pose'], 3, 'posture choice available')
         assert link.snapshot()['prepare_pose'] == 'original'
@@ -53,10 +65,13 @@ def main():
         link.request('prepare')
         status = wait(link, lambda s: s['stage'] == 'HOLDING' and s['actions']['policy'], 20, 'prepared')
         assert not status['prepare_pose_selectable'] and status['prepare_pose'] == 'arms_down'
+        assert not status['model_set_selectable'] and status['model_set'] == 'v82'
+        link.request('model_set', model_set='v81')  # Forged request after preparation.
         link.request('prepare_pose', pose='original')  # Forged request after lock.
         link.request('policy')
         status = wait(link, lambda s: s['ready'], 10, 'policy running')
         assert status['prepare_pose'] == 'arms_down' and not status['actions']['prepare_pose']
+        assert status['model_set'] == 'v82' and status['high_policy']['model_release'] == 'V8.2'
         assert status['velocity'] == [0.0, 0.0, 0.0], status
         # Disabled packets (motion gate closed) must not move the robot.
         for sequence in range(20):
@@ -91,6 +106,9 @@ def main():
         link.request('reset')
         wait(link, lambda s: s['stage'] == 'WAITING' and s['healthy'], 20, 'reset to read-only')
         wait(link, lambda s: s['actions']['prepare_pose'], 3, 'choice unlocked after reset')
+        wait(link, lambda s: s['actions']['model_set'], 3, 'model choice unlocked after reset')
+        link.request('model_set', model_set='v81')
+        wait(link, lambda s: s['model_set'] == 'v81', 3, 'original model selected')
         link.request('prepare_pose', pose='original')
         wait(link, lambda s: s['prepare_pose'] == 'original', 3, 'original selected')
         link.request('acquire')
@@ -100,6 +118,7 @@ def main():
         link.request('policy')
         status = wait(link, lambda s: s['ready'], 10, 'original policy running')
         assert status['prepare_pose'] == 'original' and not status['prepare_pose_selectable']
+        assert status['model_set'] == 'v81' and status['high_policy']['model_release'] == 'V8.1'
         link.request('stop')
         wait(link, lambda s: s['stage'] == 'DAMPED', 5, 'final stop')
         print('EXECUTOR SIM OK')

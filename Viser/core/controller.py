@@ -25,13 +25,18 @@ HAND_POSES = {1: 'open', 2: 'grasp', 3: 'open_compensated', 4: 'grasp_compensate
 
 class Controller:
     def __init__(self, config, backend, mode, recorder=None, policy_mode='auto', clock=time.monotonic,
-                 high_policy=None):
+                 high_policy=None, model_sets=None):
         self.config, self.backend, self.mode, self.recorder = config, backend, mode, recorder
         self.clock = clock
+        self.model_sets = model_sets
+        self.model_set = getattr(config, 'model_set', 'v81')
         self.high_policy = high_policy
         self.cfg = config.deployment
-        self.policy = Policy(config.deploy, self.cfg, policy_mode=policy_mode,
-                             pushcart_homie=high_policy.homie_model if high_policy is not None else None)
+        if model_sets is not None:
+            self.policy, self.high_policy = model_sets.activate(config, self.model_set)
+        else:
+            self.policy = Policy(config.deploy, self.cfg, policy_mode=policy_mode,
+                                 pushcart_homie=high_policy.homie_model if high_policy is not None else None)
         self.observations = Observations(config.contracts)
         self.commands = Commands(self.cfg)
         self.web = WebControl(self.cfg, enabled=mode != 'observe')
@@ -136,6 +141,7 @@ class Controller:
             self.latest = dict(self.latest, stage=self.stage, healthy=False, state=None,
                                preparation_warning='',
                                prepare_pose=self.prepare_pose, prepare_pose_selectable=False,
+                               model_set=self.model_set, model_set_selectable=False,
                                owner=self.web.owner, source=self.web.source, velocity=np.zeros(3), dex3={},
                                joint_comparison=None,
                                high_policy=self.high_policy.snapshot(self.clock()) if self.high_policy else None,
@@ -175,6 +181,7 @@ class Controller:
             self.latest = dict(self.latest, stage=self.stage, reason=self.reason, healthy=False,
                                preparation_warning='',
                                prepare_pose=self.prepare_pose, prepare_pose_selectable=False,
+                               model_set=self.model_set, model_set_selectable=False,
                                velocity=np.zeros(3), input_velocity=np.zeros(3),
                                decelerating=False,
                                model_actions=None, homie_estimator=None, homie_estimator_source=None,
@@ -279,6 +286,7 @@ class Controller:
                 # Camera availability is independent of body preparation.
                 self.record_event(type='cart_camera_start_failed', reason=str(exc))
         self.record_event(type='preparation_started', pose=self.prepare_pose,
+                          model_set=self.model_set,
                           config_path=str(self.config.upper_pose_paths[self.prepare_pose]))
 
     @property
@@ -289,6 +297,27 @@ class Controller:
         return (self.mode != 'observe' and state.stage == p.WAITING and self.request == p.WAIT
                 and bool(state.flags & 1) and not state.buttons & (p.B | p.L2)
                 and self.stage not in ('DAMPED', 'FAULT') and not self.stop_requested.is_set())
+
+    def _select_model_set(self, key):
+        if self.high_policy is not None:
+            self.high_policy.reset()
+        self.policy, self.high_policy = self.model_sets.activate(self.config, key)
+        self.model_set = key
+        self.cfg = self.config.deployment
+        self.policy.reset_selection()
+        self.policy.pushcart_active = False
+        self.policy.homie_estimator = self.policy.homie_estimator_source = None
+        if self.high_policy is not None:
+            self.high_policy.reset()
+        self.observations = Observations(self.config.contracts)
+        self.web.zero()
+        self.commands.value.fill(0)
+        self.heading.clear()
+        self.motion_time = None
+        self.reason = ''
+        self.record_event(type='model_set_selected', model_set=key,
+                          model_sha256=self.policy.source_sha256,
+                          high_policy_release=self.high_policy.cfg['release'] if self.high_policy else None)
 
     def _preparation_warning(self, state):
         if state.stage != p.RAMPING or not state.flags & p.PREPARATION_OVERDUE:
@@ -410,6 +439,12 @@ class Controller:
             if (self.high_policy and self.high_policy.enabled
                     and event['kind'] in ('hand_toggle', 'hand_compensation', 'hand_edit', 'hand_load', 'hand_save')):
                 self.reason = '先归零并返回普通行走，再调节或松开抓握'
+                continue
+            if event['kind'] == 'model_set':
+                key = event.get('model_set')
+                if (owned and self.model_sets is not None and self._can_select_prepare_pose(state)
+                        and isinstance(key, str) and key in self.model_sets.entries and key != self.model_set):
+                    self._select_model_set(key)
                 continue
             if event['kind'] == 'prepare_pose':
                 pose = event.get('pose')
@@ -819,6 +854,8 @@ class Controller:
             self.record_event(type='preparation_warning', active=bool(preparation_warning),
                               reason=preparation_warning or '准备姿态已到位')
         data = dict(stage=self.stage, reason=self.reason, healthy=bool(state.flags & 1),
+                    model_set=self.model_set,
+                    model_set_selectable=self.model_sets is not None and self._can_select_prepare_pose(state),
                     preparation_warning=preparation_warning,
                     prepare_pose=self.prepare_pose,
                     prepare_pose_selectable=self._can_select_prepare_pose(state),
@@ -897,6 +934,8 @@ class Controller:
             self.thread.join(timeout=5)
         self.record_event(type='shutdown', stage=self.stage, reason=self.reason or '程序退出')
         self.backend.close()
-        if self.high_policy is not None:
+        if self.model_sets is not None:
+            self.model_sets.close()
+        elif self.high_policy is not None:
             self.high_policy.close()
         self.hand_file_executor.shutdown(wait=True)

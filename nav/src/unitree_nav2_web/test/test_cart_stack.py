@@ -1,22 +1,34 @@
 """Load the actual Foxy DWB plugins and dynamic footprint on an isolated ROS graph."""
 import os
+import math
+import copy
 from pathlib import Path
 import signal
 import subprocess
 import tempfile
 import time
 
+import numpy as np
+import pytest
 import rclpy
 from ament_index_python.packages import get_package_prefix
-from geometry_msgs.msg import Point32, Polygon, PolygonStamped, TransformStamped
+from geometry_msgs.msg import Point32, Polygon, PolygonStamped, PoseStamped, TransformStamped, Twist
 from lifecycle_msgs.srv import ChangeState
+from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavigationPath
+from nav2_msgs.action import FollowPath
+from nav2_msgs.srv import ClearEntireCostmap
+from sensor_msgs.msg import LaserScan
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.action import ActionClient
 from rclpy.qos import DurabilityPolicy, QoSProfile
-from tf2_ros import StaticTransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+
+from unitree_nav2_web.cart_geometry import CartGeometry, GantryGeometry, load_settings
 
 
-def test_real_controller_loads_cart_plugins_and_uses_cart_footprint(monkeypatch):
+@pytest.mark.parametrize('scope', ['local', 'global'])
+def test_stock_nav2_footprint_and_mode_reset_preserve_external_obstacles(monkeypatch, scope):
     monkeypatch.setenv('ROS_DOMAIN_ID', '89')
     monkeypatch.setenv('ROS_LOCALHOST_ONLY', '1')
     monkeypatch.setenv('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp')
@@ -32,25 +44,46 @@ def test_real_controller_loads_cart_plugins_and_uses_cart_footprint(monkeypatch)
             try:
                 rclpy.init(context=context)
                 node = rclpy.create_node('cart_stack_test', context=context)
+                costmap = scope+'_costmap'
+                server = 'controller' if scope == 'local' else 'planner'
                 executor = SingleThreadedExecutor(context=context)
                 executor.add_node(node)
                 broadcaster = StaticTransformBroadcaster(node)
                 transform = TransformStamped()
                 transform.header.stamp = node.get_clock().now().to_msg()
-                transform.header.frame_id = 'odom'
+                transform.header.frame_id = 'odom' if scope == 'local' else 'map'
                 transform.child_frame_id = 'nav_control'
-                transform.transform.rotation.w = 1.
-                broadcaster.sendTransform(transform)
+                angle = .4
+                transform.transform.rotation.w = math.cos(angle/2)
+                transform.transform.rotation.z = math.sin(angle/2)
+                base_transform = copy.deepcopy(transform)
+                base_transform.child_frame_id = 'base_nav'
+                broadcaster.sendTransform([transform, base_transform])
                 footprints = []
-                node.create_subscription(PolygonStamped, '/local_costmap/published_footprint',
+                node.create_subscription(PolygonStamped, '/'+costmap+'/published_footprint',
                                          lambda msg: footprints.append(msg), 10)
                 qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-                publisher = node.create_publisher(Polygon, '/local_costmap/footprint', qos)
-                binary = Path(get_package_prefix('nav2_controller')) / 'lib/nav2_controller/controller_server'
+                publisher = node.create_publisher(Polygon, '/'+costmap+'/footprint', qos)
+                scan_pub = node.create_publisher(LaserScan, '/scan', 10)
+                grids = []
+                node.create_subscription(OccupancyGrid, '/'+costmap+'/costmap', grids.append, qos)
+                if scope == 'global':
+                    map_pub = node.create_publisher(OccupancyGrid, '/map', qos)
+                    static_map = OccupancyGrid()
+                    static_map.header.frame_id = 'map'
+                    static_map.info.width = static_map.info.height = 160
+                    static_map.info.resolution = .05
+                    static_map.info.origin.position.x = static_map.info.origin.position.y = -4.
+                    static_map.info.origin.orientation.w = 1.
+                    static_map.data = [0]*25600
+                    map_pub.publish(static_map)
+                package = 'nav2_'+server
+                binary = Path(get_package_prefix(package)) / ('lib/'+package+'/'+server+'_server')
                 params = Path(__file__).resolve().parents[1] / 'config/nav2_foxy_g1.yaml'
-                process = subprocess.Popen([str(binary), '--ros-args', '--params-file', str(params)],
+                process = subprocess.Popen([str(binary), '--ros-args', '-r', '__node:='+server+'_server',
+                                            '--params-file', str(params)],
                                            stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
-                client = node.create_client(ChangeState, '/controller_server/change_state')
+                client = node.create_client(ChangeState, '/'+server+'_server/change_state')
 
                 def diagnostic():
                     log.flush(); log.seek(0)
@@ -76,7 +109,135 @@ def test_real_controller_loads_cart_plugins_and_uses_cart_footprint(monkeypatch)
                 publisher.publish(polygon)
                 pump(lambda: any(min(p.x for p in f.polygon.points) < -1.3 for f in footprints))
                 text = diagnostic()
-                assert 'CartPush' in text and 'CartLookahead' in text, text
+                if scope == 'local':
+                    assert 'CartPush' in text and 'CartLookahead' in text, text
+                # nav_control changes reference on a mode switch. The cart
+                # polygon must remain attached to the stable robot frame.
+                transform.transform.translation.x = 1.
+                broadcaster.sendTransform([transform, base_transform])
+
+                def publish_scan(ranges):
+                    scan = LaserScan(angle_min=0., angle_max=(len(ranges)-1)*math.pi/2,
+                                     angle_increment=math.pi/2, range_min=.05, range_max=4.,
+                                     ranges=ranges)
+                    scan.header.frame_id = 'base_nav'
+                    scan.header.stamp = node.get_clock().now().to_msg()
+                    scan_pub.publish(scan)
+
+                clear_client = node.create_client(
+                    ClearEntireCostmap, '/'+costmap+'/clear_entirely_'+costmap)
+                pump(clear_client.service_is_ready)
+
+                def clear():
+                    future = clear_client.call_async(ClearEntireCostmap.Request())
+                    pump(future.done)
+                    future.result()
+
+                def cost(x, y):
+                    if not grids:
+                        return None
+                    grid = grids[-1]
+                    wx, wy = math.cos(angle)*x-math.sin(angle)*y, math.sin(angle)*x+math.cos(angle)*y
+                    col = int((wx-grid.info.origin.position.x)/grid.info.resolution)
+                    row = int((wy-grid.info.origin.position.y)/grid.info.resolution)
+                    return grid.data[row*grid.info.width+col]
+
+                def until_cost(predicate, action, timeout=5.):
+                    def step():
+                        action()
+                        return predicate()
+                    pump(step, timeout)
+
+                # Seed a cart return and a real obstacle outside the physical
+                # cart but inside the much larger navigation footprint.
+                until_cost(lambda: cost(.3, 0.) == 100 and cost(0., 1.) == 100,
+                           lambda: publish_scan([.3, 1.]))
+                # Replace the old enlarged footprint with the model outline.
+                # Stock inflation should narrow its highest-cost region while
+                # retaining the exact same measured obstacles, without a reset.
+                until_cost(lambda: cost(0., .5) == 99, lambda: publish_scan([.3, 1.]))
+                settings = load_settings(Path(__file__).resolve().parents[3] / 'config/pushcart_navigation.json')
+                geometry = CartGeometry(settings)
+                outline = geometry.footprint(dict(position=[.8, 0., -.7], yaw=0.,
+                                                  palms=[[.5, .2, .1], [.5, -.2, .1]]), True)
+                model_polygon = Polygon(points=[Point32(x=x, y=y) for x, y in outline])
+                def publish_model_footprint():
+                    publisher.publish(model_polygon)
+                    publish_scan([.3, 1.])
+                until_cost(lambda: 0 < cost(0., .5) < 99 and cost(.3, 0.) == 100
+                           and cost(0., 1.) == 100, publish_model_footprint)
+                # Masking the new cart returns alone cannot erase old cells.
+                deadline = time.monotonic()+.7
+                while time.monotonic() < deadline:
+                    publish_scan([float('nan'), 1.])
+                    executor.spin_once(timeout_sec=.03)
+                assert cost(.3, 0.) == 100
+                # Stock Nav2 clear service is used only with the motion gate
+                # closed; scans then rebuild external obstacles before opening.
+                clear()
+                until_cost(lambda: cost(.3, 0.) != 100 and cost(0., 1.) == 100,
+                           lambda: publish_scan([float('nan'), 1.]))
+                deadline = time.monotonic()+.7
+                while time.monotonic() < deadline:
+                    publish_scan([float('nan'), 1.])
+                    executor.spin_once(timeout_sec=.03)
+                    assert cost(.3, 0.) != 100 and cost(0., 1.) == 100
+                if scope == 'global':
+                    # Resetting the stock layers must reapply static obstacles.
+                    x, y = .3*math.cos(angle), .3*math.sin(angle)
+                    col, row = int((x+4.)/.05), int((y+4.)/.05)
+                    static_map.data[row*160+col] = 100
+                    map_pub.publish(static_map)
+                    until_cost(lambda: cost(.3, 0.) == 100,
+                               lambda: publish_scan([float('nan'), 1.]))
+                    clear()
+                    until_cost(lambda: cost(.3, 0.) == 100 and cost(0., 1.) == 100,
+                               lambda: publish_scan([float('nan'), 1.]))
+
+                # A moving rear ignore region must also clear previously
+                # cached returns, without clearing obstacles beyond it.
+                settings = load_settings(Path(__file__).resolve().parents[3] / 'config/pushcart_navigation.json')
+                gantry = GantryGeometry(settings['gantry_filter'])
+                center, angles, distances = gantry.clearing_rays()
+                body_tf = TransformStamped()
+                body_tf.header.frame_id, body_tf.child_frame_id = 'base_nav', 'base_link'
+                body_tf.transform.rotation.w = 1.
+                rear_tf = TransformStamped()
+                rear_tf.header.frame_id, rear_tf.child_frame_id = 'base_link', 'gantry_exclusion'
+                rear_tf.transform.rotation.w = 1.
+                rear_tf.transform.translation.x, rear_tf.transform.translation.y, rear_tf.transform.translation.z = map(float, center)
+                broadcaster.sendTransform([transform, base_transform, body_tf, rear_tf])
+                rear_pub = node.create_publisher(LaserScan, '/navigation/rear_clear', 10)
+                rear_scan = LaserScan(angle_min=float(angles[0]), angle_max=float(angles[-1]),
+                                      angle_increment=float(angles[1]-angles[0]), range_min=0.,
+                                      range_max=4., ranges=distances.astype(np.float32).tolist())
+                rear_scan.header.frame_id = 'gantry_exclusion'
+                until_cost(lambda: cost(-1.5, 0.) == 100,
+                           lambda: publish_scan([float('nan'), 1., 1.5]))
+                until_cost(lambda: cost(-.75, 0.) == 100,
+                           lambda: publish_scan([float('nan'), 1., .75]))
+
+                def clear_rear():
+                    publish_scan([float('nan'), 1., float('nan')])
+                    rear_scan.header.stamp = node.get_clock().now().to_msg()
+                    rear_pub.publish(rear_scan)
+
+                until_cost(lambda: cost(-.75, 0.) != 100 and cost(-1.5, 0.) == 100
+                           and cost(0., 1.) == 100, clear_rear)
+                # Shift the robot-relative clearing frame. The old region must
+                # expire; only the new rectangle may keep clearing cached hits.
+                body_tf.transform.translation.x = .4
+                broadcaster.sendTransform([transform, base_transform, body_tf, rear_tf])
+                deadline = time.monotonic()+.4
+                while time.monotonic() < deadline:
+                    clear_rear()
+                    executor.spin_once(timeout_sec=.03)
+                until_cost(lambda: cost(-.75, 0.) == 100,
+                           lambda: publish_scan([float('nan'), 1., .75]))
+                until_cost(lambda: cost(-.25, 0.) == 100,
+                           lambda: publish_scan([float('nan'), 1., .25]))
+                until_cost(lambda: cost(-.25, 0.) != 100 and cost(-.75, 0.) == 100
+                           and cost(-1.5, 0.) == 100 and cost(0., 1.) == 100, clear_rear)
             finally:
                 if process is not None and process.poll() is None:
                     process.send_signal(signal.SIGINT)
@@ -86,6 +247,172 @@ def test_real_controller_loads_cart_plugins_and_uses_cart_footprint(monkeypatch)
                         process.kill(); process.wait(timeout=2.)
                 if executor is not None:
                     executor.shutdown()
+                if node is not None:
+                    node.destroy_node()
+                if context.ok():
+                    context.shutdown()
+
+
+def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(monkeypatch):
+    monkeypatch.setenv('ROS_DOMAIN_ID', '89')
+    monkeypatch.setenv('ROS_LOCALHOST_ONLY', '1')
+    monkeypatch.setenv('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp')
+    monkeypatch.setenv('CYCLONEDDS_URI',
+        '<CycloneDDS><Domain><General><NetworkInterfaceAddress>lo</NetworkInterfaceAddress>'
+        '<AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>auto</ParticipantIndex>'
+        '<Peers><Peer Address="127.0.0.1"/></Peers></Discovery></Domain></CycloneDDS>')
+    context = Context()
+    process = node = executor = action = None
+    with tempfile.TemporaryDirectory(prefix='cart_follow_') as directory:
+        monkeypatch.setenv('ROS_LOG_DIR', directory)
+        with open(Path(directory) / 'controller.log', 'w+') as log:
+            try:
+                rclpy.init(context=context)
+                node = rclpy.create_node('cart_follow_test', context=context)
+                executor = SingleThreadedExecutor(context=context)
+                executor.add_node(node)
+                broadcaster = TransformBroadcaster(node)
+                qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+                footprint_pub = node.create_publisher(Polygon, '/local_costmap/footprint', qos)
+                scan_pub = node.create_publisher(LaserScan, '/scan', 10)
+                odom_pub = node.create_publisher(Odometry, '/Odometry_navigation', 10)
+                grids, commands, footprints = [], [], []
+                node.create_subscription(OccupancyGrid, '/local_costmap/costmap', grids.append, qos)
+                node.create_subscription(Twist, '/cmd_vel',
+                    lambda msg: commands.append((time.monotonic(), msg)), 10)
+                node.create_subscription(PolygonStamped, '/local_costmap/published_footprint', footprints.append, 10)
+                geometry = CartGeometry(load_settings(Path(__file__).resolve().parents[3] / 'config/pushcart_navigation.json'))
+                outline = geometry.footprint(dict(position=[.8, 0., -.7], yaw=0.,
+                                                  palms=[[.5, .2, .1], [.5, -.2, .1]]), True)
+                footprint = Polygon(points=[Point32(x=x, y=y) for x, y in outline])
+                params = Path(__file__).resolve().parents[1] / 'config/nav2_foxy_g1.yaml'
+                process = subprocess.Popen([
+                    '/opt/ros/foxy/lib/nav2_controller/controller_server', '--ros-args', '--params-file', str(params)],
+                    stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
+                lifecycle = node.create_client(ChangeState, '/controller_server/change_state')
+                action = ActionClient(node, FollowPath, '/follow_path')
+                yaw = .4
+                heading = np.array([math.cos(yaw), math.sin(yaw)])
+                cart = np.r_[.8*heading, yaw]
+                velocity = np.zeros(3)
+                previous = last_publish = time.monotonic()
+                moving, obstacle = True, False
+
+                def tick():
+                    nonlocal previous, last_publish
+                    now = time.monotonic()
+                    dt = min(.05, now-previous)
+                    previous = now
+                    target = np.zeros(3)
+                    if commands and now-commands[-1][0] < .25:
+                        msg = commands[-1][1]
+                        target[:] = msg.linear.x, msg.linear.y, msg.angular.z
+                    velocity[:] += min(1., dt/.4)*(target-velocity)
+                    if moving:
+                        c, s = math.cos(cart[2]), math.sin(cart[2])
+                        cart[:2] += dt*np.array([c*velocity[0]-s*velocity[1], s*velocity[0]+c*velocity[1]])
+                        cart[2] += dt*velocity[2]
+                    if now-last_publish >= .04:
+                        last_publish = now
+                        stamp = node.get_clock().now().to_msg()
+                        transform = TransformStamped()
+                        transform.header.frame_id, transform.child_frame_id = 'odom', 'nav_control'
+                        transform.header.stamp = stamp
+                        transform.transform.translation.x, transform.transform.translation.y = map(float, cart[:2])
+                        transform.transform.rotation.w = math.cos(cart[2]/2)
+                        transform.transform.rotation.z = math.sin(cart[2]/2)
+                        base = copy.deepcopy(transform)
+                        base.child_frame_id = 'base_nav'
+                        base.transform.translation.x -= .8*math.cos(cart[2])
+                        base.transform.translation.y -= .8*math.sin(cart[2])
+                        broadcaster.sendTransform([transform, base])
+                        odom = Odometry()
+                        odom.header = transform.header
+                        odom.child_frame_id = 'nav_control'
+                        odom.pose.pose.position.x, odom.pose.pose.position.y = map(float, cart[:2])
+                        odom.pose.pose.orientation = transform.transform.rotation
+                        odom.twist.twist.linear.x, odom.twist.twist.linear.y, odom.twist.twist.angular.z = map(float, velocity)
+                        odom_pub.publish(odom)
+                        footprint_pub.publish(footprint)
+                        scan = LaserScan(angle_min=-math.pi, angle_max=math.pi,
+                                         angle_increment=math.pi/180, range_min=.05, range_max=4.,
+                                         ranges=[float('inf')]*361)
+                        scan.header.frame_id, scan.header.stamp = 'base_nav', stamp
+                        if obstacle:
+                            scan.ranges[0] = float(-min(x for x, _ in outline)-.8)
+                        scan_pub.publish(scan)
+                    executor.spin_once(timeout_sec=.01)
+
+                def diagnostic():
+                    log.flush()
+                    log.seek(0)
+                    return log.read()
+
+                def until(predicate, timeout=12.):
+                    end = time.monotonic()+timeout
+                    while time.monotonic() < end:
+                        tick()
+                        if predicate():
+                            return
+                    raise AssertionError(diagnostic())
+
+                until(lifecycle.service_is_ready)
+                for transition in (1, 3):
+                    req = ChangeState.Request()
+                    req.transition.id = transition
+                    future = lifecycle.call_async(req)
+                    until(future.done)
+                    assert future.result().success, diagnostic()
+                until(lambda: action.server_is_ready() and footprints and grids)
+
+                def goal(target):
+                    request = FollowPath.Goal()
+                    request.controller_id = 'CartPush'
+                    request.path = NavigationPath()
+                    request.path.header.frame_id = 'odom'
+                    request.path.header.stamp = node.get_clock().now().to_msg()
+                    for fraction in np.linspace(0., 1., 30):
+                        pose = PoseStamped()
+                        pose.header = request.path.header
+                        pose.pose.position.x, pose.pose.position.y = map(float, cart[:2]+fraction*(target-cart[:2]))
+                        pose.pose.orientation.w, pose.pose.orientation.z = math.cos(yaw/2), math.sin(yaw/2)
+                        request.path.poses.append(pose)
+                    future = action.send_goal_async(request)
+                    until(future.done)
+                    handle = future.result()
+                    assert handle.accepted, diagnostic()
+                    return handle.get_result_async()
+
+                target = cart[:2]+.65*heading
+                result = goal(target)
+                until(result.done, 18.)
+                assert result.result().status == 4, diagnostic()
+                assert np.linalg.norm(cart[:2]-target) <= .18
+                robot = cart[:2]-.8*np.array([math.cos(cart[2]), math.sin(cart[2])])
+                assert np.linalg.norm(robot-target) > .65  # Arrival is at the CART center.
+                assert any(msg.linear.x > .05 for _, msg in commands)
+                assert all(-.2-1e-6 <= msg.linear.x <= .6+1e-6 and abs(msg.linear.y) <= .15+1e-6
+                           and abs(msg.angular.z) <= .3+1e-6 for _, msg in commands)
+                moving, obstacle = False, True
+                velocity.fill(0.)
+                commands.clear()
+                until(lambda: any(value == 100 for value in grids[-1].data))
+                result = goal(cart[:2]+.5*heading)
+                until(result.done)
+                assert result.result().status == 6, diagnostic()
+                assert 'ObstacleFootprint' in diagnostic() and 'No valid trajectories' in diagnostic()
+            finally:
+                if process is not None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5.)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2.)
+                if executor is not None:
+                    executor.shutdown()
+                if action is not None:
+                    action.destroy()
                 if node is not None:
                     node.destroy_node()
                 if context.ok():

@@ -33,13 +33,15 @@ def load_settings(path):
     workspace = path.parents[2]
     settings['display_file'] = str(workspace / 'Viser/config/cart_display.json')
     settings['robot_urdf'] = str(workspace / 'G1_URDF/g1.urdf')
-    exported = json.loads((workspace / 'G1_high_policy_deploy/robot/models/v81_config.json').read_text())
+    exported = json.loads((workspace / 'G1_high_policy_deploy/robot/models/v82_config.json').read_text())
     task = exported['task_command_range']
     allowed = np.array([task['vx'], [-task['vy_max'], task['vy_max']], [-task['wz_max'], task['wz_max']]])
     if np.any(limits[:, 0] < allowed[:, 0]) or np.any(limits[:, 1] > allowed[:, 1]):
         raise ValueError('Navigation limits exceed the deployed cart model range')
-    for key, default in (('footprint_padding_m', .12), ('tracking_margin_m', .15),
-                         ('relative_yaw_margin_rad', .30), ('self_filter_padding_m', .04)):
+    # Nav2 provides the normal obstacle inflation. The combined footprint
+    # defaults to the model geometry without an additional tracking envelope.
+    for key, default in (('footprint_padding_m', 0.), ('tracking_margin_m', 0.),
+                         ('relative_yaw_margin_rad', 0.), ('self_filter_padding_m', .04)):
         value = settings.setdefault(key, default)
         if type(value) not in (float, int) or not math.isfinite(value) or not 0 <= value <= .5:
             raise ValueError('Invalid cart geometry margin: ' + key)
@@ -70,6 +72,48 @@ def convex_hull(points):
         return result
     return np.asarray(half(points)[:-1] + half(points[::-1])[:-1])
 
+
+class GantryGeometry:
+    """Explicit rear test regions attached to the pelvis, independent of the cart."""
+
+    def __init__(self, settings):
+        self.enabled = settings.get('enabled', False)
+        self.frame = settings.get('frame', 'base_link')
+        padding = settings.get('padding_m', .03)
+        if (type(self.enabled) is not bool or self.frame != 'base_link'
+                or type(padding) not in (float, int) or not math.isfinite(padding)
+                or not 0 <= padding <= .1):
+            raise ValueError('Invalid gantry filter frame or padding')
+        self.boxes = []
+        for box in settings.get('boxes', []):
+            bounds = np.asarray([box['min_m'], box['max_m']], dtype=float)
+            if (bounds.shape != (2, 3) or not np.isfinite(bounds).all()
+                    or np.any(bounds[0] >= bounds[1]) or bounds[1, 0]+padding >= 0):
+                raise ValueError('Gantry regions must be finite boxes behind the robot')
+            self.boxes.append((bounds[0]-padding, bounds[1]+padding))
+        if self.enabled and not self.boxes:
+            raise ValueError('Enabled gantry filter requires explicit rear regions')
+        if len(self.boxes) > 1:
+            raise ValueError('Gantry clearing supports one rear rectangle')
+
+    def clearing_rays(self, count=720):
+        """Clearing rays start inside the ignored rectangle and stop at its edge."""
+        low, high = self.boxes[0]
+        center, half = (low+high)/2, (high-low)/2
+        angles = -math.pi + np.arange(count)*(2*math.pi/count)
+        directions = np.abs(np.column_stack((np.cos(angles), np.sin(angles))))
+        distances = np.divide(half[:2], directions, out=np.full_like(directions, np.inf),
+                              where=directions > 1e-10).min(axis=1)
+        # Stay inside boundary cells even at exact right angles.
+        return center, angles, distances*.999
+
+    def self_mask(self, points):
+        points = np.asarray(points)
+        inside = np.zeros(len(points), dtype=bool)
+        if self.enabled:
+            for low, high in self.boxes:
+                inside |= np.all((points >= low) & (points <= high), axis=1)
+        return inside
 
 class CartGeometry:
     def __init__(self, settings):
@@ -106,9 +150,20 @@ class CartGeometry:
                 for y in (-half[1], half[1]):
                     for z in (-half[2], half[2]):
                         points.append((transform @ [x, y, z, 1])[:2])
+        body_outline = convex_hull(points).tolist()
+        handle = base.find("visual[@name='bar_0']")
+        handle_transform = origin(handle.find('origin'))
+        handle_half = np.fromstring(handle.find('geometry/box').get('size'), sep=' ')/2
+        handle_ends = [(handle_transform @ [0, y, 0, 1])[:2].tolist()
+                       for y in (-handle_half[1], handle_half[1])]
         for center, radius in self.spheres:
             points.extend(center[:2] + radius*np.array([[1, 1], [-1, 1], [-1, -1], [1, -1]]))
         self.outline = convex_hull(points)
+        # One model supplies both the navigation outline and its map symbol.
+        # Body, handle and casters remain separate from the combined footprint.
+        self.top_view = dict(outline=self.outline.tolist(), body=body_outline, handle=handle_ends,
+                             wheels=[dict(center=center[:2].tolist(), radius=radius)
+                                     for center, radius in self.spheres])
 
     def estimate(self, joints, quaternion, yaw):
         if not math.isfinite(yaw):

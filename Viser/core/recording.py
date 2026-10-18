@@ -1,5 +1,6 @@
 """Append-only per-run archives; disk I/O stays outside the controller thread."""
 from datetime import datetime, timezone
+from copy import deepcopy
 import gzip
 import json
 from pathlib import Path
@@ -52,7 +53,12 @@ class SessionRecorder:
         tag = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
         self.path = Path(directory or ROOT / 'logs/sessions') / (tag + '_' + arguments['mode'] + '_' + uuid.uuid4().hex[:8])
         self.path.mkdir(parents=True, exist_ok=False)
-        metadata = dict(schema=18, has_robot_data=False, config_token=config.token,
+        metadata = dict(schema=19, has_robot_data=False, config_token=config.token,
+                        initial_model_set=getattr(config, 'model_set', 'v81'),
+                        model_sets=deepcopy(getattr(config, 'model_sets_metadata', {})),
+                        model_set_selection='telemetry.model_set identifies the active model set; '
+                                            'model_sets contains its artifact paths, hashes and high-level provenance. '
+                                            'Top-level policy_outputs/high_policy describe the initial set.',
                         preparation_poses={key: str(path) for key, path in config.upper_pose_paths.items()},
                         joint_comparison=joint_metadata(),
                         dex3_pd=dict(config_path=str(config.hand_pd_path),
@@ -76,7 +82,7 @@ class SessionRecorder:
                              'no source code, URDF, meshes, deployment files or model snapshots are archived',
                         completion='summary.json is written only after recording stops; missing summary means interrupted run')
         if getattr(config, 'high_policy_metadata', None) is not None:
-            metadata['high_policy'] = config.high_policy_metadata
+            metadata['high_policy'] = deepcopy(config.high_policy_metadata)
             metadata['high_policy']['upper_pd'] = dict(
                 file=str(config.deploy / 'config/pushcart_upper_pd.json'),
                 transition_s=config.deployment['pushcart_upper_transition_s'],

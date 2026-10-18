@@ -45,7 +45,7 @@ class RecordingTests(unittest.TestCase):
                 metadata = json.loads((path / 'metadata.json').read_text())
                 self.assertEqual(metadata['motion_settings'], config.motion_settings)
                 self.assertNotIn('snapshot_sha256', metadata)
-                self.assertEqual(metadata['schema'], 18)
+                self.assertEqual(metadata['schema'], 19)
                 self.assertEqual(metadata['preparation_poses'],
                                  {key: str(path) for key, path in config.upper_pose_paths.items()})
                 self.assertEqual(metadata['dex3_pd']['active'], config.hand_pd)

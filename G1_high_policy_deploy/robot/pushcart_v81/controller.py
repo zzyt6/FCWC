@@ -64,10 +64,15 @@ class HighOutput:
     gate: float
 
 
-def load_config(models_dir) -> dict:
-    cfg = json.loads((Path(models_dir) / "v81_config.json").read_text(encoding="utf-8"))
+def load_config(models_dir, model_version='v81') -> dict:
+    releases = {'v81': 'V8.1', 'v82': 'V8.2'}
+    if model_version not in releases:
+        raise ValueError('Unsupported pushcart model version: ' + model_version)
+    cfg = json.loads((Path(models_dir) / f"{model_version}_config.json").read_text(encoding="utf-8"))
     if cfg.get("schema") != "pushcart_v81_deploy_v1":
         raise ValueError(f"unexpected config schema {cfg.get('schema')}")
+    if cfg.get("release") != releases[model_version]:
+        raise ValueError(f"unexpected model release {cfg.get('release')}")
     return cfg
 
 

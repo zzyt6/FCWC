@@ -65,6 +65,7 @@ def gate(monkeypatch):
                 ], stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
 
                 class Gate:
+                    acknowledged = None
                     def pump(self, duration):
                         packets = []
                         deadline = time.monotonic() + duration
@@ -101,6 +102,7 @@ def gate(monkeypatch):
                         raise AssertionError('ROS gate condition timed out: ' + log.read())
 
                 result = Gate()
+                result.acknowledged = acknowledged
                 result.wait(lambda _: enables.get_subscription_count() > 0
                             and commands.get_subscription_count() > 0 and acknowledged)
                 result.pump(.2)
@@ -197,3 +199,47 @@ def test_cart_epoch_clears_old_commands_and_clamps_all_three_axes(gate):
     gate.enable(True)
     gate.velocity()
     assert all(not p[2] for p in gate.pump(.10))
+
+
+def test_short_reference_gap_stops_output_then_requires_new_velocity_without_reopening(gate):
+    gate.enable(True)
+    gate.pump(.05)
+    gate.velocity()
+    gate.wait(lambda items: any(p[2] for p in items))
+    gate.reference(ready=False)
+    gate.wait(lambda items: any(not p[2] for p in items))
+    for _ in range(3):
+        gate.enable(True)  # Lease renewals must not revoke existing authorization.
+        gate.velocity(.5)
+        assert all(not p[2] for p in gate.pump(.04))
+    assert gate.acknowledged[-1] is True
+    gate.reference(ready=True)
+    assert all(not p[2] for p in gate.pump(.1))  # Discard velocity received in the gap.
+    gate.velocity(.2)
+    packets = gate.wait(lambda items: any(p[2] for p in items))
+    assert [p for p in packets if p[2]][-1][5] == pytest.approx(.2)
+
+
+def test_sustained_reference_loss_latches_closed_despite_late_renewals(gate):
+    gate.enable(True)
+    gate.pump(.05)
+    gate.velocity()
+    gate.wait(lambda items: any(p[2] for p in items))
+    gate.reference(ready=False)
+    deadline = time.monotonic()+.8
+    while time.monotonic() < deadline:
+        gate.enable(True)
+        gate.velocity()
+        gate.pump(.03)
+    assert gate.acknowledged[-1] is False
+    gate.reference(ready=True)
+    for _ in range(5):
+        gate.enable(True)
+        gate.velocity()
+        assert all(not p[2] for p in gate.pump(.03))
+    gate.enable(False)  # Bridge acknowledges cancellation; operator must reopen.
+    gate.pump(.05)
+    gate.enable(True)
+    gate.pump(.05)
+    gate.velocity()
+    gate.wait(lambda items: any(p[2] for p in items))

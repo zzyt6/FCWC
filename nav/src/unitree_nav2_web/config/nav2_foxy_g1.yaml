@@ -168,6 +168,7 @@ controller_server:
     # launch file reads the actual axis limits from pushcart_navigation.json.
     CartPush:
       plugin: "unitree_nav2_core::ApproachDWBLocalPlanner"
+      debug_trajectory_details: true
       trajectory_generator_name: "unitree_nav2_core::SpeedLimitedGenerator"
       navigation_speed_mode: "auto"
       navigation_speed: 0.35
@@ -231,9 +232,20 @@ local_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        # Self returns are filtered upstream; preserve nearby external obstacles.
+        # Rebuild through Nav2's clear service on mode changes, before opening
+        # the gate. Never clear real obstacles inside the padded footprint.
         footprint_clearing_enabled: false
-        observation_sources: scan
+        observation_sources: scan rear_clear
+        rear_clear:
+          topic: /navigation/rear_clear
+          data_type: "LaserScan"
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          marking: false
+          clearing: true
+          raytrace_range: 4.0
+          min_obstacle_height: -2.0
+          max_obstacle_height: 2.0
         scan:
           topic: /scan
           observation_persistence: 0.0
@@ -275,9 +287,19 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        # Self returns are filtered upstream; preserve nearby external obstacles.
+        # Clear only the fresh physical cart body, never the larger collision footprint.
         footprint_clearing_enabled: false
-        observation_sources: scan
+        observation_sources: scan rear_clear
+        rear_clear:
+          topic: /navigation/rear_clear
+          data_type: "LaserScan"
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          marking: false
+          clearing: true
+          raytrace_range: 4.0
+          min_obstacle_height: -2.0
+          max_obstacle_height: 2.0
         scan:
           topic: /scan
           observation_persistence: 0.0

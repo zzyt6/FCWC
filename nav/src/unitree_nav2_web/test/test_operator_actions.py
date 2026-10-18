@@ -6,10 +6,11 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import pytest
+from rclpy.time import Time
 
 from unitree_nav2_web.locomotion import CART_ACTIONS, locomotion_actions
 from unitree_nav2_web.nav_web_bridge import NavigationWebBridge
-from test_navigation_safety import _Harness, _Locomotion, _Logger
+from test_navigation_safety import _Harness, _Locomotion, _Logger, _Publisher
 
 
 def operator():
@@ -18,6 +19,45 @@ def operator():
                 high_policy=dict(enabled=False, enable_reason='', zero_reason='', camera=dict(fresh=True)),
                 hands=dict(healthy=True, active=True, pose='zero', editor_available=True,
                            compensation_available=True), cart=dict(attached=True, valid=True))
+
+
+def initial_pose_operator(stage='POLICY', *, requires_policy=True, **state):
+    h = _Harness(_Locomotion(stage=stage))
+    h.navigation_active = h.localized = h.motion_enabled = False
+    h.initial_pose_requires_policy = requires_policy
+    h.locomotion.value.update(state)
+    h.initial_pose_pub = _Publisher()
+    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=100))
+    return h
+
+
+@pytest.mark.parametrize('stage', ['WAITING', 'ZERO', 'PREPARING', 'HOLDING', 'FAULT', 'DAMPED'])
+def test_initial_pose_requires_body_policy_before_publishing(stage):
+    h = initial_pose_operator(stage)
+    with pytest.raises(ValueError, match='准备姿态.*混合策略'):
+        NavigationWebBridge.set_initial_pose(h, {'x':['1'], 'y':['2'], 'yaw':['0.3']})
+    assert h.initial_pose_pub.messages == [] and h.motion_commands == []
+    assert h.locomotion.requests == []
+
+
+@pytest.mark.parametrize('state', [{'online':False}, {'healthy':False}, {'decelerating':True}])
+def test_initial_pose_waits_for_live_healthy_stationary_policy(state):
+    h = initial_pose_operator(**state)
+    with pytest.raises(ValueError, match='站稳'):
+        NavigationWebBridge.set_initial_pose(h, {'x':['1'], 'y':['2'], 'yaw':['0.3']})
+    assert h.initial_pose_pub.messages == []
+
+
+@pytest.mark.parametrize('read_only', [False, True])
+def test_initial_pose_after_policy_or_explicit_read_only_mode(read_only):
+    h = initial_pose_operator('WAITING' if read_only else 'POLICY',
+                              requires_policy=not read_only, ready=False)
+    # Cart/camera readiness must not block robot localization once body policy
+    # is running. The explicit localization-only launch also stays usable.
+    result = NavigationWebBridge.set_initial_pose(h, {'x':['1'], 'y':['2'], 'yaw':['0.3']})
+    assert result == {'x':1., 'y':2., 'z':0., 'yaw':.3}
+    assert len(h.initial_pose_pub.messages) == 1 and h.phase == 'LOCALIZING'
+    assert h.motion_commands == [False] and h.locomotion.requests == []
 
 
 @pytest.mark.parametrize('field,value', [('owned',False),('healthy',False),('decelerating',True),('velocity',[.1,0,0])])

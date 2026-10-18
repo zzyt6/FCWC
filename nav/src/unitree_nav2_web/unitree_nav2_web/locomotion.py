@@ -24,11 +24,13 @@ REQUEST_CODES = {
     "stop": 5,
     "reset": 6,
     "prepare_pose": 7,
+    "model_set": 8,
 }
 CART_ACTIONS = frozenset(('hand_toggle', 'hand_compensation', 'hand_edit', 'hand_load', 'hand_save',
                           'cart_camera_start', 'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable', 'cart_detach'))
 # The request's payload byte selects a Viser pose; joint targets live in Viser.
 PREPARE_POSE_CODES = {"original": 0, "arms_down": 1}
+MODEL_SET_CODES = {"v81": 0, "v82": 1}
 STATUS_MAGIC = "G1LOCO1"
 STATUS_MAX_AGE_S = 0.5
 # All 27 body and 14 hand joints may warn together, plus preparation details.
@@ -59,6 +61,7 @@ def locomotion_actions(status):
         "acquire": healthy and stage == "WAITING",
         "prepare": healthy and stage == "ZERO",
         "prepare_pose": healthy and bool(status.get("prepare_pose_selectable")),
+        "model_set": healthy and stage in ("WAITING", "ZERO") and bool(status.get("model_set_selectable")),
         "policy": healthy
         and stage == "HOLDING"
         and int(status.get("observation_frames", 0)) >= 6,
@@ -157,6 +160,11 @@ class LocomotionLink:
             "mode": status.get("mode") if online else None,
             "simulation": bool(online and status.get("simulation")),
             "reason": status.get("reason", "") if online else "",
+            "model_set": status.get("model_set") if online else None,
+            "model_set_options": status.get("model_set_options", []) if online else [],
+            "model_set_selectable": bool(online and status.get("model_set_selectable")),
+            "model_sha256": status.get("model_sha256", {}) if online else {},
+            "model_warmup": status.get("model_warmup", {}) if online else {},
             "prepare_pose": status.get("prepare_pose") if online else None,
             "prepare_pose_options": status.get("prepare_pose_options", []) if online else [],
             "prepare_pose_selectable": bool(online and status.get("prepare_pose_selectable")),
@@ -183,7 +191,7 @@ class LocomotionLink:
         result["actions"] = locomotion_actions(result)
         return result
 
-    def request(self, kind, *, pose=None, **payload):
+    def request(self, kind, *, pose=None, model_set=None, **payload):
         if kind in CART_ACTIONS:
             with self.lock:
                 self.sequence += 1
@@ -194,12 +202,18 @@ class LocomotionLink:
         if kind not in REQUEST_CODES:
             raise ValueError(f"未知运控请求：{kind}")
         payload = 0
-        if kind == "prepare_pose":
+        if kind == "model_set":
+            if not isinstance(model_set, str) or model_set not in MODEL_SET_CODES or pose is not None:
+                raise ValueError("请选择有效的模型组合")
+            payload = MODEL_SET_CODES[model_set]
+        elif kind == "prepare_pose":
             if not isinstance(pose, str) or pose not in PREPARE_POSE_CODES:
                 raise ValueError("请选择有效的准备姿态")
             payload = PREPARE_POSE_CODES[pose]
         elif pose is not None:
             raise ValueError("该运控请求不接受姿态参数")
+        if kind != "model_set" and model_set is not None:
+            raise ValueError("该运控请求不接受模型参数")
         with self.lock:
             self.sequence += 1
             sequence = self.sequence

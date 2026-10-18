@@ -1,0 +1,232 @@
+{
+  "schema": "homie_g1_lowlevel_456_to_12_v1",
+  "checkpoint_iteration": 68000,
+  "input": {
+    "name": "observations",
+    "dtype": "float32",
+    "shape": [
+      1,
+      456
+    ],
+    "history_frames": 6,
+    "frame_dim": 76,
+    "history_order": "oldest_to_newest; zero prefix only at startup; preserve selected history across switches",
+    "frame_fields": [
+      [
+        "vx_vy_wz",
+        3
+      ],
+      [
+        "height",
+        1
+      ],
+      [
+        "imu_angular_velocity",
+        3
+      ],
+      [
+        "projected_gravity",
+        3
+      ],
+      [
+        "joint_position_minus_default",
+        27
+      ],
+      [
+        "joint_velocity",
+        27
+      ],
+      [
+        "previous_selected_action_after_training_clip",
+        12
+      ]
+    ],
+    "command_scale": [
+      2.0,
+      2.0,
+      0.5,
+      1.0
+    ],
+    "observation_scales": {
+      "ang_vel": 0.5,
+      "dof_pos": 1.0,
+      "dof_vel": 0.05,
+      "height_measurements": 5.0,
+      "lin_vel": 2.0
+    },
+    "clip_observations": 100.0,
+    "imu_link": "imu_in_pelvis",
+    "previous_action_source": "previous_selected_action_after_training_clip",
+    "history_source": "selected_policy_execution"
+  },
+  "output": {
+    "name": "actions",
+    "shape": [
+      1,
+      12
+    ],
+    "action_scale": 0.25,
+    "mapping": "q_target = default_leg_q + action_scale * action; enforce physical joint limits",
+    "training_clip_actions": 100.0
+  },
+  "control_dt_s": 0.02,
+  "physics_dt_s": 0.005,
+  "joint_order": [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint"
+  ],
+  "sdk29_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28
+  ],
+  "default_joint_positions": [
+    -0.1,
+    0,
+    0.0,
+    0.3,
+    -0.2,
+    0,
+    -0.1,
+    0,
+    0.0,
+    0.3,
+    -0.2,
+    0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    -0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "nominal_kp": [
+    100.0,
+    100.0,
+    100.0,
+    150.0,
+    40.0,
+    40.0,
+    100.0,
+    100.0,
+    100.0,
+    150.0,
+    40.0,
+    40.0,
+    300.0,
+    200.0,
+    200.0,
+    200.0,
+    100.0,
+    20.0,
+    20.0,
+    20.0,
+    200.0,
+    200.0,
+    200.0,
+    100.0,
+    20.0,
+    20.0,
+    20.0
+  ],
+  "nominal_kd": [
+    2.0,
+    2.0,
+    2.0,
+    4.0,
+    2.0,
+    2.0,
+    2.0,
+    2.0,
+    2.0,
+    4.0,
+    2.0,
+    2.0,
+    5.0,
+    4.0,
+    4.0,
+    4.0,
+    1.0,
+    0.5,
+    0.5,
+    0.5,
+    4.0,
+    4.0,
+    4.0,
+    1.0,
+    0.5,
+    0.5,
+    0.5
+  ],
+  "unobserved_sdk29_joints": {
+    "13": "waist_roll",
+    "14": "waist_pitch"
+  },
+  "dex3": "Not observed or controlled by this policy; separate controller required.",
+  "notes": [
+    "Gains are training nominal values, not automatic approval for hardware operation.",
+    "Physics dump has zero leg drive stiffness because legs use explicit torque PD; do not copy those zeros.",
+    "Upper body and the two additional waist joints require an explicit controller/hold target.",
+    "Offline equivalence does not establish standing, walking, or sim-to-real performance.",
+    "HOMIE V3 walking model (homie_isaaclab_v2 cfg.v3, fine-tuned from model_60000): velocity-only commands, trained for |cmd| >= 0.05 at fixed height 0.74; below that the Balance model takes over.",
+    "Same observation / action / PD semantics as model_60000 (command scale 2, 2, 0.5, 1; wz scale 0.5)."
+  ]
+}

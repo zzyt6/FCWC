@@ -163,11 +163,23 @@ def main():
         browser.click('接管网页操作')
         until(lambda: row().get('owner') is not None)
         owner = row()['owner']
+        from core.model_sets import MODEL_SET_LABELS
+        selector = until(lambda: browser.find('模型组合'))
+        assert browser.components[selector]['options'] == list(MODEL_SET_LABELS.values())
+        assert row()['model_set'] == 'v81'
+        until(lambda: not browser.components[selector]['disabled'])
+        for key in ('v82', 'v81'):
+            browser.set_slider('模型组合', MODEL_SET_LABELS[key])
+            until(lambda: row().get('model_set') == key)
+            assert row()['stage'] == 'WAITING' and not np.any(row()['velocity'])
         other = Browser(port)
         clients.append(other)
         other.click('接管网页操作', force=True)
         time.sleep(.15)
         assert row()['owner'] == owner
+        other.set_slider('模型组合', MODEL_SET_LABELS['v82'])
+        time.sleep(.15)
+        assert row()['model_set'] == 'v81'
         until(lambda: row().get('heading', {}).get('effective_frame') == 'body')
         other.set_slider('航向 Kp (1/s)', .4)
         other.set_slider('角速度滤波截止频率 (Hz)', 2.)
@@ -188,6 +200,9 @@ def main():
         browser.click('以当前朝向重设航向目标')
         browser.click('① 接管底层')
         until(lambda: row().get('stage') == 'ZERO')
+        browser.set_slider('模型组合', MODEL_SET_LABELS['v82'])
+        until(lambda: row().get('model_set') == 'v82')
+        assert row()['high_policy']['model_release'] == 'V8.2'
         browser.click('Dex3 使能并抓握（3 秒）', force=True)
         time.sleep(.15)
         assert not row()['dex3']['active']
@@ -197,6 +212,10 @@ def main():
         browser.click('② 移到准备姿态')
         until(lambda: row().get('stage') in ('HOLDING', 'FAULT'))
         assert row()['stage'] == 'HOLDING', row()
+        until(lambda: browser.components[selector]['disabled'])
+        browser.set_slider('模型组合', MODEL_SET_LABELS['v81'])
+        time.sleep(.15)
+        assert row()['model_set'] == 'v82'
         from core.robot import RobotConfig, ACTIVE, UPPER
         config = RobotConfig()
         np.testing.assert_allclose(np.asarray(row()['target'])[ACTIVE], config.prepare_q[ACTIVE], atol=1e-4)
@@ -325,6 +344,9 @@ def main():
     assert summary['dropped_records'] == 0 and summary['recorder_error'] == '', summary
     metadata = json.loads((session/'metadata.json').read_text())
     assert metadata['motion_settings'] == defaults
+    assert metadata['initial_model_set'] == 'v81'
+    assert set(metadata['model_sets']) == {'v81', 'v82'}
+    assert metadata['model_sets']['v82']['high_policy']['model_release'] == 'V8.2'
     assert not (session/'snapshot').exists()
     with gzip.open(session/'telemetry.jsonl.gz', 'rt') as stream:
         telemetry = [json.loads(line) for line in stream]
@@ -344,6 +366,7 @@ def main():
     with gzip.open(session/'events.jsonl.gz', 'rt') as stream:
         events = [json.loads(line) for line in stream]
     assert not any(e['type'] == 'policy_result' for e in events)
+    assert any(e['type'] == 'model_set_selected' and e['model_set'] == 'v82' for e in events)
     assert any(e['type'] == 'motion_settings' and e['settings']['heading_kp'] == .65 for e in events)
     assert any(e['type'] == 'motion_settings_rejected' for e in events)
     assert any(e['type'] == 'smooth_zero_started' for e in events)

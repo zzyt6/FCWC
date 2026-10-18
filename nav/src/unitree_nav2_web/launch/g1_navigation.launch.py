@@ -5,7 +5,7 @@ from ament_index_python.packages import get_package_prefix, get_package_share_di
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -50,7 +50,7 @@ def generate_launch_description():
             package="nav2_controller",
             executable="controller_server",
             name="controller_server",
-            output="screen",
+            output="both",
             parameters=[nav2_params, {
                 "CartPush.min_vel_x": cart_limits[0][0], "CartPush.max_vel_x": cart_limits[0][1],
                 "CartPush.min_vel_y": cart_limits[1][0], "CartPush.max_vel_y": cart_limits[1][1],
@@ -176,7 +176,8 @@ def generate_launch_description():
                     "--cart-config", cart_config,
                 ],
                 name="g1_locomotion_executor",
-                output="screen",
+                # Keep model-loading/bridge tracebacks after the terminal closes.
+                output="both",
                 # The executor needs SIGINT for its own one-second damping stop.
                 sigterm_timeout="12",
             ),
@@ -224,7 +225,7 @@ def generate_launch_description():
                 package="unitree_nav2_web",
                 executable="cart_navigation",
                 name="cart_navigation",
-                output="screen",
+                output="both",
                 parameters=[{"config_file": cart_config}],
             ),
             Node(
@@ -332,7 +333,7 @@ def generate_launch_description():
                 package="unitree_nav2_web",
                 executable="nav_web_bridge",
                 name="navigation_web_bridge",
-                output="screen",
+                output="both",
                 parameters=[
                     {
                         "maps_dir": os.path.join(root, "maps"),
@@ -350,6 +351,10 @@ def generate_launch_description():
                         "cart_bt_xml": os.path.join(share, "behavior_trees", "cart_push.xml"),
                         "speed_settings_file": LaunchConfiguration("speed_settings_file"),
                         "footprint": footprint,
+                        "initial_pose_requires_policy": ParameterValue(PythonExpression([
+                            "'", start_locomotion, "'.lower() in ('true', '1', 'yes') and '",
+                            locomotion_mode, "' != 'observe'",
+                        ]), value_type=bool),
                         "locomotion_command_port": ParameterValue(
                             command_port, value_type=int
                         ),

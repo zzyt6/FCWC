@@ -9,7 +9,7 @@ let initialCandidate = null;
 let liveScan = { points: [], count: 0, nearest: null, rangeMax: 10, receivedAt: 0 };
 const visibility = {
   grid: true, map: true, global: true, local: true, scan: true,
-  globalPath: true, localPath: true, robot: true, radar: true,
+  globalPath: true, localPath: true, robot: true, cart: true, footprint: true, radar: true,
 };
 const camera = { zoom: 1, panX: 0, panY: 0 };
 let mode = 'view';
@@ -22,6 +22,8 @@ let speedRequestBusy = false;
 let speedRequestError = '';
 let preparationPending = null;
 let preparationError = '';
+let modelSetPending = null;
+let modelSetError = '';
 let cartBusy = false;
 let cartError = '';
 let cartPending = null;
@@ -54,6 +56,7 @@ function acceptStatus(next) {
   status = next;
   lastStatusAt = performance.now();
   updateUi();
+  draw();
 }
 function statusFresh() { return performance.now() - lastStatusAt < 2500; }
 async function refreshStatus() { acceptStatus((await api('/api/status')).status); }
@@ -336,10 +339,8 @@ function draw() {
   if (visibility.scan) drawScanOverlay(candidatePose(), dpr);
   if (visibility.globalPath) drawPath(paths.global, '#28c8f2', 3 * dpr, [8 * dpr, 5 * dpr]);
   if (visibility.localPath) drawPath(paths.local, '#56f39a', 4 * dpr);
-  if (visibility.robot) {
-    drawArrow(robotPose, '#ffe35b', 20 * dpr, 'G1');
-    drawCart(dpr);
-  }
+  drawCart(dpr);
+  if (visibility.robot) drawArrow(robotPose, '#ffe35b', 20 * dpr, 'G1');
   drawArrow(goalPose, '#42ddff', 18 * dpr, 'Goal');
   if (dragStart && dragCurrent) {
     const a = worldToScreen(...dragStart), b = worldToScreen(...dragCurrent);
@@ -511,6 +512,38 @@ function updatePreparationUi(loco) {
   setNote('locoPreparePoseStatus', preparationError || message, preparationError ? 'bad' : '');
 }
 
+function updateModelSetUi(loco) {
+  const selector = $('locoModelSet');
+  const options = loco.model_set_options || [];
+  const signature = JSON.stringify(options);
+  if (selector.dataset.options !== signature) {
+    selector.replaceChildren(...options.map(item => {
+      const option = document.createElement('option');
+      option.value = item.value; option.textContent = item.label;
+      return option;
+    }));
+    selector.dataset.options = signature;
+  }
+  if (modelSetPending) {
+    if (loco.online && loco.model_set === modelSetPending.value) {
+      modelSetPending = null;
+    } else if (!loco.online || !loco.model_set_selectable || Date.now() - modelSetPending.started > 4000) {
+      modelSetError = '切换未确认，请检查当前模型组合后重试。';
+      modelSetPending = null;
+    }
+  }
+  selector.value = modelSetPending?.value || loco.model_set || '';
+  selector.disabled = !loco.actions?.model_set || !!modelSetPending || !!preparationPending || !!lifecyclePending;
+  if (modelSetPending) {
+    ['locoAcquire', 'locoPrepare', 'locoPolicy', 'locoPreparePose'].forEach(id => { $(id).disabled = true; });
+  }
+  const message = modelSetPending ? '等待运控确认模型组合…'
+    : !loco.online ? '等待运控连接'
+    : loco.model_set_selectable ? '已加载并预热；选择后再准备，行走与推车模型成套切换。'
+    : '本次模型组合已锁定。停止并复位后可重新选择。';
+  setNote('locoModelSetStatus', modelSetError || message, modelSetError ? 'bad' : '');
+}
+
 function updateLocomotionUi(loco) {
   const actions = loco.actions || {};
   const warnings = loco.online ? (loco.warnings || []) : [];
@@ -523,7 +556,11 @@ function updateLocomotionUi(loco) {
     $(id).disabled = !statusFresh() || !actions[action] || (!!lifecyclePending && !['zero', 'stop'].includes(action));
   });
   updatePreparationUi(loco);
-  if (!statusFresh() || lifecyclePending) $('locoPreparePose').disabled = true;
+  updateModelSetUi(loco);
+  if (!statusFresh() || lifecyclePending) {
+    $('locoPreparePose').disabled = true;
+    $('locoModelSet').disabled = true;
+  }
   if (!loco.online) {
     setBadge('locoBadge', '未连接', 'bad');
     setNote('locoStatus', '运控执行进程未连接。确认 run_navigation.sh 已启动 nav/locomotion，且 Viser 网页没有占用底层桥接。', 'bad');
@@ -533,6 +570,8 @@ function updateLocomotionUi(loco) {
   setBadge('locoBadge', loco.ready ? '策略运行' : loco.stage_text,
     loco.ready ? 'ok' : stopped ? 'bad' : loco.stage === 'WAITING' ? '' : 'busy');
   const lines = [`${loco.stage_text}${loco.simulation ? '（离线合成反馈）' : ''}`];
+  const modelLabel = (loco.model_set_options || []).find(item => item.value === loco.model_set)?.label;
+  if (modelLabel) lines.push(`当前模型：${modelLabel}`);
   if (loco.selected_model && loco.stage === 'POLICY') {
     const v = loco.velocity || [0, 0, 0];
     lines.push(`模型 ${loco.selected_model} · 策略命令 ${v.map(n => Number(n).toFixed(2)).join(' / ')}`);
@@ -554,23 +593,36 @@ function updateUi() {
   $('statusText').textContent = status.error ? `${status.message}：${status.error}` : (status.message || '等待状态');
   const fresh = statusFresh();
   const mapOperationAllowed = fresh && !mapBusy && !!$('mapSelect').value && !status.processing && !status.navigation_active;
-  const initialAllowed = fresh && !poseBusy && !!status.map_ready && !status.processing && !status.navigation_active;
+  const requiresPolicy = status.initial_pose_requires_policy !== false;
+  const bodyPolicyReady = !!loco.online && !!loco.healthy && loco.stage === 'POLICY';
+  const initialPolicyReady = !requiresPolicy || (bodyPolicyReady && !loco.decelerating);
+  const initialAllowed = fresh && !poseBusy && !!status.map_ready && !status.processing && !status.navigation_active && initialPolicyReady;
   const speed = status.navigation_speed || {};
   const goalAllowed = fresh && !poseBusy && !!status.localized && !!status.motion_enabled && !!loco.ready && !status.navigation_active && !loco.decelerating && speed.ready && !speed.pending;
   $('processMap').disabled = !mapOperationAllowed;
   $('processMap').textContent = status.map_ready ? '切换 / 重新处理所选 PCD' : '处理并装载所选 PCD';
   $('initialMode').disabled = !initialAllowed;
+  $('initialPoseHint').textContent = !requiresPolicy ? '只读定位：确认机器人姿态稳定后，在地图上设置初始位置和朝向。'
+    : !bodyPolicyReady ? '先完成准备姿态、启动混合策略，确认机器人落地站稳后再设置初始位姿。'
+    : loco.decelerating ? '等待机器人停止并站稳后再设置初始位姿。'
+    : '混合策略已启动。确认机器人已落地站稳，再设置初始位姿；运动门保持关闭直到定位完成。';
   $('goalMode').disabled = !goalAllowed;
   $('toolbarInitial').disabled = !initialAllowed;
   $('toolbarGoal').disabled = !goalAllowed;
   const gate = status.motion_gate || {};
+  if (gate.suspended) $('statusText').textContent = '导航暂缓，正在归零并等待观测恢复';
+  if (!status.error && status.phase === 'READY' && status.localized && !status.motion_enabled
+      && (status.message || '').startsWith('AMCL 定位稳定')) {
+    $('statusText').textContent = gate.can_enable ? 'AMCL 定位稳定；可启用运动门'
+      : `AMCL 定位稳定；运动门等待：${(gate.blockers || []).join('；') || '状态确认'}`;
+  }
   $('motionButton').disabled = motionBusy || (fresh && status.motion_enabled ? false : !fresh || !gate.can_enable);
   $('motionButton').textContent = status.motion_enabled ? '关闭 G1 运动安全门' : '启用 G1 运动安全门';
   $('motionButton').classList.toggle('enabled', !!status.motion_enabled);
   const blockers = fresh ? (gate.blockers || []) : ['导航状态已过期，等待连接恢复'];
   if (!fresh) $('statusText').textContent = '导航状态已过期，等待连接恢复；停止按钮仍可用';
-  $('gateBlockers').hidden = (fresh && !!status.motion_enabled) || !blockers.length;
-  $('gateBlockers').textContent = blockers.length ? `运动门等待：\n· ${blockers.join('\n· ')}` : '';
+  $('gateBlockers').hidden = (fresh && !!status.motion_enabled && !gate.suspended) || !blockers.length;
+  $('gateBlockers').textContent = blockers.length ? `${gate.suspended ? '导航暂缓' : '运动门等待'}：\n· ${blockers.join('\n· ')}` : '';
   // The stop endpoint is idempotent; keep the safety control always available.
   $('stopButton').disabled = false;
   if ((mode === 'initial' && !initialAllowed) || (mode === 'goal' && !goalAllowed)) {
@@ -579,8 +631,8 @@ function updateUi() {
   }
 
   $('stepMap').className = status.map_ready ? 'done' : (status.processing ? 'active' : '');
-  $('stepLoc').className = status.localized ? 'done' : (status.map_ready ? 'active' : '');
-  $('stepLoco').className = loco.ready ? 'done' : (loco.online && !['DAMPED', 'FAULT'].includes(loco.stage) ? 'active' : '');
+  $('stepLoc').className = status.localized ? 'done' : (status.map_ready && initialPolicyReady ? 'active' : '');
+  $('stepLoco').className = bodyPolicyReady ? 'done' : (status.map_ready ? 'active' : '');
   $('stepMotion').className = status.motion_enabled ? 'done' : (status.localized && loco.ready ? 'active' : '');
   $('stepNav').className = status.navigation_active ? 'active'
     : ((status.navigation_task || {}).state === 'SUCCEEDED' ? 'done' : '');
@@ -588,7 +640,8 @@ function updateUi() {
   setBadge('mapBadge', status.map_ready ? (status.selected_map || '已装载') : status.processing ? '处理中' : '未装载',
     status.map_ready ? 'ok' : status.processing ? 'busy' : '');
   setBadge('locBadge', status.localization_fault ? '定位故障' : status.localized ? 'READY'
-    : status.phase === 'LOCALIZING' ? '修正中' : status.map_ready ? '等待初始位姿' : '等待地图',
+    : status.phase === 'LOCALIZING' ? '修正中' : !status.map_ready ? '等待地图'
+    : !initialPolicyReady ? '等待策略启动并站稳' : '等待初始位姿',
     status.localization_fault ? 'bad' : status.localized ? 'ok' : status.phase === 'LOCALIZING' ? 'busy' : '');
   setBadge('navBadge', status.navigation_active ? '导航中' : status.motion_enabled ? '可下发目标' : '运动门关闭',
     status.navigation_active ? 'busy' : status.motion_enabled ? 'ok' : '');
@@ -628,18 +681,47 @@ function updateUi() {
 function drawCart(dpr) {
   const pose = status.cart_pose;
   const reference = status.navigation_reference || {};
-  if (!pose || reference.mode !== 'cart' || !reference.ready) return;
-  const points = (reference.footprint || []).map(([x, y]) => worldToScreen(
+  if (!statusFresh() || !pose || reference.mode !== 'cart') return;
+  const project = ([x, y]) => worldToScreen(
     pose.x + Math.cos(pose.yaw) * x - Math.sin(pose.yaw) * y,
-    pose.y + Math.sin(pose.yaw) * x + Math.cos(pose.yaw) * y));
-  if (points.length && points.every(Boolean)) {
+    pose.y + Math.sin(pose.yaw) * x + Math.cos(pose.yaw) * y);
+  const polygon = (vertices, fill = false) => {
+    const points = (vertices || []).map(project);
+    if (points.length < 3 || !points.every(Boolean)) return;
     ctx.beginPath();
     points.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
     ctx.closePath();
-    ctx.fillStyle = 'rgba(255, 159, 67, 0.12)'; ctx.fill();
-    ctx.strokeStyle = '#ff9f43'; ctx.lineWidth = 2 * dpr; ctx.stroke();
+    if (fill) ctx.fill();
+    ctx.stroke();
+  };
+  ctx.save();
+  if (visibility.footprint) {
+    ctx.strokeStyle = '#ffb347'; ctx.lineWidth = 1.5 * dpr;
+    ctx.setLineDash([6 * dpr, 4 * dpr]);
+    polygon(reference.footprint);
+    ctx.setLineDash([]);
   }
-  drawArrow(pose, '#ff9f43', 18 * dpr, '小车（估计）');
+  if (visibility.cart) {
+    const model = reference.cart_model || {};
+    const color = reference.ready ? '#63e6be' : '#a6b8b2';
+    ctx.strokeStyle = color; ctx.fillStyle = 'rgba(99, 230, 190, 0.12)';
+    ctx.lineWidth = 2 * dpr;
+    polygon(model.body, true);
+    for (const wheel of model.wheels || []) {
+      const point = project(wheel.center);
+      if (!point) continue;
+      ctx.beginPath(); ctx.arc(...point, wheel.radius * viewTransform().scale, 0, Math.PI * 2);
+      ctx.fillStyle = '#183e36'; ctx.fill(); ctx.stroke();
+    }
+    const handle = (model.handle || []).map(project);
+    if (handle.length === 2 && handle.every(Boolean)) {
+      ctx.lineWidth = 4 * dpr; ctx.beginPath(); ctx.moveTo(...handle[0]);
+      ctx.lineTo(...handle[1]); ctx.stroke();
+    }
+    const degrees = Math.atan2(Math.sin(pose.yaw), Math.cos(pose.yaw)) * 180 / Math.PI;
+    drawArrow(pose, color, 22 * dpr, `小车 ${degrees.toFixed(1)}°（位置估计）`);
+  }
+  ctx.restore();
 }
 
 const handLabels = ['拇指旋转', '拇指近端', '拇指远端', '中指近端', '中指远端', '食指近端', '食指远端'];
@@ -657,6 +739,13 @@ for (let joint = 0; joint < 14; joint++) {
 function updateCartUi(loco) {
   const high = loco.high_policy || {}, hands = loco.hands || {}, cart = loco.cart || {};
   const reference = status.navigation_reference || {}, camera = high.camera || {};
+  const gantry = reference.gantry_filter || {};
+  $('gantryStatus').hidden = !gantry.enabled;
+  if (gantry.enabled) {
+    const regions = (gantry.boxes || []).map(box =>
+      `身后 ${(-box.max_m[0]).toFixed(2)}–${(-box.min_m[0]).toFixed(2)} m，横向 ${box.min_m[1].toFixed(2)}–${box.max_m[1].toFixed(2)} m`).join('；');
+    setNote('gantryStatus', `后方区域清空已开启（随机器人移动）\n${regions}\n区域内人员和物体不参与实时避障，区域外继续避障。${gantry.ready ? '' : '\n' + (gantry.reason || reference.reason || '等待避障扫描')}`, 'warn');
+  }
   const actions = loco.actions || {};
   const reply = loco.cart_request || {};
   if (cartPending && reply.sequence === cartPending.id && reply.state !== 'queued') {
@@ -809,7 +898,7 @@ const locomotionConfirm = {
 };
 async function locomotionRequest(action) {
   if (!statusFresh() || (action === 'prepare' && preparationPending)) return;
-  if (lifecyclePending && !['zero', 'stop'].includes(action)) return;
+  if ((lifecyclePending || modelSetPending) && !['zero', 'stop'].includes(action)) return;
   const pose = status.locomotion?.prepare_pose;
   const label = status.locomotion?.prepare_pose_options?.find(item => item.value === pose)?.label;
   const confirmation = action === 'prepare' && label
@@ -838,7 +927,7 @@ async function locomotionRequest(action) {
   }
 }
 $('locoPreparePose').onchange = async () => {
-  if (preparationPending || !status.locomotion?.actions?.prepare_pose) return;
+  if (preparationPending || modelSetPending || !status.locomotion?.actions?.prepare_pose) return;
   const pose = $('locoPreparePose').value;
   preparationError = '';
   preparationPending = { action: 'prepare_pose', pose, started: Date.now() };
@@ -849,6 +938,22 @@ $('locoPreparePose').onchange = async () => {
   } catch (error) {
     preparationPending = null;
     preparationError = error.message;
+  }
+  updateUi();
+};
+$('locoModelSet').onchange = async () => {
+  if (!statusFresh() || modelSetPending || preparationPending || lifecyclePending
+      || !status.locomotion?.actions?.model_set) return;
+  const value = $('locoModelSet').value;
+  modelSetError = '';
+  modelSetPending = { value, started: Date.now() };
+  updateUi();
+  try {
+    await api(`/api/locomotion?action=model_set&model_set=${encodeURIComponent(value)}`);
+    await refreshStatus();
+  } catch (error) {
+    modelSetPending = null;
+    modelSetError = error.message;
   }
   updateUi();
 };

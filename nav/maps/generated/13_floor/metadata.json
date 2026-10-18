@@ -1,5 +1,5 @@
 {
-  "source_pcd": "maps/13_floor.pcd",
+  "source_pcd": "/home/unitree/CWC/nav/maps/13_floor.pcd",
   "points": 278624,
   "filtered_points": 271142,
   "ground_points": 136343,

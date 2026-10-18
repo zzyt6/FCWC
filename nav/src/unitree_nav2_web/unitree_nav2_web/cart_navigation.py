@@ -20,9 +20,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan, PointCloud2
 from std_msgs.msg import Bool, String, UInt32
-from tf2_ros import TransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
-from .cart_geometry import CartGeometry, load_settings, quaternion_matrix, rotation_z
+from .cart_geometry import CartGeometry, GantryGeometry, load_settings, quaternion_matrix, rotation_z
 
 
 def cloud_arrays(message):
@@ -43,6 +43,14 @@ def cloud_arrays(message):
     return xyz, records
 
 
+def filtered_cloud(message, records, keep):
+    output = copy.copy(message)
+    output.height, output.width = 1, int(keep.sum())
+    output.row_step = output.width*output.point_step
+    output.data = records[keep].tobytes()
+    return output
+
+
 class CartNavigation(Node):
     def __init__(self):
         super().__init__('cart_navigation')
@@ -52,6 +60,12 @@ class CartNavigation(Node):
         self.declare_parameter('raw_cloud_frame', 'livox_frame')
         self.settings = load_settings(self.get_parameter('config_file').value)
         self.geometry = CartGeometry(self.settings)
+        self.gantry = GantryGeometry(self.settings.get('gantry_filter', {}))
+        self.last_gantry_filtered = -math.inf
+        self.gantry_removed_points = 0
+        self.gantry_error = ''
+        self.gantry_clear_active = False
+        self.last_gantry_clear = -math.inf
         self.raw_frame = self.get_parameter('raw_cloud_frame').value
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(('127.0.0.1', self.get_parameter('geometry_port').value))
@@ -59,6 +73,8 @@ class CartNavigation(Node):
         self.state = {}
         self.cart = {}
         self.received = self.last_base = self.last_filtered = self.last_scan = -math.inf
+        self.last_raw = self.last_localization_scan = -math.inf
+        self.localizing_without_cart = False
         self.previous = None
         self.velocity = np.zeros(3)
         self.epoch = 0
@@ -69,6 +85,23 @@ class CartNavigation(Node):
         self.create_subscription(TransformStamped, '/g1/lidar_mount', self._mount, 3)
         self.broadcaster = TransformBroadcaster(self)
         sensor = QoSProfile(depth=3, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.gantry_clear_pub = self.create_publisher(LaserScan, '/navigation/rear_clear', sensor)
+        self.gantry_clear_scan = None
+        if self.gantry.enabled:
+            center, angles, distances = self.gantry.clearing_rays()
+            transform = TransformStamped()
+            transform.header.frame_id = self.gantry.frame
+            transform.child_frame_id = 'gantry_exclusion'
+            transform.header.stamp = self.get_clock().now().to_msg()
+            transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z = map(float, center)
+            transform.transform.rotation.w = 1.
+            self.gantry_broadcaster = StaticTransformBroadcaster(self)
+            self.gantry_broadcaster.sendTransform(transform)
+            self.gantry_clear_scan = LaserScan(
+                angle_min=float(angles[0]), angle_max=float(angles[-1]),
+                angle_increment=float(angles[1]-angles[0]), range_min=0.,
+                range_max=float(distances.max()+.1), ranges=distances.astype(np.float32).tolist())
+            self.gantry_clear_scan.header.frame_id = transform.child_frame_id
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.cloud_pub = self.create_publisher(PointCloud2, '/navigation/lidar', sensor)
@@ -102,6 +135,11 @@ class CartNavigation(Node):
         if message.header.frame_id == 'base_link' and message.child_frame_id == self.raw_frame:
             self.mount = message
 
+    def _gantry_ready(self):
+        now = time.monotonic()
+        return not self.gantry.enabled or (now-self.last_gantry_filtered <= .5
+                                           and now-self.last_scan <= .5)
+
     def _tick(self):
         now = time.monotonic()
         for _ in range(64):
@@ -127,12 +165,15 @@ class CartNavigation(Node):
                 continue
         attached = bool(self.cart.get('attached'))
         fresh = self._fresh()
+        if self.gantry_clear_active and (not fresh or not self._gantry_ready()
+                                        or now-self.last_gantry_clear > .2):
+            self._expire_gantry_clear()
         footprint = self.geometry.footprint(self.cart, attached) if fresh else None
         ready = fresh and now-self.last_base <= .5 and self.odom_epoch == self.epoch
         if attached:
             ready = ready and now-self.last_filtered <= .5 and now-self.last_scan <= .5
         if not fresh:
-            reason = '等待新鲜的小车航向和运控反馈' if attached else '等待运控反馈'
+            reason = ((self.cart.get('reason') or '小车航向或运控反馈已过期') if attached else '等待运控反馈')
         elif not ready:
             reason = self.filter_error or '等待导航里程计和车体过滤后的扫描'
         else:
@@ -146,7 +187,20 @@ class CartNavigation(Node):
         self.ready_pub.publish(Bool(data=bool(ready)))
         self.status_pub.publish(String(data=json.dumps(dict(
             ready=bool(ready), epoch=self.epoch, mode='cart' if attached else 'walk',
-            reason=reason, footprint=footprint, cart=self.cart, removed_points=self.removed_points,
+            reason=reason, footprint=footprint, cart=self.cart, cart_model=self.geometry.top_view,
+            removed_points=self.removed_points,
+            gantry_filter=dict(enabled=self.gantry.enabled, frame=self.gantry.frame,
+                               ready=self._gantry_ready(), removed_points=self.gantry_removed_points,
+                               reason=self.gantry_error,
+                               boxes=[dict(min_m=low.tolist(), max_m=high.tolist())
+                                      for low, high in self.gantry.boxes]),
+            observations=dict(
+                raw_age_s=round(now-self.last_raw, 3) if math.isfinite(self.last_raw) else None,
+                filtered_age_s=round(now-self.last_filtered, 3) if math.isfinite(self.last_filtered) else None,
+                obstacle_scan_age_s=round(now-self.last_scan, 3) if math.isfinite(self.last_scan) else None,
+                localization_scan_age_s=round(now-self.last_localization_scan, 3)
+                if math.isfinite(self.last_localization_scan) else None,
+                localization_without_cart_filter=self.localizing_without_cart),
             sent_monotonic=now), ensure_ascii=False)))
 
     def _odom(self, message):
@@ -212,49 +266,110 @@ class CartNavigation(Node):
             return
 
     def _cloud(self, message):
+        self.last_raw = time.monotonic()
+        if self.gantry.enabled:
+            try:
+                points, records = self._points_in_body(message)
+                keep = ~self.gantry.self_mask(points)
+                message = filtered_cloud(message, records, keep)
+                self.gantry_removed_points = int((~keep).sum())
+                self.last_gantry_filtered = time.monotonic()
+                self.gantry_error = ''
+            except Exception as exc:
+                self.gantry_error = '后方区域清空暂不可用：' + str(exc)
+                self.last_gantry_filtered = -math.inf
+                self._expire_gantry_clear()
+                # Fall back to ordinary lidar obstacles if the rear region
+                # cannot be placed. Cart filtering retains its own checks.
         if not self.cart.get('attached'):
+            self.localizing_without_cart = False
             self.cloud_pub.publish(message)
             return
         if not self._fresh():
-            return  # No fresh geometry: pause observations, never publish an empty free-space scan.
+            self._localization_only(message)
+            return
         try:
             # Mount geometry is published directly from lowstate, independent
             # of FAST-LIO. Filtering can resume after camera loss without a
             # circular dependency on new filtered odometry/TF.
-            transform = self.mount
-            if transform is None:
-                raise ValueError('等待雷达安装位姿')
-            stamp = Time.from_msg(transform.header.stamp)
-            if abs((self.get_clock().now()-stamp).nanoseconds)*1e-9 > .3:
-                raise ValueError('雷达与机身坐标变换已过期')
-            q, t = transform.transform.rotation, transform.transform.translation
+            body_points, records = self._points_in_body(message)
             leveled = np.asarray(self.cart['body_rotation'])
-            rotation = leveled @ quaternion_matrix([q.w, q.x, q.y, q.z])
-            xyz, records = cloud_arrays(message)
-            points = xyz @ rotation.T + leveled @ [t.x, t.y, t.z]
+            points = body_points @ leveled.T
             keep = ~self.geometry.self_mask(points, self.cart)
-            output = copy.copy(message)
-            output.height, output.width = 1, int(keep.sum())
-            output.row_step = output.width*output.point_step
-            output.data = records[keep].tobytes()
+            output = filtered_cloud(message, records, keep)
             self.cloud_pub.publish(output)
             self.removed_points = int((~keep).sum())
             self.last_filtered, self.filter_error = time.monotonic(), ''
+            self.localizing_without_cart = False
         except Exception as exc:
             self.filter_error = '车体点云过滤等待有效坐标：' + str(exc)
+            self._localization_only(message)
+
+    def _points_in_body(self, message):
+        if message.header.frame_id != self.raw_frame:
+            raise ValueError('雷达点云坐标系不匹配')
+        transform = self.mount
+        if transform is None:
+            raise ValueError('等待雷达安装位姿')
+        stamp = Time.from_msg(transform.header.stamp)
+        if abs((self.get_clock().now()-stamp).nanoseconds)*1e-9 > .3:
+            raise ValueError('雷达与机身坐标变换已过期')
+        q, t = transform.transform.rotation, transform.transform.translation
+        rotation = quaternion_matrix([q.w, q.x, q.y, q.z])
+        offset = np.asarray([t.x, t.y, t.z])
+        if not np.isfinite(offset).all():
+            raise ValueError('雷达安装位置不是有限数值')
+        xyz, records = cloud_arrays(message)
+        return xyz @ rotation.T + offset, records
+
+    def _expire_gantry_clear(self):
+        if not self.gantry_clear_active:
+            return
+        # Foxy retains the last observation even when the publisher falls
+        # silent. Replace it explicitly with a cloud containing no rays.
+        empty = LaserScan(angle_increment=1., range_min=0., range_max=4., ranges=[float('nan')])
+        empty.header.frame_id = self.gantry.frame
+        empty.header.stamp = self.get_clock().now().to_msg()
+        self.gantry_clear_pub.publish(empty)
+        self.gantry_clear_active = False
+
+    def _localization_only(self, message):
+        # Camera/arm tracking must not starve FAST-LIO of lidar measurements.
+        # With unknown cart geometry retain the remaining returns for localization;
+        # do not guess a mask or publish an empty/free-space obstacle scan.
+        # The cart reference remains unready and navigation stays gated off.
+        self.localizing_without_cart = True
+        self.last_filtered = -math.inf
+        self.cloud_pub.publish(message)
 
     def _scan(self, message, topic):
+        localization = topic == 'scan_localization'
         if self.cart.get('attached'):
-            if not self._fresh():
-                return
-            angles = message.angle_min + np.arange(len(message.ranges))*message.angle_increment
-            ranges = np.asarray(message.ranges, dtype=float).copy()
-            ranges[self.geometry.occluded_ranges(angles, ranges, self.cart)] = np.nan
-            message = copy.copy(message)
-            message.ranges = ranges.astype(np.float32).tolist()
+            if not self._fresh() or self.localizing_without_cart:
+                if not localization:
+                    return
+            else:
+                angles = message.angle_min + np.arange(len(message.ranges))*message.angle_increment
+                ranges = np.asarray(message.ranges, dtype=float).copy()
+                ranges[self.geometry.occluded_ranges(angles, ranges, self.cart)] = np.nan
+                message = copy.copy(message)
+                message.ranges = ranges.astype(np.float32).tolist()
         self.scan_pubs[topic].publish(message)
-        if topic == 'scan':
+        if localization:
+            self.last_localization_scan = time.monotonic()
+        else:
             self.last_scan = time.monotonic()
+        if not localization and self.gantry.enabled and self._gantry_ready() and self._fresh():
+            # This is an explicit ignore region, not a physical free-space
+            # measurement. Stock Nav2 uses it for clearing only. The origin
+            # is inside the rear rectangle so rays never cross its exterior.
+            clear_scan = copy.deepcopy(self.gantry_clear_scan)
+            clear_scan.header.stamp = copy.copy(message.header.stamp)
+            self.gantry_clear_pub.publish(clear_scan)
+            self.gantry_clear_active = True
+            self.last_gantry_clear = time.monotonic()
+        elif not localization:
+            self._expire_gantry_clear()
 
     def destroy_node(self):
         self.sock.close()

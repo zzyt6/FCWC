@@ -105,7 +105,7 @@ def output_metadata(config):
             velocity_raw=dict(shape=[3], axes=['x', 'y', 'z'],
                               units='actor input in training-target units; not measured velocity',
                               source='homie_estimator_source: homie_original or pushcart_finetuned',
-                              tensor='original encoder[:3] or paired homie_v81 vel_used'),
+                              tensor='original encoder[:3] or selected model set paired Homie vel_used'),
             velocity_original_raw=dict(shape=[3], tensor=ENCODER_OUTPUT, indices=[0, 3],
                                        scope='original HIM velocity on the same history, including during pushcart'),
             latent_raw=dict(shape=[32], tensor=ENCODER_OUTPUT, indices=[3, 35]),

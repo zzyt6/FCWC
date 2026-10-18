@@ -22,6 +22,10 @@ stdexcept
 string
 -
 
+../cpp/hand_feedback.hpp
+hand_core.hpp
+../cpp/hand_core.hpp
+
 ../cpp/protocol.hpp
 array
 -
@@ -819,6 +823,8 @@ unitree/idl/hg/HandCmd_.hpp
 -
 hand_command.hpp
 /home/unitree/CWC/G1Deploy_BalanceHomie/tests/hand_command.hpp
+hand_feedback.hpp
+/home/unitree/CWC/G1Deploy_BalanceHomie/tests/hand_feedback.hpp
 org/eclipse/cyclonedds/core/cdr/basic_cdr_ser.hpp
 -
 algorithm

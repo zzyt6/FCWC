@@ -319,7 +319,7 @@ class IntegrationTests(unittest.TestCase):
                                      high['camera']['captured_monotonic'])
                     self.assertLessEqual(high['inference_started_monotonic'], high['inference_finished_monotonic'])
             metadata = json.loads((recorder.path / 'metadata.json').read_text())
-            self.assertEqual(metadata['schema'], 18)
+            self.assertEqual(metadata['schema'], 19)
             self.assertEqual(metadata['high_policy']['upper_pd']['target_interpolation_s'], .02)
             self.assertEqual(metadata['high_policy']['telemetry']['upper_sdk_indices'], UPPER.tolist())
             with gzip.open(recorder.path / 'events.jsonl.gz', 'rt') as stream:

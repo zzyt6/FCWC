@@ -10,9 +10,19 @@ from .homie_observations import Observations as HomieObservations
 from .command_filter import filter_command
 
 
-def read_bundle(root):
+def read_bundle(root, manifest_path=None):
     root = Path(root)
     cfg, _, token = load_config(root)
+    if manifest_path is not None:
+        manifest = json.loads((root / manifest_path).read_text())
+        if manifest['schema'] != 1 or manifest['profile'] != cfg['policy_profile']:
+            raise ValueError('Unsupported model bundle')
+        if set(manifest['model_files']) != set(PROFILES):
+            raise ValueError('Expected Balance and Homie in the model bundle')
+        cfg['model_files'] = manifest['model_files'].copy()
+        cfg['contract_files'] = {name: str(Path(path).parent / 'deployment_contract.json')
+                                 for name, path in cfg['model_files'].items()}
+        cfg['model_manifest'] = str(manifest_path)
     contracts = {name: json.loads((root/cfg['contract_files'][name]).read_text()) for name in PROFILES}
     for name in PROFILES:
         spec = contracts[name]
@@ -59,7 +69,7 @@ class Policy:
         import onnxruntime as ort
         self.policy_mode = policy_mode
         self.root = Path(root)
-        self.manifest = json.loads((self.root/'models/manifest.json').read_text())
+        self.manifest = json.loads((self.root / cfg.get('model_manifest', 'models/manifest.json')).read_text())
         self.source_sha256 = self.manifest['model_sha256']
         for name, digest in self.manifest['artifact_sha256'].items():
             if hashlib.sha256((self.root/name).read_bytes()).hexdigest() != digest:

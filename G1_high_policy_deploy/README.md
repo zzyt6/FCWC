@@ -1,5 +1,11 @@
 # G1 推车高层：由原 Viser 统一使用
 
+Viser 开始时可在“模型组合”选择原 Homie `model_60000.pt`＋V8.1（默认），
+或 Homie `model_68000.pt`＋V8.2。两套均提前加载和预热，准备请求发出后锁定。
+每套成对加载对应的学生、导出配置和微调 Homie：`v81_student.onnx`／`v81_config.json`／`homie_v81.onnx`，
+或 `v82_student.onnx`／`v82_config.json`／`homie_v82.onnx`。V8.1 配 estimator 6000，V8.2 配 estimator 7000。
+共享适配器入口仍为 `pushcart_v81`，本机相机与任务限幅配置仍为 `viser_v81.json`；模型文件更新后须完整重启。
+
 唯一机器人网页入口：
 
 ```bash
@@ -31,7 +37,7 @@ Viser 启动时加载 Balance/Homie、推车学生和配套微调 HIM 分支并�
 
 普通模式速度滑条为机器人机身坐标；推车模式明确改标“小车”任务速度，采用训练定义。
 切换时清零旧速度，防止同一数值被带到另一坐标含义下继续执行。
-Viser 推车限幅与当前 V8.1 模型导出的训练范围对齐：vx `[-0.6, 0.9]` m/s、vy `±0.25` m/s、wz `±0.6` rad/s。
+Viser 推车限幅与V8.1/V8.2 模型导出的训练范围对齐：vx `[-0.6, 0.9]` m/s、vy `±0.25` m/s、wz `±0.6` rad/s。
 普通机器人指令范围为 vx `[-0.8, 1.2]` m/s、vy `±0.5` m/s、wz `±0.8` rad/s，也与模型导出配置一致。
 推车滑条与高层执行端共用 `robot/config/viser_v81.json` 的 `task_limits`；修改后完整重启 Viser 生效。
 Walk/Homie 与 Balance 的选择、减速、PD 和 DDS 下发均由原 Viser 管理。
@@ -40,9 +46,9 @@ Walk/Homie 与 Balance 的选择、减速、PD 和 DDS 下发均由原 Viser 管
 推车学生的 30 维动作包含 3 维机器人速度残差、15 维腰 yaw/双臂修正和 12 维腿部残差。
 小车任务参考与速度残差经过高层自身滤波后生成机器人侧速度指令，两者通常不相等。
 这条指令在 Viser 中标为 `PUSHCART`，进入同一骨盆航向外环后再交给 Walk/Balance。
-按用户要求，Viser 发布配置默认 `run_mode=active`，行走和推车共用网页的航向参数：
-Kp=1.0 s⁻¹、Ki=Kd=0、纠偏上限 ±0.15 rad/s；仍可归零后选择 `shadow` 或 `disabled`。
-推车参考航向从当前骨盆朝向开始，按上一拍高层输出的**机器人侧 wz** 推进，
+按用户最新要求，Viser 发布配置恢复 `run_mode=active`，启用行走和推车共用的航向纠偏外环，关节 PD 不受影响。
+使用 Kp=1.0 s⁻¹、Ki=Kd=0、纠偏上限 ±0.15 rad/s；归零后可选择 `shadow` 或 `disabled`。
+启用航向纠偏时，推车参考航向从当前骨盆朝向开始，按上一拍高层输出的**机器人侧 wz** 推进，
 不是按小车任务 wz，也不是按叠加纠偏后的 wz 推进。Kp 修正参考航向与骨盆 IMU 航向的误差，
 仅修改机器人 wz，vx/vy 保持高层给定值。参考误差限制为 ±0.2 rad，沿用原纠偏渐入、限幅和变化率限制。
 这样既能纠正 Homie 执行偏差，也不会把高层主动转弯误当作偏航、拉回旧朝向。
@@ -84,8 +90,9 @@ Kp=1.0 s⁻¹、Ki=Kd=0、纠偏上限 ±0.15 rad/s；仍可归零后选择 `sha
 ## 配置和数据约定
 
 - `robot/config/viser_v81.json`：本机高层配置、相机端口/超时、航向偏置、任务限幅。
-- `robot/models/v81_student.onnx`：实际运行的学生，630/4032 维输入，30 维动作。
-- `robot/models/v81_config.json`：导出的观测、滤波、动作缩放和关节约定。
+- `robot/models/v81_student.onnx`、`v82_student.onnx`：所选组合的学生，630/4032 维输入，30 维动作。
+- `robot/models/homie_v81.onnx`、`homie_v82.onnx`：分别配套 Homie 60000、68000 actor、原 HIM 和推车微调速度估计器。
+- `robot/models/v81_config.json`、`v82_config.json`：各自导出的观测、滤波、动作缩放、关节约定和模型来源。
 - `robot/pushcart_v81/viser_policy.py`：与 Viser 同拍执行的适配器。
 - `carmer/heading_udp.py`：只发往本机的 `carmer_cart_yaw_v1` JSON。
 
@@ -116,10 +123,11 @@ yaw 来自 `raw_fused_cart_heading.yaw_rad`，必须有有效骨盆补偿和 `pe
 两套底层下一拍都使用选中动作（Homie 加实际残差，再按训练裁剪），不使用未执行输出。
 原始网络输出和高层状态写入现有 Viser 会话日志，不复制模型或完整输入历史。
 
-`Viser/logs/sessions/` 中的新版 `telemetry.jsonl.gz`（schema 18）逐帧记录：
+`Viser/logs/sessions/` 中的新版 `telemetry.jsonl.gz`（schema 19）逐帧记录：
 
 | 字段 | 用途 |
 |---|---|
+| `model_set` / `high_policy.model_release` | 当前整套模型选择（v81/v82）及高层版本；对应元数据 model_sets 中的文件与哈希 |
 | `high_policy.task_command` / `task_reference` | 实际进入高层的小车命令 / 本拍更新后的滤波参考，顺序 vx/vy/wz |
 | `high_policy.homie_command` | 高层生成的机器人候选速度，尚未经过 Viser 的零速拦截和滤波 |
 | `input_velocity` → `filtered_velocity` → `velocity` | 拦截后输入 → Viser 航向纠偏/归零滤波结果 → 当前选中运控的命令；选择 Balance 时最后一项为零 |
@@ -143,11 +151,12 @@ yaw 来自 `raw_fused_cart_heading.yaw_rad`，必须有有效骨盆补偿和 `pe
 `1b9574d682a2acfe34eebd21654e792c781aa3f7` 的
 [MuJoCo V8 runner](https://github.com/zzyt6/CJME_Push_car/blob/1b9574d682a2acfe34eebd21654e792c781aa3f7/HomieRL/homie_pushcart_v8/mujoco_runner.py)。
 
-按本机要求运行现有 Viser 控制链路。已核对两份导出的 HOMIE actor 和原始 encoder 的全部 14 个权重张量，
-逐值完全一致，均来自相同的 `model_60000.pt`。两份 ONNX 的文件哈希不同不代表主网络不同。
-推车启用时，Viser 用 `homie_v81.onnx` 的微调 `hv` 三维速度估计和原 HIM 的 32 维归一化隐变量
+按本机要求运行现有 Viser 控制链路。加载时核对每套组合中普通行走与配套推车 Homie 的 actor 和原始 encoder 全部 14 个权重张量，
+要求逐值完全一致；V8.1 对应 `model_60000.pt`，V8.2 对应 `model_68000.pt`。跨版本配对会被拒绝。
+推车启用时，Viser 用所选 `homie_v81.onnx` 或 `homie_v82.onnx` 的微调 `hv` 三维速度估计和原 HIM 的 32 维归一化隐变量
 共同输入同一 Homie actor，与参考 runner 的 `use_finetuned=1` 一致。配套估计器来自
-`v8_1_roa_teacher_8k/homie_velocity_estimator_6000.pt`，不是高层学生自己的 19 维显式估计头。
+V8.1 的 `2026-10-12_20-52-19_v8_1_roa_teacher_8k/homie_velocity_estimator_6000.pt`，
+或 V8.2 的 `2026-10-16_22-28-14_v8_2_roa_teacher_20k/homie_velocity_estimator_7000.pt`，不是高层学生自己的 19 维显式估计头。
 两者作用不同：学生估计头服务高层动作，微调 HIM 速度服务下层 Homie 腿部 actor。
 训练环境以仿真真值比较两种速度估计误差并选择；参考部署在高层启用时使用配套微调估计，Viser 采用此部署规则。
 普通行走恢复原 Homie 估计器；Balance 不变。推车减速期间仍使用微调 Homie，归零后按原规则切入 Balance。
@@ -197,5 +206,6 @@ yaw 来自 `raw_fused_cart_heading.yaw_rad`，必须有有效骨盆补偿和 `pe
 使用真实 ONNX、合成机器人反馈和独立 UDP 端口，检查两份 HOMIE 基座导出的一致性、航向新鲜度、
 抓握/控制权限、动作历史、Balance 接管、掉线锁止和急停，不代表真机闭环稳定性。
 `Viser/test/test_pushcart_pd.py` 使用真实 C++ 控制核心及管道合成反馈，验证上肢目标、增益切换及抓握保持。
-本机检查不依赖安装时的 `deploy.zip`。`pc/` 的仿真脚本需要训练仓库和其环境，
+本机检查不依赖安装时的 `deploy.zip`。`pc/export_v81.py` 保留为 V8.1 导出参考；
+本次回切直接使用原导出文件。`pc/` 的仿真脚本需要训练仓库和其环境，
 原始说明见 [训练仓库部署文档](https://github.com/zzyt6/CJME_Push_car/blob/main/deploy/README.md)。

@@ -2,6 +2,7 @@
 #include <unitree/idl/hg/HandState_.hpp>
 #include <unitree/idl/hg/HandCmd_.hpp>
 #include "hand_command.hpp"
+#include "hand_feedback.hpp"
 #include <org/eclipse/cyclonedds/core/cdr/basic_cdr_ser.hpp>
 #include <algorithm>
 #include <cstring>
@@ -48,6 +49,35 @@ std::vector<uint8_t> fixture() {
 
 int main(int argc,char** argv) {
   try {
+    // Reproduce the field failure: one empty left-hand message between healthy
+    // frames must not drop grasp PD. It must not refresh age or hide a fault.
+    {
+      using namespace decoupled;
+      constexpr uint64_t stamp=1000000000;
+      HandFeedback feedback;
+      HandState complete;
+      complete.motor_state().resize(7);
+      require(receive_hand_feedback(complete,0,stamp,80,feedback),"Complete hand sample rejected");
+      receive_hand_feedback(complete,1,stamp,80,feedback);
+      HandCore hands(true,{});
+      require(hands.prepare(feedback,stamp),"Healthy grasp preparation failed");
+      HandState empty;
+      require(!receive_hand_feedback(empty,0,stamp+5000000,80,feedback),"Empty sample accepted");
+      require(feedback.received_ns[0]==stamp,"Empty sample refreshed watchdog");
+      require(!hands.check_feedback(feedback,stamp+5000000) && hands.active,"Single empty sample dropped grasp");
+      receive_hand_feedback(empty,0,stamp+199000000,80,feedback);
+      require(feedback.healthy_flags(stamp+201000000)==0,"Empty stream bypassed watchdog");
+      require(hands.check_feedback(feedback,stamp+201000000) && !hands.active,"Stale hand did not suspend");
+      receive_hand_feedback(complete,0,stamp+202000000,80,feedback);
+      receive_hand_feedback(complete,1,stamp+202000000,80,feedback);
+      require(!hands.active,"Recovered feedback rearmed suspended hands");
+      empty.error()[0]=7;
+      require(receive_hand_feedback(empty,0,stamp+203000000,80,feedback),"Fault in empty sample ignored");
+      require(!feedback.valid[0],"Hardware fault was hidden");
+      complete.motor_state()[0].motorstate(4);
+      receive_hand_feedback(complete,1,stamp+203000000,80,feedback);
+      require(!feedback.valid[1],"Motor fault was hidden");
+    }
     // Exercise the production command builder with the actual SDK message type.
     auto gains=decoupled::HandPd::parse("1.5,0.2");
     require(gains.kp==1.5f && gains.kd==.2f,"Dex3 PD argument parsing mismatch");

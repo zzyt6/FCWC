@@ -1,0 +1,20 @@
+{
+  "source_checkpoint": "logs/rsl_rl/homie_g1_v3/2026-10-16_13-22-44_v3_fric_ent005_from64000/model_68000.pt",
+  "source_checkpoint_sha256": "d9e82ab8a65d08fc343d202e901e93944412377215aaf3df637fdae2aceb5012",
+  "source_params_sha256": "00dbdc92694f7bda33c7da454aa2084554e17c617572c249a826bbbaeef759da",
+  "source_physics_sha256": "4c7fde3dc7202c7f94d569931aafde0dfea11abce34abd09f98660c4cc2f5715",
+  "checkpoint_iteration": 68000,
+  "torch_version": "2.11.0+cu128",
+  "saved_model_loaded_strictly": true,
+  "samples": 89,
+  "jit_max_abs_error": 0.0,
+  "onnx_max_abs_error": 1.1444091796875e-05,
+  "artifact_sha256": {
+    "policy.onnx": "301cabafabc9d0a1fb3eb6bfd467da97e1b2be225300d2f3ff65107982022de1",
+    "policy_jit.pt": "993adb7e4af701561a7c2830a6f55ae6c318b919073a191df5be08bcb685238d",
+    "verification_vectors.npz": "f09f9fb3bbfed1e536df513c10feb9f5e54dda1e9b0e9850dc2607020423505d",
+    "deployment_contract.json": "8518642591ab1f175b71bafa4c9ecd97eff09a82c8b9416dfe9f85ebcd961097"
+  },
+  "scope": "Offline export only; no robot connection, no actuator commands.",
+  "execution_history_source": "CJME_Push_car 1b9574d682a2acfe34eebd21654e792c781aa3f7: scripts/export_homie_v3.py real_histories (real-robot recordings logs/homie_isaaclab_v2/real_cases) + zero start history"
+}

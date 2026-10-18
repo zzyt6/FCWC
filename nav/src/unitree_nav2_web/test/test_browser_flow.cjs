@@ -11,7 +11,7 @@ const os = require('node:os');
 const puppeteer = require(process.env.PUPPETEER_MODULE || 'puppeteer-core');
 const web = path.resolve(__dirname, '../web');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'nav-browser-'));
-const actions = Object.fromEntries(['acquire', 'prepare', 'prepare_pose', 'policy', 'zero', 'stop', 'reset',
+const actions = Object.fromEntries(['acquire', 'prepare', 'prepare_pose', 'model_set', 'policy', 'zero', 'stop', 'reset',
   'hand_toggle', 'hand_compensation', 'hand_edit', 'hand_load', 'hand_save', 'cart_camera_start',
   'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable', 'cart_detach'].map(k => [k, true]));
 const lower = [[-1.05,-.724,0,-1.57,-1.75,-1.57,-1.75],[-1.05,-1.05,-1.75,0,0,0,0]];
@@ -19,8 +19,10 @@ const upper = [[1.05,1.05,1.75,0,0,0,0],[1.05,.742,0,1.57,1.75,1.57,1.75]];
 const state = { phase: 'SELECT_MAP', message: '离线界面测试', map_ready: false, localized: false,
   processing: false, motion_enabled: false, navigation_active: false, navigation_task: {state:'IDLE'},
   motion_gate:{can_enable: true, blockers: []}, navigation_speed:{mode:'auto',speed:.35,ready:true,pending:false},
-  locomotion:{online:true,owned:true,armed:true,healthy:true,ready:true,stage:'POLICY',stage_text:'策略运行',
+  locomotion:{online:true,owned:true,armed:true,healthy:true,ready:false,stage:'WAITING',stage_text:'等待接管',
     mode:'control',velocity:[0,0,0],actions,prepare_pose:'original',prepare_pose_selectable:true,
+    model_set:'v81',model_set_selectable:true,
+    model_set_options:[{value:'v81',label:'60000 轮 Homie + V8.1 高层'},{value:'v82',label:'68000 轮 Homie + V8.2 高层'}],
     prepare_pose_options:[{value:'original',label:'原准备姿态'},{value:'arms_down',label:'双臂下垂'}],
     hands:{active:true,healthy:true,pose:'grasp',grasp_revision:0,grasp_dirty:false,lower,upper,
       grasp:lower.map((r,i)=>r.map((x,j)=>(x+upper[i][j])/2)),compensation_available:true},
@@ -51,11 +53,13 @@ const server = http.createServer(async (req,res)=>{
       const action=url.searchParams.get('action');
       const loco=state.locomotion, hands=loco.hands, high=loco.high_policy;
       if(action==='prepare_pose') loco.prepare_pose=url.searchParams.get('pose');
-      if(action==='prepare') {loco.stage='HOLDING';loco.prepare_pose_selectable=false;}
+      if(action==='model_set') loco.model_set=url.searchParams.get('model_set');
+      if(action==='prepare') {loco.stage='HOLDING';loco.prepare_pose_selectable=false;loco.model_set_selectable=false;loco.actions.model_set=false;}
       if(action==='acquire') loco.stage='ZERO';
       if(action==='policy') loco.stage='POLICY';
       if(action==='stop') loco.stage='DAMPED';
       if(action==='reset') loco.stage='WAITING';
+      loco.ready=loco.stage==='POLICY';
       const id=++sequence;
       loco.cart_request={sequence:id,state:'queued'};
       setTimeout(()=>{
@@ -77,7 +81,10 @@ const server = http.createServer(async (req,res)=>{
   const name=url.pathname==='/'?'index.html':url.pathname.slice(1);
   if(!['index.html','app.js','style.css'].includes(name)){res.statusCode=404;return res.end();}
   res.setHeader('Content-Type',name.endsWith('.js')?'application/javascript':name.endsWith('.css')?'text/css':'text/html');
-  res.end(fs.readFileSync(path.join(web,name)));
+  // Keep the stub in the page realm: Firefox 128 rejects cross-realm access
+  // to the class injected by BiDi's evaluateOnNewDocument preload script.
+  const socketStub = 'window.WebSocket=class{constructor(){setTimeout(()=>this.onopen?.(),0);}send(){}close(){}};\n';
+  res.end((name==='app.js'?socketStub:'') + fs.readFileSync(path.join(web,name),'utf8'));
 });
 (async()=>{
   await new Promise(r=>server.listen(0,'127.0.0.1',r));
@@ -85,7 +92,6 @@ const server = http.createServer(async (req,res)=>{
   const page=await browser.newPage(); await page.setViewport({width:1400,height:1000});
   page.on('pageerror',e=>errors.push(e.message));
   page.on('dialog',async d=>{dialogs.push(d.message());await d.accept();});
-  await page.evaluateOnNewDocument(()=>{window.WebSocket=class{constructor(){setTimeout(()=>this.onopen?.(),0);}send(){}close(){}};});
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   const refresh=()=>page.evaluate(()=>refreshStatus());
   const disabled=selector=>page.$eval(selector,e=>e.disabled);
@@ -105,14 +111,36 @@ const server = http.createServer(async (req,res)=>{
     await page.mouse.move(box.x+box.w*.45,box.y+box.h*.5);await page.mouse.down();
     await page.mouse.move(box.x+box.w*.55,box.y+box.h*.5);await page.mouse.up();
   };
-  count=calls.length;await drag('#initialMode');await waitCall(count);await refresh();assert.equal(calls.at(-1).path,'/api/initial_pose');
-  count=calls.length;await drag('#toolbarInitial');await waitCall(count);await refresh();assert.equal(calls.at(-1).query.replace,'true');
+  assert.equal(await disabled('#initialMode'),true);
+  assert.equal(await disabled('#toolbarInitial'),true);
+  assert.deepEqual(await page.$$eval('.steps li',items=>items.map(e=>e.id)),['stepMap','stepLoco','stepLoc','stepMotion','stepNav']);
+  state.initial_pose_requires_policy=false;await refresh();assert.equal(await disabled('#initialMode'),false);
+  state.initial_pose_requires_policy=true;await refresh();assert.equal(await disabled('#initialMode'),true);
   // Each lifecycle control uses its intended action, including both preparation choices.
+  for(const key of ['v82','v81']){
+    await mutate('#locoModelSet',key);await page.waitForFunction(()=>modelSetPending===null);
+    assert.equal(calls.at(-1).query.model_set,key);
+    assert.equal(await page.$eval('#locoModelSet',e=>e.value),key);
+  }
   for(const pose of ['arms_down','original']){await mutate('#locoPreparePose',pose);await page.waitForFunction(()=>preparationPending===null);assert.equal(calls.at(-1).query.pose,pose);}
-  for(const [id,action] of [['locoAcquire','acquire'],['locoPrepare','prepare'],['locoPolicy','policy'],['locoZero','zero'],['locoStop','stop'],['locoReset','reset']]){
+  for(const [id,action] of [['locoAcquire','acquire'],['locoPrepare','prepare'],['locoPolicy','policy']]){
+    count=calls.length;await click('#'+id);await waitCall(count);await page.waitForFunction(()=>lifecyclePending===null);assert.equal(calls.at(-1).query.action,action);
+    if(action==='prepare') assert.equal(await disabled('#locoModelSet'),true);
+    assert.equal(await disabled('#initialMode'),action!=='policy');
+  }
+  state.locomotion.decelerating=true;await refresh();assert.equal(await disabled('#initialMode'),true);
+  state.locomotion.decelerating=false;await refresh();
+  count=calls.length;await drag('#initialMode');await waitCall(count);await refresh();assert.equal(calls.at(-1).path,'/api/initial_pose');
+  state.message='AMCL 定位稳定；运控进入策略运行后可启用运动门';await refresh();
+  assert.equal(await page.$eval('#statusText',e=>e.textContent),'AMCL 定位稳定；可启用运动门');
+  state.motion_gate={can_enable:false,blockers:['等待导航里程计']};await refresh();
+  assert.equal(await page.$eval('#statusText',e=>e.textContent),'AMCL 定位稳定；运动门等待：等待导航里程计');
+  state.motion_gate={can_enable:true,blockers:[]};await refresh();
+  count=calls.length;await drag('#toolbarInitial');await waitCall(count);await refresh();assert.equal(calls.at(-1).query.replace,'true');
+  for(const [id,action] of [['locoZero','zero'],['locoStop','stop'],['locoReset','reset']]){
     count=calls.length;await click('#'+id);await waitCall(count);await page.waitForFunction(()=>lifecyclePending===null);assert.equal(calls.at(-1).query.action,action);
   }
-  state.locomotion.stage='POLICY';await refresh();
+  state.locomotion.stage='POLICY';state.locomotion.ready=true;await refresh();
   await page.$eval('#cartHandEditor',e=>e.closest('details').open=true);
   for(let i=0;i<14;i++){
     const value=(lower[Math.floor(i/7)][i%7]+upper[Math.floor(i/7)][i%7])/2+.001;
@@ -135,13 +163,31 @@ const server = http.createServer(async (req,res)=>{
   await page.waitForFunction(()=>!speedRequestBusy);assert.equal(calls.at(-1).query.speed,'0.42');assert.equal(calls.at(-1).query.mode,'fixed');
   await mutate('#speedSlider','0.3');assert.equal(await page.$eval('#speedValue',e=>e.value),'0.30');
   count=calls.length;await click('#motionButton');await waitCall(count);await page.waitForFunction(()=>!motionBusy);assert.equal(state.motion_enabled,true);
+  state.motion_gate={can_enable:false,blockers:['等待车体过滤后的扫描'],suspended:true};await refresh();
+  assert.match(await page.$eval('#statusText',e=>e.textContent),/导航暂缓/);
+  assert.equal(await page.$eval('#gateBlockers',e=>e.hidden),false);
+  assert.equal(await disabled('#motionButton'),false); // Closing remains available during a gap.
+  state.motion_gate={can_enable:true,blockers:[],suspended:false};await refresh();
   count=calls.length;await drag('#goalMode');await waitCall(count);await refresh();assert.equal(calls.at(-1).path,'/api/goal');
   assert.equal(await disabled('[data-cart-action="hand_toggle"]'),true);assert.equal(await disabled('#processMap'),true);
   count=calls.length;await click('#stopButton');await waitCall(count);await refresh();assert.equal(state.motion_enabled,false);
   state.motion_enabled=true;await refresh();count=calls.length;await drag('#toolbarGoal');await waitCall(count);await refresh();
   count=calls.length;await click('#motionButton');await waitCall(count);await page.waitForFunction(()=>!motionBusy);assert.equal(state.motion_enabled,false);
   state.navigation_active=false;await refresh();
-  for(const layer of ['grid','map','global','local','scan','globalPath','localPath','robot','radar']) {
+  const savedReference=state.navigation_reference;
+  state.navigation_reference={mode:'cart',ready:true,footprint:[[-1,-.4],[.6,-.4],[.6,.4],[-1,.4]],
+    cart_model:{body:[[-.5,-.25],[.5,-.25],[.5,.25],[-.5,.25]],handle:[[-.49,-.25],[-.49,.25]],wheels:[]}};
+  state.cart_pose={x:4,y:4,yaw:0};await refresh();
+  const cartPixel=()=>page.evaluate(()=>{
+    visibility.footprint=false;ctx.clearRect(0,0,canvas.width,canvas.height);drawCart(1);
+    const p=worldToScreen(4.4,3.85);return Array.from(ctx.getImageData(Math.round(p[0]),Math.round(p[1]),1,1).data);
+  });
+  assert.ok((await cartPixel())[3]>0,'Cart body must be visible at its model position');
+  state.cart_pose.yaw=Math.PI/2;await refresh();
+  assert.equal((await cartPixel())[3],0,'Cart body must rotate with the measured map heading');
+  state.navigation_reference=savedReference;delete state.cart_pose;await refresh();
+  await page.evaluate(()=>{visibility.footprint=true;});
+  for(const layer of ['grid','map','global','local','scan','globalPath','localPath','robot','cart','footprint','radar']) {
     await page.$eval('.displays',e=>e.open=true);await click(`[data-display="${layer}"]`);
     assert.equal(await page.evaluate(k=>visibility[k],layer),false);
   }
@@ -155,6 +201,7 @@ const server = http.createServer(async (req,res)=>{
   assert.equal(await page.evaluate(()=>status.motion_enabled),false);
   offline=true;await page.waitForFunction(()=>!statusFresh(),{timeout:6000});await page.waitForFunction(()=>document.querySelector('#locoPolicy').disabled);
   assert.equal(await disabled('[data-cart-action="pushcart_enable"]'),true);assert.equal(await disabled('#motionButton'),true);assert.equal(await disabled('#stopButton'),false);
+  assert.equal(await disabled('#locoModelSet'),true);
   offline=false;await refresh();await page.setViewport({width:390,height:844});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   assert.deepEqual(errors,[]);

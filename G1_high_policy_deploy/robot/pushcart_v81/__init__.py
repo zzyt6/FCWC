@@ -1,1 +1,1 @@
-"""V8.1 push-cart real-robot deployment (Unitree G1 + Dex-3, HOMIE low level). See deploy/README.md."""
+"""V8.1/V8.2 push-cart deployment. See ../README.md."""

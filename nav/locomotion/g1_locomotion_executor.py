@@ -41,7 +41,7 @@ sys.path.insert(0, str(WORKSPACE / 'nav/src/unitree_nav2_web'))
 from core.robot import RobotConfig, URDF_PATH, HAND_PD_PATH, UPPER_POSE_LABELS, JOINT_NAMES  # noqa: E402
 from core.controller import Controller, STAGES  # noqa: E402
 from core.joint_monitor import limits, live_warnings, WarningBoard  # noqa: E402
-from core.pushcart import load_feature  # noqa: E402
+from core.model_sets import ModelSets, MODEL_SET_LABELS  # noqa: E402
 from core.hand_grasp import HAND_LOWER, HAND_UPPER  # noqa: E402
 from unitree_nav2_web.cart_geometry import CartGeometry, load_settings  # noqa: E402
 from unitree_nav2_web.locomotion import locomotion_actions  # noqa: E402
@@ -56,8 +56,9 @@ MOTION_CONFIG = Path(__file__).with_name('motion_config.json')
 REQUEST_PACKET = struct.Struct('<IHBBQ')
 REQUEST_MAGIC, REQUEST_VERSION = 0x47314C52, 1
 REQUESTS = {1: 'acquire', 2: 'prepare', 3: 'policy', 4: 'zero', 5: 'stop', 6: 'reset',
-            7: 'prepare_pose'}
+            7: 'prepare_pose', 8: 'model_set'}
 PREPARE_POSES = {0: 'original', 1: 'arms_down'}
+MODEL_SETS = {0: 'v81', 1: 'v82'}
 # Executor's single internal "browser" identity inside Viser's WebControl.
 CLIENT = 1
 COMMAND_TIMEOUT_S = 0.25
@@ -78,8 +79,11 @@ class Executor:
         self.cart_settings = load_settings(cart_config)
         self.cart_geometry = CartGeometry(self.cart_settings)
         self.cart_limits = np.asarray(self.cart_settings['task_limits'])
-        if controller.high_policy is not None:
-            controller.high_policy.limits = self.cart_limits.copy()
+        highs = ([entry['high'] for entry in controller.model_sets.entries.values()]
+                 if controller.model_sets is not None else [controller.high_policy])
+        for high in highs:
+            if high is not None:
+                high.limits = self.cart_limits.copy()
         self.cart_attached = False
         self.navigation_epoch = (int(clock()*1e6) & 0xfffffffe) or 2
         self.cart_error = ''
@@ -151,12 +155,16 @@ class Executor:
                 magic, version, request, payload, sequence = REQUEST_PACKET.unpack(data)
                 if (magic != REQUEST_MAGIC or version != REQUEST_VERSION or request not in REQUESTS
                         or (request == 7 and payload not in PREPARE_POSES)
-                        or (request != 7 and payload != 0)
+                        or (request == 8 and payload not in MODEL_SETS)
+                        or (request not in (7, 8) and payload != 0)
                         or sequence <= self.last_request_sequence):
                     self.rejected += 1
                     continue
                 self.last_request_sequence = sequence
-                self.request(REQUESTS[request], pose=PREPARE_POSES[payload] if request == 7 else None)
+                if request == 8:
+                    self.request('model_set', model_set=MODEL_SETS[payload])
+                else:
+                    self.request(REQUESTS[request], pose=PREPARE_POSES[payload] if request == 7 else None)
             elif data.startswith(b'{'):
                 try:
                     request = json.loads(data)
@@ -214,6 +222,12 @@ class Executor:
                 self.control.emit(kind, CLIENT, **payload)
             self.cart_error = ''
             return True
+        elif kind == 'model_set':
+            key = payload.get('model_set')
+            if set(payload) != {'model_set'} or not isinstance(key, str) or key not in MODEL_SET_LABELS:
+                raise ValueError('请选择有效的模型组合')
+            if not self.cart_attached:
+                self.control.emit('model_set', CLIENT, model_set=key)
         elif kind == 'prepare_pose':
             if not isinstance(pose, str) or pose not in self.control.config.prepare_poses:
                 raise ValueError('请选择有效的准备姿态')
@@ -254,14 +268,19 @@ class Executor:
                       epoch=self.navigation_epoch, valid=False, error=self.cart_error,
                       task_limits=self.cart_settings['task_limits'])
         stamp = camera.get('captured_monotonic')
-        if (not data.get('healthy') or not camera.get('fresh') or stamp is None
+        if not data.get('healthy'):
+            result['reason'] = '机器人反馈不可用：' + (data.get('reason') or '反馈不新鲜或健康检查未通过')
+            return result
+        if (not camera.get('fresh') or stamp is None
                 or not 0 <= now-stamp <= camera.get('timeout_s', .3)):
+            result['reason'] = '小车 AprilTag 航向不可用：' + (camera.get('reason') or '相机观测已过期')
             return result
         try:
             result.update(self.cart_geometry.estimate(dict(zip(JOINT_NAMES, state['q'])), state['quat'], camera['yaw_rad']))
             result.update(valid=True, captured_monotonic=stamp)
         except (KeyError, ValueError, TypeError) as exc:
             result['error'] = '小车位置估计不可用：' + str(exc)
+            result['reason'] = result['error']
         return result
 
     def step(self):
@@ -325,18 +344,29 @@ class Executor:
             ready = ready and bool(high.get('enabled')) and not high.get('motion_blocked') and cart['valid'] and not data.get('upper_pd_transitioning')
         # Keep the UDP status small; full inference outputs remain in the existing recorder.
         high_status = {key: high.get(key) for key in ('enabled', 'motion_blocked', 'reason', 'enable_reason', 'zero_reason',
-                       'history_frames', 'history_required', 'warmup_error', 'zero_calibration', 'camera', 'camera_process')} if high else {}
+                       'history_frames', 'history_required', 'warmup_error', 'zero_calibration', 'camera', 'camera_process',
+                       'model_release')} if high else {}
         hand_status = {key: dex3.get(key) for key in ('active', 'healthy', 'pose', 'moving', 'pending',
                        'recovering', 'recovery_pending', 'blocking_reason', 'grasp', 'grasp_revision', 'grasp_dirty', 'editor_available', 'editor_message',
                        'compensation_enabled', 'compensation_available', 'file_busy', 'q', 'ever_started')}
         hand_status.update(lower=HAND_LOWER.tolist(), upper=HAND_UPPER.tolist())
         if self.cart_request.get('state') == 'queued' and (data.get('state') or {}).get('tick') != self.cart_request_tick:
             self.cart_request['state'] = 'handled'
+        # The controller may have switched since this snapshot was captured.
+        # Report the hashes belonging to the snapshot's model, not a newer one.
+        model_key = data.get('model_set', self.control.model_set)
+        model_policy = (self.control.model_sets.entries[model_key]['policy']
+                        if self.control.model_sets is not None else self.control.policy)
         status = dict(
             magic='G1LOCO1', ready=ready, mode=self.control.mode, stage=stage,
             stage_text=STAGES.get(stage, stage), healthy=bool(data.get('healthy')),
             armed=bool(self.control.backend.armed), reason=data.get('reason') or '',
             source=data.get('source'), owned=data.get('owner') == CLIENT,
+            model_set=model_key,
+            model_set_options=[dict(value=key, label=label) for key, label in MODEL_SET_LABELS.items()],
+            model_set_selectable=bool(owned and data.get('model_set_selectable') and not self.cart_attached),
+            model_sha256=model_policy.source_sha256,
+            model_warmup=data.get('model_warmup') or {},
             prepare_pose=data.get('prepare_pose'),
             prepare_pose_options=[dict(value=key, label=UPPER_POSE_LABELS[key])
                                   for key in self.control.config.prepare_poses],
@@ -397,12 +427,12 @@ def main():
     config = RobotConfig(URDF_PATH, args.motion_config, None, args.heading_kp,
                          None if args.heading_mode == 'config' else args.heading_mode,
                          hand_pd_config=args.dex3_pd_config)
-    high_policy = load_feature(config, args.mode, args.interface)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
-    recorder = controller = executor = backend = None
+    recorder = controller = executor = backend = model_sets = None
     try:
+        model_sets = ModelSets(config, args.mode, args.interface, policy_mode=args.policy_mode)
         if args.record and args.mode == 'control':
             from core.recording import SessionRecorder
             recorder = SessionRecorder(config, dict(vars(args), mode='control'))
@@ -411,14 +441,16 @@ def main():
         build_bridge()
         backend = Bridge(config, args.mode, args.interface)
         controller = Controller(config, backend, args.mode, recorder=recorder, policy_mode=args.policy_mode,
-                                high_policy=high_policy)
+                                model_sets=model_sets)
         executor = Executor(controller, args.command_port, args.status_port, args.heading_source,
                             cart_config=args.cart_config, geometry_port=args.geometry_port)
         controller.start()
         print('G1 LOCOMOTION EXECUTOR READY mode=%s interface=%s heading=%s Kp=%.2f source=%s | '
+              'models=%s homie_sha256=%s | '
               'cmd udp://127.0.0.1:%d status udp://127.0.0.1:%d'
               % (args.mode, args.interface, config.motion_settings['run_mode'],
                  config.motion_settings['heading_kp'], args.heading_source,
+                 MODEL_SET_LABELS[controller.model_set], controller.policy.source_sha256['homie'],
                  args.command_port, args.status_port), flush=True)
         while not stop.is_set():
             executor.step()
@@ -429,8 +461,8 @@ def main():
         else:
             if backend:
                 backend.close()
-            if high_policy:
-                high_policy.close()
+            if model_sets:
+                model_sets.close()
         if executor:
             executor.close()
         if recorder:

@@ -1,4 +1,4 @@
-"""V8.1 student extension for the existing Viser Controller.
+"""V8.1/V8.2 student extension for the existing Viser Controller.
 
 Viser owns Balance/Homie selection, executed history, gains and all motor I/O.
 This module loads the student and its paired Homie estimator/actor; no DDS or LCM.
@@ -19,19 +19,21 @@ UPPER = ACTIVE[12:]
 
 
 class StudentModel:
-    def __init__(self, directory, threads=1):
+    def __init__(self, directory, threads=1, *, model_version='v81'):
         import onnxruntime as ort
         options = ort.SessionOptions()
         options.intra_op_num_threads = threads
         options.inter_op_num_threads = 1
-        self.path = Path(directory) / 'v81_student.onnx'
+        if model_version not in ('v81', 'v82'):
+            raise ValueError('Unsupported pushcart model version')
+        self.path = Path(directory) / f'{model_version}_student.onnx'
         self.session = ort.InferenceSession(str(self.path), options, providers=['CPUExecutionProvider'])
         inputs, outputs = self.session.get_inputs(), self.session.get_outputs()
         if ([(x.name, x.shape, x.type) for x in inputs] !=
                 [('policy', [1, 630], 'tensor(float)'), ('history', [1, 4032], 'tensor(float)')]
                 or [(x.name, x.shape, x.type) for x in outputs] !=
                 [('actions', [1, 30], 'tensor(float)'), ('velocity_estimate', [1, 19], 'tensor(float)')]):
-            raise ValueError('V8.1 student ONNX interface mismatch')
+            raise ValueError('Pushcart student ONNX interface mismatch')
         self.raw = None
         self.inference_ms = None
         self.started_monotonic = self.finished_monotonic = None
@@ -46,27 +48,27 @@ class StudentModel:
 
     def run_student(self, policy, history):
         if not np.isfinite(policy).all() or not np.isfinite(history).all():
-            raise ValueError('Non-finite V8.1 observation')
+            raise ValueError('Non-finite pushcart observation')
         started = time.perf_counter()
         self.started_monotonic = time.monotonic()
         action, estimate = self.session.run(None, dict(policy=policy[None], history=history[None]))
         self.finished_monotonic = time.monotonic()
         self.inference_ms = (time.perf_counter() - started) * 1000
         if not np.isfinite(action).all() or not np.isfinite(estimate).all():
-            raise ValueError('Non-finite V8.1 output')
+            raise ValueError('Non-finite pushcart output')
         self.raw = action[0].copy()
         return action[0], estimate[0]
 
 
 class ViserPushPolicy:
-    def __init__(self, robot_config, path, *, camera=None):
+    def __init__(self, robot_config, path, *, camera=None, model_version='v81'):
         path = Path(path).resolve()
         self.settings = json.loads(path.read_text())
         settings = self.settings
         if settings.get('schema') != 'pushcart_viser_v1':
-            raise ValueError('Invalid Viser V8.1 configuration')
+            raise ValueError('Invalid Viser pushcart configuration')
         directory = (path.parent / settings['models_dir']).resolve()
-        cfg = load_config(directory)
+        cfg = load_config(directory, model_version)
         self.robot_config, self.cfg = robot_config, cfg
         self._validate_contract()
         self.limits = np.asarray(settings['task_limits'], dtype=float)
@@ -85,8 +87,8 @@ class ViserPushPolicy:
                 or not 0 < float(cam['timeout_s']) <= .3 or not np.isfinite(cam['yaw_offset_rad'])
                 or type(settings['onnx_threads']) is not int or not 1 <= settings['onnx_threads'] <= 8):
             raise ValueError('Invalid camera or inference settings')
-        self.model = StudentModel(directory, settings['onnx_threads'])
-        self.homie_model = PushcartHomie(directory / 'homie_v81.onnx', robot_config.policy_paths['homie'],
+        self.model = StudentModel(directory, settings['onnx_threads'], model_version=model_version)
+        self.homie_model = PushcartHomie(directory / f'homie_{model_version}.onnx', robot_config.policy_paths['homie'],
                                          settings['onnx_threads'])
         self.homie_model.metadata.update(
             estimator_checkpoint=cfg['provenance']['homie_velocity_estimator'],
@@ -102,7 +104,10 @@ class ViserPushPolicy:
         self._zero_samples = []
         self.metadata = dict(student_path=str(self.model.path),
                              student_sha256=hashlib.sha256(self.model.path.read_bytes()).hexdigest(),
-                             training_commit='1b9574d682a2acfe34eebd21654e792c781aa3f7',
+                             model_release=cfg['release'],
+                             export_config_path=str(directory / f'{model_version}_config.json'),
+                             export_config_sha256=hashlib.sha256((directory / f'{model_version}_config.json').read_bytes()).hexdigest(),
+                             provenance=cfg['provenance'],
                              low_level='Viser auto Balance/Homie; paired tuned HIM velocity while pushcart is enabled or paused',
                              homie=self.homie_model.metadata,
                              upper_torque='PD estimate from preceding 2..8 ms bridge sample when available, otherwise latest; not measured torque',
@@ -137,11 +142,11 @@ class ViserPushPolicy:
         c, rc = self.cfg, self.robot_config
         if (c['num_lower'], c['homie_frame'], c['homie_history'], c['frame_dim'],
                 c['policy_history'], c['long_history'], c['action_dim'], c['hl_actions']) != (12, 76, 6, 126, 5, 32, 30, 18):
-            raise ValueError('Unsupported V8.1 observation dimensions')
+            raise ValueError('Unsupported pushcart observation dimensions')
         if not np.isclose(c['dt'], 1 / rc.deployment['policy_hz']):
-            raise ValueError('V8.1 must run in the same 50 Hz Viser tick')
+            raise ValueError('Pushcart must run in the same 50 Hz Viser tick')
         if c['joints'] != [rc.deployment['joint_names_sdk29'][i] for i in ACTIVE]:
-            raise ValueError('V8.1 joint order mismatch')
+            raise ValueError('Pushcart joint order mismatch')
         for name in ('balance', 'homie'):
             spec = rc.contracts[name]
             pairs = [(c['default_dof_pos'], spec['default_joint_positions']),
@@ -153,7 +158,7 @@ class ViserPushPolicy:
             pairs += [(c['obs_scales'][k], spec['input']['observation_scales'][k])
                       for k in ('ang_vel', 'dof_pos', 'dof_vel')]
             if not all(np.allclose(a, b, rtol=0, atol=1e-7) for a, b in pairs):
-                raise ValueError('V8.1 and Viser observation/action units disagree: ' + name)
+                raise ValueError('Pushcart and Viser observation/action units disagree: ' + name)
 
     def reset(self, reason='', *, blocked=False, preserve_history=False):
         self.cancel_zero_calibration('控制状态改变，标定已取消；保留原零位')
@@ -418,6 +423,7 @@ class ViserPushPolicy:
 
     def snapshot(self, now):
         return dict(enabled=self.enabled, motion_blocked=self.motion_blocked,
+                    model_release=self.cfg['release'],
                     reason=self.reason, camera=self.camera.snapshot(now),
                     zero_calibration=self.zero_calibration.copy(),
                     model_warmed=self.model.warmed, startup_warmup_ms=self.model.warmup_ms,

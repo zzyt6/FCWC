@@ -93,15 +93,16 @@ class CameraProcess:
             self.reader.join(timeout=1)
 
 
-def load_feature(config, mode, interface, path=CONFIG):
+def load_feature(config, mode, interface, path=CONFIG, *, model_version='v81', camera=None,
+                 camera_process=None):
     """Feature failure must not remove normal Balance/Homie operation."""
     config.pushcart_error = ''
     try:
         sys.path.insert(0, str(WORKSPACE / 'G1_high_policy_deploy/robot'))
         from pushcart_v81.viser_policy import ViserPushPolicy
-        high = ViserPushPolicy(config, path)
-        high.camera_process = CameraProcess(high.settings['camera']['udp_port'], mode, interface,
-                                            high.settings['camera']['tag_ids'])
+        high = ViserPushPolicy(config, path, camera=camera, model_version=model_version)
+        high.camera_process = camera_process if camera_process is not None else CameraProcess(
+            high.settings['camera']['udp_port'], mode, interface, high.settings['camera']['tag_ids'])
         config.high_policy_metadata = high.metadata
         return high
     except Exception as exc:

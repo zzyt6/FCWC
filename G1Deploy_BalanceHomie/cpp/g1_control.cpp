@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include "hand_feedback.hpp"
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -296,6 +297,7 @@ class Robot {
   CommandTrace trace_;
   std::array<int,2> last_hand_active_{{-1,-1}};
   std::array<std::string,2> last_hand_write_errors_;
+  std::array<std::array<uint64_t,2>,2> last_bad_hand_sample_log_{};
   static void hand_transport_log(int side,const std::string& operation,const std::string& error) {
     std::cout<<"DEX3 TRANSPORT side="<<(side==0?"left":"right")<<" operation="<<operation
              <<(error.empty()?" recovered":" warning reason="+error)<<std::endl;
@@ -304,23 +306,17 @@ class Robot {
     const auto& msg=*static_cast<const HandState*>(message);
     std::lock_guard<std::mutex> guard(mutex_);
     auto& feedback=hand_feedback_sources_.samples[source];
-    std::string error;
-    if(msg.motor_state().size()!=7) error="motor_count="+std::to_string(msg.motor_state().size());
-    for(auto code:msg.error()) if(code && error.empty()) error="hand_error="+std::to_string(code);
-    for(size_t j=0;j<std::min(size_t(7),msg.motor_state().size());++j) {
-      const auto& motor=msg.motor_state()[j];
-      bool finite=std::isfinite(motor.q()) && std::isfinite(motor.dq());
-      if(error.empty() && !finite) error="nonfinite_joint="+std::to_string(j);
-      if(error.empty() && motor.motorstate())
-        error="motor_error index="+std::to_string(j)+" code="+std::to_string(motor.motorstate());
-      for(auto t:motor.temperature()) if(t>=config::max_temperature_c && error.empty())
-        error="motor_temperature index="+std::to_string(j)+" c="+std::to_string(t);
-      // Invalid samples mark health false without poisoning the UDP packet with NaNs.
-      if(finite) { feedback.q[side*7+j]=motor.q(); feedback.dq[side*7+j]=motor.dq(); }
+    const auto now=monotonic_ns();
+    if(!receive_hand_feedback(msg,side,now,config::max_temperature_c,feedback)) {
+      auto& logged=last_bad_hand_sample_log_[source][side];
+      if(!logged || now-logged>=1000000000ULL) {
+        std::cout<<"DEX3 SAMPLE discarded side="<<(side==0?"left":"right")
+                 <<" topic="<<HandFeedbackSources::topic(side,source)
+                 <<" motor_count="<<msg.motor_state().size()
+                 <<"; last complete feedback age retained"<<std::endl;
+        logged=now;
+      }
     }
-    feedback.valid[side]=error.empty();
-    feedback.invalid_reason[side]=error;
-    feedback.received_ns[side]=monotonic_ns();
   }
   void state(const void* message) {
     auto& msg=*static_cast<const LowState*>(message);
