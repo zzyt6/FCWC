@@ -357,6 +357,17 @@ bool NavigationSpeedLimitCritic::prepare(
 
 double NavigationSpeedLimitCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory)
 {
+  // Foxy's stock iterator can emit both exact zero and +/-2.8e-17 for the
+  // same axis. OscillationCritic treats the latter as a direction reversal.
+  // Reject those numerical duplicates; retain the stock exact-zero sample
+  // and its full braking rollout without rewriting the selected velocity.
+  for (const double axis : {trajectory.velocity.x, trajectory.velocity.y,
+      trajectory.velocity.theta})
+  {
+    if (axis != 0. && std::abs(axis) < 1e-7) {
+      throw dwb_core::IllegalTrajectoryException(name_, "Numerical zero velocity sample");
+    }
+  }
   if (std::hypot(trajectory.velocity.x, trajectory.velocity.y) > speed_limit_ + 1e-9) {
     throw dwb_core::IllegalTrajectoryException(name_, "Requested navigation speed limit");
   }

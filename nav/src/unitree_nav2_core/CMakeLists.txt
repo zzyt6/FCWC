@@ -34,10 +34,15 @@ install(DIRECTORY include/ DESTINATION include)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(nav2_costmap_2d REQUIRED)
   ament_add_gtest(test_navigation_speed test/test_navigation_speed.cpp)
   target_include_directories(test_navigation_speed PRIVATE include)
   target_link_libraries(test_navigation_speed navigation_speed)
   ament_target_dependencies(test_navigation_speed dwb_core dwb_plugins)
+  # Invoked by test_cart_dwb_turns.py with the production CartPush parameters.
+  add_executable(cart_dwb_regression test/cart_dwb_regression.cpp)
+  ament_target_dependencies(cart_dwb_regression
+    dwb_core nav2_costmap_2d nav2_util nav_2d_utils rclcpp tf2_ros)
 endif()
 
 add_executable(pcd_to_nav_map src/pcd_to_nav_map.cpp)

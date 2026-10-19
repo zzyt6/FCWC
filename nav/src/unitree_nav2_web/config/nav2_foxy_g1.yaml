@@ -201,16 +201,20 @@ controller_server:
       decel_lim_y: -0.20
       decel_lim_theta: -0.40
       vx_samples: 9
-      vy_samples: 13
-      vtheta_samples: 21
+      vy_samples: 7
+      vtheta_samples: 11
       sim_time: 1.0
       # Also resolve braking travel for a zero target velocity.
       discretize_by_time: true
       time_granularity: 0.05
-      # Foxy otherwise shortens the forward plan to prune_distance (1 m).
-      # A 1.0 s rollout plus the 0.60 m front alignment point can exceed that
-      # artificial endpoint. Keep the path visible across the local costmap.
-      shorten_transformed_plan: false
+      # Keep Foxy's local target near the cart. A target across a distant
+      # corner can make GoalDist/GoalAlign reward stopping or cutting across
+      # the bend instead of following the current leg of the global path.
+      shorten_transformed_plan: true
+      # With the 1 s rollout and 0.30 m/s cruise cap, even the default 1 m
+      # target can cross a right-angle corner too early. Long-turn tests use
+      # 0.8 m; keep this independent of the 3 m obstacle-observation radius.
+      prune_distance: 0.8
       linear_granularity: 0.04
       angular_granularity: 0.025
       transform_tolerance: 0.30
@@ -222,15 +226,15 @@ controller_server:
       # can reject candidates already worse than the best before the full
       # footprint sweep. Every candidate that can win still gets that sweep.
       # Official Foxy path/goal critics, with a stronger cart-center PathDist.
-      # Keep the cart's real
-      # holonomic limits and footprint; the TurtleBot example's vy=0 does not apply.
+      # Keep the cart's holonomic limits and footprint; the TurtleBot example's
+      # vy=0 does not apply.
       # navigation2/0.4.7: nav2_bringup/bringup/params/nav2_params.yaml
       critics: ["NavigationSpeedLimit", "RotateToGoal", "Oscillation", "Twirling", "GoalAlign", "PathAlign", "PathDist", "GoalDist", "CruiseSpeed", "ObstacleFootprint"]
       NavigationSpeedLimit.class: "unitree_nav2_core::NavigationSpeedLimitCritic"
       NavigationSpeedLimit.scale: 1.0
-      # Official holonomic-robot critic: prefer translation to unnecessary
-      # rotations when discrete path costs are similar. Turning remains legal.
-      Twirling.scale: 5.0
+      # This cost is NOT multiplied by resolution/2 like the path critics.
+      # Keep it weak so needed turns do not lose to sideways translation.
+      Twirling.scale: 0.5
       ObstacleFootprint.scale: 1.0
       RotateToGoal.scale: 32.0
       RotateToGoal.slowing_factor: 5.0
@@ -241,7 +245,7 @@ controller_server:
       PathAlign.forward_point_distance: 0.325
       GoalAlign.scale: 24.0
       GoalAlign.forward_point_distance: 0.325
-      PathDist.scale: 32.0
+      PathDist.scale: 64.0
       GoalDist.scale: 24.0
       CruiseSpeed.class: "unitree_nav2_core::CruiseSpeedCritic"
       CruiseSpeed.scale: 18.0
@@ -256,9 +260,11 @@ local_costmap:
       global_frame: odom
       robot_base_frame: nav_control
       rolling_window: true
-      width: 8
-      height: 8
-      resolution: 0.05
+      # The 3 m radius covers the combined body plus the 1 s rollout. Keeping
+      # the previous 8 m window at 2.5 cm would quadruple each critic's grid.
+      width: 6
+      height: 6
+      resolution: 0.025
       footprint: "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:

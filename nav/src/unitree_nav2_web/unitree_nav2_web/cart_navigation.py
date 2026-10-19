@@ -313,8 +313,8 @@ class CartNavigation(Node):
                     delta[2] = math.atan2(math.sin(delta[2]), math.cos(delta[2]))
                     velocity = delta/dt
                     if np.linalg.norm(velocity[:2]) <= 2. and abs(velocity[2]) <= 3.:
-                        # Rate-independent: the DDS LiDAR is normally 10 Hz;
-                        # a 50 Hz camera does not make odometry 50 Hz.
+                        # Preserve the time constant for both the vendor's
+                        # 10 Hz LiDAR and direct Livox's 50 Hz odometry.
                         alpha = 1. - .65**(dt/.05)
                         self.velocity += alpha*(velocity-self.velocity)
                     else:

@@ -110,7 +110,7 @@ class PelvisYawHistory:
 
 class CartPoseHistory:
     """Pair relative cart geometry with the base pose at its measurement time."""
-    def __init__(self, max_gap=.15, max_samples=128):
+    def __init__(self, max_gap=.05, max_samples=128):
         self.samples = deque(maxlen=max_samples)
         self.max_gap = max_gap
         self.key = None

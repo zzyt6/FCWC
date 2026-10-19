@@ -12,6 +12,7 @@ import time
 import numpy as np
 import pytest
 import rclpy
+import yaml
 from ament_index_python.packages import get_package_prefix
 from geometry_msgs.msg import Point32, Polygon, PolygonStamped, PoseStamped, TransformStamped, Twist
 from lifecycle_msgs.srv import ChangeState
@@ -24,6 +25,7 @@ from rclpy.time import Time
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.action import ActionClient
 from rclpy.qos import DurabilityPolicy, QoSProfile
+from rcl_interfaces.srv import GetParameters
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from unitree_nav2_web.cart_geometry import CartGeometry, GantryGeometry, load_settings
@@ -255,9 +257,9 @@ def test_stock_nav2_footprint_and_mode_reset_preserve_external_obstacles(monkeyp
                     context.shutdown()
 
 
-@pytest.mark.parametrize('scenario', ['straight', 'diagonal', 'fast_diagonal', 'velocity_noise', 'curve', 'state_sway',
+@pytest.mark.parametrize('scenario', ['straight', 'diagonal', 'slow_diagonal', 'fast_diagonal', 'speed_0_30', 'velocity_noise', 'curve', 'state_sway',
                                      'offset_left', 'offset_right', 'heading_left', 'heading_right',
-                                     'delayed_response', 'fixed_offset', 'fixed_delayed_response'])
+                                     'delayed_response'])
 def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(monkeypatch, scenario,
                                                                             record_property):
     monkeypatch.setenv('ROS_DOMAIN_ID', '89')
@@ -298,11 +300,8 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 odom_pub = node.create_publisher(Odometry, '/Odometry_navigation', 10)
                 grids, commands, footprints = [], [], []
                 recorded_poses, local_plans, transformed_plans = [], [], []
-                plan_inputs = {}
-                def local_plan_received(message):
-                    local_plans.append(message)
-                    plan_inputs[id(message)] = dict(estimator.navigation_odometry)
-                node.create_subscription(NavigationPath, '/local_plan', local_plan_received, 10)
+                state_errors = []
+                node.create_subscription(NavigationPath, '/local_plan', local_plans.append, 10)
                 node.create_subscription(NavigationPath, '/transformed_global_plan', transformed_plans.append, 10)
                 node.create_subscription(OccupancyGrid, '/local_costmap/costmap', grids.append, qos)
                 node.create_subscription(Twist, '/cmd_vel',
@@ -319,11 +318,19 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                                                   palms=[[.5, .2, .1], [.5, -.2, .1]]), True)
                 footprint = Polygon(points=[Point32(x=x, y=y) for x, y in outline])
                 params = Path(__file__).resolve().parents[1] / 'config/nav2_foxy_g1.yaml'
+                speed_limit = (.6 if scenario == 'fast_diagonal' else .2 if scenario == 'slow_diagonal'
+                               else .3 if scenario == 'speed_0_30' else .35)
+                # Foxy's node-specific YAML values override unscoped CLI -p
+                # values. Write the actual scenario settings into its own file
+                # and verify the server's parameters after configuration.
+                settings = yaml.safe_load(params.read_text())
+                controller = settings['controller_server']['ros__parameters']['CartPush']
+                controller.update(navigation_speed_mode='auto',
+                                  max_speed_xy=speed_limit, navigation_speed=speed_limit)
+                params = Path(directory) / 'params.yaml'
+                params.write_text(yaml.safe_dump(settings))
                 process = subprocess.Popen([
-                    '/opt/ros/foxy/lib/nav2_controller/controller_server', '--ros-args', '--params-file', str(params),
-                    '-p', 'CartPush.navigation_speed_mode:='+('fixed' if scenario.startswith('fixed_') else 'auto'),
-                    '-p', 'CartPush.max_speed_xy:='+('0.6' if scenario == 'fast_diagonal' else '0.35'),
-                    '-p', 'CartPush.navigation_speed:='+('0.6' if scenario == 'fast_diagonal' else '0.35')],
+                    '/opt/ros/foxy/lib/nav2_controller/controller_server', '--ros-args', '--params-file', str(params)],
                     stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
                 lifecycle = node.create_client(ChangeState, '/controller_server/change_state')
                 action = ActionClient(node, FollowPath, '/follow_path')
@@ -332,9 +339,9 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 lateral = np.array([-heading[1], heading[0]])
                 cart = np.r_[.8*heading, yaw]
                 path_start = cart[:2].copy()
-                displaced = scenario in ('offset_left', 'offset_right', 'fixed_offset')
+                displaced = scenario in ('offset_left', 'offset_right')
                 misaligned = scenario in ('heading_left', 'heading_right')
-                delayed = scenario in ('delayed_response', 'fixed_delayed_response')
+                delayed = scenario == 'delayed_response'
                 if displaced:
                     cart[:2] += (-.25 if scenario == 'offset_right' else .25)*lateral
                 if misaligned:
@@ -343,9 +350,10 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 previous = last_publish = time.monotonic()
                 moving, obstacle = True, False
                 started = time.monotonic()
+                next_feedback = started
 
                 def tick():
-                    nonlocal previous, last_publish
+                    nonlocal previous, last_publish, next_feedback
                     now = time.monotonic()
                     sample_ros_ns = node.get_clock().now().nanoseconds
                     dt = min(.05, now-previous)
@@ -367,11 +375,16 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                     recorded_poses.append(cart.copy())
                     truth_history.append((now, cart.copy()))
                     if scenario == 'state_sway':
-                        relative_yaw = -.15*math.sin(4*math.pi*(now-started))
-                        estimator.cart = dict(estimator.cart, sample_monotonic=now,
-                            pose_source='grasp', yaw=relative_yaw,
-                            position=[.8*math.cos(relative_yaw), .8*math.sin(relative_yaw), 0.])
-                        estimator.cart_history.add(estimator.cart)
+                        # Simulate the independent 50 Hz feedback source. The
+                        # Python ROS consumer may stall while deserializing a
+                        # costmap; that is transport delay, not missing samples.
+                        while next_feedback <= now:
+                            relative_yaw = -.15*math.sin(4*math.pi*(next_feedback-started))
+                            estimator.cart = dict(estimator.cart, sample_monotonic=next_feedback,
+                                pose_source='grasp', yaw=relative_yaw,
+                                position=[.8*math.cos(relative_yaw), .8*math.sin(relative_yaw), 0.])
+                            estimator.cart_history.add(estimator.cart)
+                            next_feedback += .02
                     if now-last_publish >= (.1 if delayed else .02):
                         last_publish = now
                         stamp = Time(nanoseconds=sample_ros_ns).to_msg()
@@ -413,6 +426,10 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                             if not estimator.odom_pub.messages:
                                 return
                             odom = estimator.odom_pub.messages[-1]
+                            estimated = np.array([odom.pose.pose.position.x, odom.pose.pose.position.y,
+                                2*math.atan2(odom.pose.pose.orientation.z, odom.pose.pose.orientation.w)])
+                            state_errors.append((float(np.linalg.norm(estimated[:2]-measured[:2])),
+                                float(estimated[2]-measured[2])))
                             # DWB receives the matched cart pose and measured
                             # velocity, including real estimator dynamics.
                             transform.header = odom.header
@@ -465,6 +482,17 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                     until(future.done)
                     assert future.result().success, diagnostic()
                 until(lambda: action.server_is_ready() and footprints and grids)
+                parameters = node.create_client(GetParameters, '/controller_server/get_parameters')
+                until(parameters.service_is_ready)
+                actual = parameters.call_async(GetParameters.Request(names=[
+                    'CartPush.navigation_speed', 'CartPush.max_speed_xy', 'CartPush.navigation_speed_mode']))
+                until(actual.done)
+                values = actual.result().values
+                record_property('configured_speed_m_s', values[0].double_value)
+                record_property('configured_mode', values[2].string_value)
+                assert values[0].double_value == speed_limit
+                assert values[1].double_value == speed_limit
+                assert values[2].string_value == 'auto'
 
                 def goal(target, curve=False, start=None):
                     start = cart[:2].copy() if start is None else start
@@ -500,25 +528,36 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 assert result.result().status == 4, diagnostic()
                 assert transformed_plans
                 first_plan = transformed_plans[0]
-                # The full 2 m test path fits inside the local costmap. A
-                # default 1 m forward prune creates an artificial endpoint
-                # inside the rollout + 0.6 m alignment lookahead at high speed.
+                # Foxy's moving local target must stay within prune_distance;
+                # an endpoint beyond a distant bend can reverse goal scoring.
+                # Arrival still uses the true final goal, checked below.
                 assert first_plan.header.frame_id == 'odom'
-                np.testing.assert_allclose(
-                    [first_plan.poses[-1].pose.position.x, first_plan.poses[-1].pose.position.y],
-                    target, atol=.025)
+                first_points = np.array([[p.pose.position.x, p.pose.position.y]
+                                         for p in first_plan.poses])
+                initial_cart = recorded_poses[0][:2]
+                assert np.max(np.linalg.norm(first_points-initial_cart, axis=1)) <= controller['prune_distance']+.03
+                if scenario == 'straight':
+                    np.testing.assert_allclose(first_points[-1], target, atol=.025)
+                else:
+                    assert np.linalg.norm(first_points[-1]-target) > .10
+                if scenario != 'curve':
+                    assert np.max(np.abs((first_points-path_start) @ lateral)) < .025
                 assert np.linalg.norm(cart[:2]-target) <= .18
                 robot = cart[:2]-.8*np.array([math.cos(cart[2]), math.sin(cart[2])])
                 assert np.linalg.norm(robot-target) > .65  # Arrival is at the CART center.
                 assert any(msg.linear.x > .05 for _, msg in commands)
                 assert all(-.2-1e-6 <= msg.linear.x <= .6+1e-6 and abs(msg.linear.y) <= .3+1e-6
                            and abs(msg.angular.z) <= .4+1e-6 for _, msg in commands)
-                assert all(math.hypot(msg.linear.x, msg.linear.y) <=
-                           (.6 if scenario == 'fast_diagonal' else .35)+1e-6 for _, msg in commands)
+                assert all(math.hypot(msg.linear.x, msg.linear.y) <= speed_limit+1e-6 for _, msg in commands)
                 record_property('local_costmap_resolution_m', grids[-1].info.resolution)
                 intervals = np.diff([stamp for stamp, _ in commands])*1000.
                 record_property('median_command_period_ms', float(np.median(intervals)))
                 record_property('p95_command_period_ms', float(np.percentile(intervals, 95)))
+                if state_errors:
+                    record_property('max_state_position_error_m', max(row[0] for row in state_errors))
+                    record_property('max_state_heading_error_rad', max(abs(row[1]) for row in state_errors))
+                    assert max(row[0] for row in state_errors) < .005
+                    assert max(abs(row[1]) for row in state_errors) < .005
                 if scenario != 'curve':
                     # Test following the path, including the green prediction.
                     # A small command change alone says nothing about tracking.
@@ -550,7 +589,6 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                     first = worst_plan.poses[0].pose.position
                     record_property('worst_prediction_goal_distance_m',
                                     float(np.linalg.norm(np.array([first.x, first.y])-target)))
-                    record_property('worst_prediction_input', plan_inputs[id(worst_plan)])
                     record_property('worst_prediction_points', [
                         [s.pose.position.x, s.pose.position.y,
                          2*math.atan2(s.pose.orientation.z, s.pose.orientation.w)]

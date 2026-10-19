@@ -222,7 +222,11 @@ TEST_F(NavigationSpeedTest, OfficialSamplesObeyLiveSpeedAndTrueGoalApproach)
       for (const auto & command : official.getTwists(current)) {
         auto trajectory = official.generateTrajectory(pose, current, command);
         const double speed = std::hypot(command.x, command.y);
-        if (speed <= cap+1e-9) {
+        bool numerical_zero = false;
+        for (const double axis : {command.x, command.y, command.theta}) {
+          numerical_zero |= axis != 0. && std::abs(axis) < 1e-7;
+        }
+        if (speed <= cap+1e-9 && !numerical_zero) {
           EXPECT_DOUBLE_EQ(limit.scoreTrajectory(trajectory), 0.);
           moving |= speed > 0.1;
           turn |= speed < 1e-9 && std::abs(command.theta) > 0.1;
@@ -247,9 +251,19 @@ TEST_F(NavigationSpeedTest, OfficialSamplesObeyLiveSpeedAndTrueGoalApproach)
   current.x = 0.3;
   nav_2d_msgs::msg::Twist2D stop;
   auto braking = official.generateTrajectory(pose, current, stop);
+  EXPECT_DOUBLE_EQ(limit.scoreTrajectory(braking), 0.);
   ASSERT_GT(braking.poses.size(), 2u);
   EXPECT_GT(braking.poses.back().x, 0.12);
   EXPECT_LE(braking.poses.back().x, 0.15);
+  for (int axis = 0; axis < 3; ++axis) {
+    for (const double residue : {-2.8e-17, 2.8e-17}) {
+      auto duplicate = braking;
+      if (axis == 0) {duplicate.velocity.x = residue;}
+      if (axis == 1) {duplicate.velocity.y = residue;}
+      if (axis == 2) {duplicate.velocity.theta = residue;}
+      EXPECT_THROW(limit.scoreTrajectory(duplicate), dwb_core::IllegalTrajectoryException);
+    }
+  }
 }
 
 TEST_F(NavigationSpeedTest, CartLookaheadDoesNotJumpWhenTheNearestWaypointChanges)

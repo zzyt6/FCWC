@@ -311,7 +311,7 @@ def test_raw_scan_waits_for_delayed_camera_then_recovers_without_lio(geometry, m
     monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
     h = harness(geometry)
     h.cart_history.samples.clear()
-    h.cart_history.add(dict(h.cart, sample_monotonic=99.95))
+    h.cart_history.add(dict(h.cart, sample_monotonic=99.99))
     msg = cloud([[0., 2., 0.], [0., -2., 0.]])
     CartNavigation._cloud(h, msg)
     assert len(h.pending_clouds) == 1 and not h.cloud_pub.messages
@@ -503,11 +503,15 @@ def test_cart_history_keeps_pose_sources_separate_and_handles_angle_wrap():
     history = CartPoseHistory()
     p = dict(pose(), pose_source='grasp', yaw=math.pi-.1)
     history.add(dict(p, sample_monotonic=10.))
-    history.add(dict(p, sample_monotonic=10.1, yaw=-math.pi+.1))
-    assert abs(history.at(10.05)['yaw']) == pytest.approx(math.pi)
+    history.add(dict(p, sample_monotonic=10.02, yaw=-math.pi+.1))
+    assert abs(history.at(10.01)['yaw']) == pytest.approx(math.pi)
+    history.add(dict(p, sample_monotonic=10.16))
+    # Missing 50 Hz measurements must not become a smooth, invented pose
+    # across a 140 ms gap, especially while the pelvis is swaying.
+    assert history.at(10.08) is None
     assert history.at(10.2) is None
-    history.add(dict(p, pose_source='apriltag', sample_monotonic=10.12))
-    assert history.at(10.05) is None
+    history.add(dict(p, pose_source='apriltag', sample_monotonic=10.18))
+    assert history.at(10.01) is None
 
 
 def test_duplicate_odometry_does_not_change_cart_velocity_and_walk_keeps_base_twist(geometry, monkeypatch):
