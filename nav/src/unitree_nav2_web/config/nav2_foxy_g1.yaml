@@ -277,7 +277,8 @@ local_costmap:
         rear_clear:
           topic: /navigation/rear_clear
           data_type: "LaserScan"
-          observation_persistence: 0.0
+          # Expire clearing rays even if their publisher exits before sending an empty scan.
+          observation_persistence: 0.3
           expected_update_rate: 0.0
           marking: false
           clearing: true
@@ -286,8 +287,9 @@ local_costmap:
           max_obstacle_height: 2.0
         scan:
           topic: /scan
-          observation_persistence: 0.0
-          expected_update_rate: 0.0
+          observation_persistence: 0.5
+          # Seconds between observations; zero would consider a dead stream current forever.
+          expected_update_rate: 0.5
           inf_is_valid: true
           min_obstacle_height: -2.0
           max_obstacle_height: 2.0
@@ -331,7 +333,8 @@ global_costmap:
         rear_clear:
           topic: /navigation/rear_clear
           data_type: "LaserScan"
-          observation_persistence: 0.0
+          # Expire clearing rays even if their publisher exits before sending an empty scan.
+          observation_persistence: 0.3
           expected_update_rate: 0.0
           marking: false
           clearing: true
@@ -340,8 +343,9 @@ global_costmap:
           max_obstacle_height: 2.0
         scan:
           topic: /scan
-          observation_persistence: 0.0
-          expected_update_rate: 0.0
+          observation_persistence: 0.5
+          # Seconds between observations; zero would consider a dead stream current forever.
+          expected_update_rate: 0.5
           inf_is_valid: true
           min_obstacle_height: -2.0
           max_obstacle_height: 2.0

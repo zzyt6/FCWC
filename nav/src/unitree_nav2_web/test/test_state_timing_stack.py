@@ -19,10 +19,10 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TransformStamped
-from sensor_msgs.msg import Imu, PointCloud2, PointField, TimeReference
+from sensor_msgs.msg import Imu, LaserScan, PointCloud2, PointField, TimeReference
 from std_msgs.msg import String
 
-from unitree_nav2_web.cart_geometry import CartGeometry, load_settings, rotation_z
+from unitree_nav2_web.cart_geometry import CartGeometry, load_settings, quaternion_matrix, rotation_z
 
 
 @pytest.mark.parametrize('period, speed', [(.1, 0.), (.019, .3), (.020, .3)])
@@ -167,7 +167,11 @@ def test_delayed_lidar_uses_historical_waist_for_odometry_and_cloud(monkeypatch,
                 context.shutdown()
 
 
-def test_raw_filter_receives_clock_and_delayed_pose_without_lio(monkeypatch):
+@pytest.mark.parametrize('feedback_hz, point_groups, repeats, pose_delay', [
+    (200, 2, 1, .12), (1200, 20, 500, .17),
+])
+def test_raw_filter_receives_clock_and_delayed_pose_without_lio(
+        monkeypatch, feedback_hz, point_groups, repeats, pose_delay):
     monkeypatch.setenv('ROS_DOMAIN_ID', '93')
     monkeypatch.setenv('ROS_LOCALHOST_ONLY', '1')
     monkeypatch.setenv('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp')
@@ -192,10 +196,12 @@ def test_raw_filter_receives_clock_and_delayed_pose_without_lio(monkeypatch):
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     imu_pub = node.create_publisher(Imu, '/utlidar/imu_livox_mid360', qos_profile_sensor_data)
     raw_pub = node.create_publisher(PointCloud2, '/utlidar/cloud_livox_mid360', qos_profile_sensor_data)
-    outputs, statuses, expected = [], [], {}
+    scan_pub = node.create_publisher(LaserScan, '/scan_unmasked', qos_profile_sensor_data)
+    outputs, statuses, expected, mounts = [], [], {}, []
     node.create_subscription(PointCloud2, '/navigation/lidar', outputs.append, qos_profile_sensor_data)
     node.create_subscription(String, '/g1/navigation_reference',
                              lambda m: statuses.append(json.loads(m.data)), 10)
+    node.create_subscription(TransformStamped, '/g1/lidar_mount', mounts.append, 100)
     processes = []
     with tempfile.TemporaryDirectory(prefix='raw-timing-') as directory:
         monkeypatch.setenv('ROS_LOG_DIR', directory)
@@ -209,6 +215,7 @@ def test_raw_filter_receives_clock_and_delayed_pose_without_lio(monkeypatch):
                     '--ros-args', '-p', 'geometry_port:='+str(ports[1]),
                     '-p', 'config_file:='+str(settings)], stdout=log, stderr=log))
                 started, last_cloud, sequence = time.monotonic(), 0., 0
+                next_joint = started
                 pitch = .04014257279586953
                 ry = np.array([[math.cos(pitch), 0., math.sin(pitch)], [0., 1., 0.],
                                [-math.sin(pitch), 0., math.cos(pitch)]])
@@ -218,47 +225,77 @@ def test_raw_filter_receives_clock_and_delayed_pose_without_lio(monkeypatch):
                 body_point = geometry.boxes[0][0][:3, 3]+cart_position
                 while time.monotonic()-started < 5.:
                     now, wall = time.monotonic(), time.time()
-                    q = [0.]*29
-                    q[12] = .7*(now-started)
-                    udp.sendto(struct.pack('<IHBBQd29d', 0x47314c53, 2, 0, 0, sequence, now, *q),
-                               ('127.0.0.1', ports[0]))
-                    sequence += 1
+                    # Preserve acquisition timestamps while sending the real
+                    # 1.2 kHz input in small batches between ROS callbacks.
+                    while next_joint <= now:
+                        q = [0.]*29
+                        q[12] = .7*(next_joint-started)
+                        udp.sendto(struct.pack('<IHBBQd29d', 0x47314c53, 2, 0, 0, sequence, next_joint, *q),
+                                   ('127.0.0.1', ports[0]))
+                        sequence += 1
+                        next_joint += 1/feedback_hz
                     imu = Imu()
                     imu.header.stamp = Time(seconds=wall-62.).to_msg()
                     imu_pub.publish(imu)
-                    captured = now-.12
+                    captured = now-pose_delay
                     cart = dict(epoch=3, valid=True, attached=True, pose_source='apriltag',
                                 captured_monotonic=captured, sample_monotonic=captured,
                                 position=cart_position.tolist(), yaw=0., rotation=np.eye(3).tolist(),
                                 body_rotation=np.eye(3).tolist(), palms=[[.3, .2, .1], [.3, -.2, .1]])
                     udp.sendto(json.dumps(dict(magic='G1LOCO1', cart=cart, sent_monotonic=now)).encode(),
                                ('127.0.0.1', ports[1]))
-                    if now-started > .8 and now-last_cloud > .1:
+                    # Keep pose feedback alive across a real observation gap.
+                    # Expiry used to crash _tick while encoding numpy.bool_.
+                    if now-started > .8 and not 2.3 < now-started < 3.4 and now-last_cloud > .1:
                         last_cloud = now
                         records = []
-                        for offset in (0., .099):
+                        for offset in np.linspace(0., .099, point_groups):
                             rz = rotation_z(.7*(now-.1+offset-started))
                             rotation, position = rz @ mount_rotation, rz @ mount_position
                             for point in (body_point, np.array([0., 2., 0.])):
                                 records.append([*((point-position) @ rotation), offset*1e9])
-                        records = np.asarray(records, dtype='<f4')
-                        cloud = PointCloud2(height=1, width=4, point_step=16, row_step=64,
+                        records = np.repeat(np.asarray(records, dtype='<f4'), repeats, axis=0)
+                        cloud = PointCloud2(height=1, width=len(records), point_step=16, row_step=len(records)*16,
                             fields=[PointField(name=name, offset=i*4, datatype=PointField.FLOAT32, count=1)
                                     for i, name in enumerate(('x', 'y', 'z', 'time'))],
                             data=array('B', records.tobytes()))
                         cloud.header.frame_id = 'livox_frame'
                         cloud.header.stamp = Time(seconds=wall-.1-62.).to_msg()
                         key = (cloud.header.stamp.sec, cloud.header.stamp.nanosec)
-                        expected[key] = records[[1, 3]].tobytes()
+                        keep = np.repeat(np.tile([False, True], point_groups), repeats)
+                        expected[key] = records[keep].tobytes()
                         raw_pub.publish(cloud)
+                        scan = LaserScan(angle_increment=.1, range_min=.1, range_max=5., ranges=[2.])
+                        scan.header.frame_id = 'base_nav'
+                        scan.header.stamp = Time(seconds=wall-.25).to_msg()
+                        scan_pub.publish(scan)
                     executor.spin_once(timeout_sec=.005)
                 log.flush(); log.seek(0); diagnostic = log.read()
                 assert len(outputs) >= 20 and statuses, diagnostic
-                for output in outputs[-10:]:
+                for output in outputs[3:]:
                     key = (output.header.stamp.sec, output.header.stamp.nanosec)
-                    assert output.width == 2 and bytes(output.data) == expected[key], diagnostic
-                assert statuses[-1]['removed_points'] == 2, statuses[-1]
+                    assert output.width == point_groups*repeats and bytes(output.data) == expected[key], diagnostic
+                assert statuses[-1]['removed_points'] == point_groups*repeats, statuses[-1]
                 assert not statuses[-1]['observations']['localization_without_cart_filter'], statuses[-1]
+                assert all(process.poll() is None for process in processes), diagnostic
+                expired = [s for s in statuses if (s['observations']['filtered_age_s'] or 0.) > .5]
+                assert expired and all(not s['gantry_filter']['ready'] for s in expired), diagnostic
+                assert statuses[-1]['observations']['filtered_age_s'] < .5, statuses[-1]
+                assert statuses[-1]['gantry_filter']['ready'], statuses[-1]
+                mount_stamps = [m.header.stamp.sec+m.header.stamp.nanosec*1e-9 for m in mounts]
+                assert len(mount_stamps) > 200, diagnostic
+                assert (len(mount_stamps)-1)/(mount_stamps[-1]-mount_stamps[0]) <= 205
+                for mount, stamp in zip(mounts, mount_stamps):
+                    # Throttling selects an actual sample; it must not stamp
+                    # old waist feedback with the later publish time.
+                    elapsed = stamp-(wall-now)-started
+                    q = mount.transform.rotation
+                    actual_rotation = quaternion_matrix([q.w, q.x, q.y, q.z])
+                    expected_rotation = rotation_z(.7*elapsed) @ mount_rotation
+                    np.testing.assert_allclose(actual_rotation, expected_rotation, atol=2e-4)
+                    actual = np.array([mount.transform.translation.x, mount.transform.translation.y])
+                    wanted = (rotation_z(.7*elapsed) @ mount_position)[:2]
+                    np.testing.assert_allclose(actual, wanted, atol=1e-5)
             finally:
                 for process in processes:
                     process.terminate()

@@ -4,6 +4,7 @@ These tests exercise bridge methods on small harnesses without a ROS graph,
 and the loopback locomotion link with real UDP sockets on free ports.
 """
 import json
+import math
 import socket
 import threading
 import time
@@ -14,7 +15,9 @@ import pytest
 import yaml
 from pathlib import Path
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from rclpy.time import Time
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2, LaserScan
 
 from unitree_nav2_web.locomotion import (
     REQUEST_CODES,
@@ -101,6 +104,7 @@ class _Harness:
         NavigationWebBridge._abort_navigation_for_motion_gate
     )
     _reference_blockers = NavigationWebBridge._reference_blockers
+    _reference_snapshot = NavigationWebBridge._reference_snapshot
     _check_reference_gate = NavigationWebBridge._check_reference_gate
     _locomotion_blockers = NavigationWebBridge._locomotion_blockers
     _status_timer = NavigationWebBridge._status_timer
@@ -260,7 +264,7 @@ def test_locomotion_link_reports_freshness_and_sends_requests():
             json.dumps({"magic": "WRONG", "ready": True}).encode(),
             ("127.0.0.1", status_port),
         )
-        status = {"magic": "G1LOCO1", "ready": True, "stage": "POLICY", "healthy": True,
+        status = {"magic": "G1LOCO1", "sent_monotonic": time.monotonic(), "ready": True, "stage": "POLICY", "healthy": True,
                   "prepare_pose": "arms_down", "prepare_pose_selectable": False,
                   "prepare_pose_options": [{"value": "arms_down", "label": "双臂下垂"}],
                   "preparation_warning": "等待关节到位"}
@@ -421,7 +425,7 @@ def test_large_warning_status_remains_online_and_keeps_all_joint_details():
                  "message": f"joint_{i} 位置超限：实测超出参考范围，机身控制继续。" * 3}
                 for i in range(41)]
     try:
-        packet = json.dumps({"magic": "G1LOCO1", "ready": True, "healthy": True,
+        packet = json.dumps({"magic": "G1LOCO1", "sent_monotonic": time.monotonic(), "ready": True, "healthy": True,
                              "stage": "POLICY", "warnings": warnings}, ensure_ascii=False).encode()
         assert len(packet) > 8192
         sender.sendto(packet, link.sock.getsockname())
@@ -727,7 +731,7 @@ def test_cart_reference_must_match_executor_before_opening_gate(failure):
         harness.reference_received -= 1.
     else:
         harness.navigation_reference['ready'] = False
-    with pytest.raises(ValueError, match='导航参考点'):
+    with pytest.raises(ValueError, match='导航参考'):
         harness._validate_motion_enable()
 
 
@@ -917,6 +921,42 @@ def test_downstream_reference_fault_is_acknowledged_even_without_a_goal():
     assert '等待扫描' in h.last_safety_event
 
 
+def test_stopped_filter_expires_cached_status_without_stopping_body_policy(monkeypatch):
+    now = [100.]
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0])
+    h = _Harness()
+    h.navigation_reference.update(
+        reason='', sent_monotonic=100., gantry_filter=dict(ready=True),
+        observations=dict(raw_age_s=.1, filtered_age_s=None, obstacle_scan_age_s=.2))
+    cached = json.loads(json.dumps(h.navigation_reference))
+    now[0] = 100.1
+    reference = h._reference_snapshot()
+    assert reference['ready'] and reference['fresh']
+    assert reference['observations']['raw_age_s'] == pytest.approx(.2)
+    now[0] = 100.6
+    reference = h._reference_snapshot()
+    assert not reference['ready'] and not reference['fresh']
+    assert not reference['gantry_filter']['ready']
+    assert reference['observations']['obstacle_scan_age_s'] == pytest.approx(.8)
+    assert reference['observations']['filtered_age_s'] is None
+    assert '过滤节点未更新' in reference['reason']
+    diagnostic = h._navigation_diagnostic()
+    assert not diagnostic['reference_ready']
+    assert diagnostic['reference_age_s'] == pytest.approx(.6)
+    assert diagnostic['observations'] == reference['observations']
+    goal = h.goal_handle
+    h._check_reference_gate(h.locomotion.snapshot())
+    now[0] += REFERENCE_READY_GRACE_S+.01
+    h._check_reference_gate(h.locomotion.snapshot())
+    assert not h.navigation_active and not h.motion_enabled
+    assert goal.cancel_count == 1
+    assert h.locomotion.requests == []  # Never request a body stop for lost perception.
+    assert h.navigation_reference == cached  # Reading must not compound cached ages.
+    h.reference_received = now[0]
+    assert h._reference_snapshot()['ready']
+    assert not h._reference_blockers(h.locomotion.snapshot())
+
+
 @pytest.mark.parametrize('failure', [None, 'zero_stamps', 'old_stamps', 'no_scan', 'no_maps', 'mode_change', 'gate_open', 'pending', 'reference_gap', 'reference_lost'])
 def test_mode_reset_waits_for_fresh_scan_and_rebuilt_maps_with_gate_closed(monkeypatch, failure):
     now = [100.]
@@ -973,3 +1013,74 @@ def test_mode_reset_waits_for_fresh_scan_and_rebuilt_maps_with_gate_closed(monke
         NavigationWebBridge._reset_navigation_costmaps(h, 3, 100.5)
         assert now[0] == pytest.approx(100.3 if failure == 'reference_gap' else 100.2)
     assert calls == ([] if failure in ('gate_open', 'pending') else ['local', 'global'])
+
+
+def test_status_delay_replay_and_reordering_never_renew_readiness():
+    clock = [100.]
+    link = LocomotionLink(0, 0, clock=lambda: clock[0])
+    try:
+        ready = dict(magic='G1LOCO1', stage='POLICY', ready=True, healthy=True,
+                     sent_monotonic=99.8)
+        assert link._accept_status(ready)
+        assert link.snapshot()['age_s'] == pytest.approx(.2)
+        clock[0] = 100.31
+        for stamp in (99.8, 101., None, math.nan):
+            assert not link._accept_status(dict(ready, sent_monotonic=stamp))
+        assert link._accept_status(dict(ready, sent_monotonic=99.9))
+        # The one newer sample still expires from its source time, not reception.
+        clock[0] = 100.41
+        assert not link.snapshot()['ready']
+        assert link._accept_status(dict(ready, sent_monotonic=100.4, ready=False))
+        assert not link._accept_status(dict(ready, sent_monotonic=100.35))
+        assert not link.snapshot()['ready']
+    finally:
+        link.close()
+
+
+@pytest.mark.parametrize('stream, message_type, callback, attribute', [
+    ('cloud', PointCloud2, '_cloud_callback', 'last_cloud_time'),
+    ('odom', Odometry, '_odom_callback', 'last_odom_time'),
+    ('scan', LaserScan, '_localization_scan_callback', 'last_localization_scan_time'),
+    ('amcl', PoseWithCovarianceStamped, '_localization_callback', 'last_pose_time'),
+])
+def test_navigation_rejects_old_future_and_unstamped_measurements(stream, message_type, callback, attribute):
+    bridge = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=100.)),
+                             **{attribute: 12.})
+    message = message_type()
+    if stream in ('odom', 'amcl'):
+        message.pose.pose.orientation.w = 1.
+    for stamp in (0., 90., 101.):
+        message.header.stamp = Time(seconds=stamp).to_msg()
+        getattr(NavigationWebBridge, callback)(bridge, message)
+        assert getattr(bridge, attribute) == 12.
+
+
+def test_odometry_receipt_does_not_renew_its_acquisition_time(monkeypatch):
+    clock = [200.]
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    bridge = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=clock[0]+1000.)),
+                             lock=threading.RLock(), navigation_active=False, last_odom_time=0.)
+    message = Odometry()
+    message.pose.pose.orientation.w = 1.
+    message.header.stamp = Time(seconds=1199.6).to_msg()
+    NavigationWebBridge._odom_callback(bridge, message)
+    assert bridge.last_odom_time == pytest.approx(199.6)
+    clock[0] += .1
+    message.twist.twist.linear.x = 10.  # Replayed sequence must not change the velocity either.
+    NavigationWebBridge._odom_callback(bridge, message)
+    assert bridge.last_odom_time == pytest.approx(199.6)
+    assert bridge.last_odom_speed == 0.
+
+
+def test_fresh_status_packet_does_not_extend_body_feedback_deadline():
+    clock = [100.]
+    link = LocomotionLink(0, 0, clock=lambda: clock[0])
+    try:
+        assert link._accept_status(dict(sent_monotonic=100., ready=True, healthy=True,
+                                       feedback_age_s=.08, feedback_timeout_s=.1))
+        assert link.snapshot()['ready']
+        clock[0] += .03
+        assert link.snapshot()['online']
+        assert not link.snapshot()['ready'] and not link.snapshot()['healthy']
+    finally:
+        link.close()

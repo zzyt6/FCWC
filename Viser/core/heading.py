@@ -95,6 +95,7 @@ class HeadingControl:
         self.origin = None
         self.source = None
         self.needs_neutral = False
+        self.timing_blocked = False
         self.translating = self.turning = False
         self.release_since = self.settle_since = None
         self.state, self.reason = 'STOPPED', 'initial'
@@ -144,16 +145,24 @@ class HeadingControl:
                              wz_suggested=0., body_velocity=[0.,0.,0.])
 
     def update(self, quaternion, velocity, dt, active, *, omega, sample_key,
-               received_time, control_time, raw_command, command_source='UNKNOWN', smooth_zero=False):
+               received_time, control_time, raw_command, command_source='UNKNOWN', smooth_zero=False,
+               feedback_times=()):
         cfg = self.settings
         command = np.array(velocity, dtype=float, copy=True)
         user = np.asarray(raw_command, dtype=float)
         if (command.shape != (3,) or user.shape != (3,) or not np.isfinite(command).all()
                 or not np.isfinite(user).all() or not np.isfinite(dt) or dt < 0):
             raise ValueError('Invalid physical velocity command or control interval')
-        if active and dt > cfg['imu_timeout_s']:
-            raise ImuFault('Control loop gap exceeds feedback timeout')
-        m = self.imu.update(quaternion, omega, sample_key, received_time, control_time)
+        m = self.imu.update(quaternion, omega, sample_key, received_time, control_time,
+                            feedback_times=feedback_times)
+        # A fresh valid body sample can still run Balance after a missed
+        # heading interval. Drop motion/reference continuity, not motor support.
+        control_gap = active and dt > cfg['imu_timeout_s']
+        if control_gap or m['imu_gap_detected']:
+            self.timing_blocked = True
+            self.needs_neutral = True
+            self.imu.good_since = received_time
+            self._release()
         yaw = m['yaw_used']
         if self.origin is None: self.origin = yaw
         mode = cfg['run_mode']
@@ -165,8 +174,9 @@ class HeadingControl:
                    abs(user[2]) <= cfg['turn_exit_rad_s'])
         if m['imu_health'] not in ('healthy','warming_up'):
             self.needs_neutral = True
-        if m['imu_health'] == 'healthy' and neutral:
+        if m['imu_health'] == 'healthy' and neutral and not control_gap:
             self.needs_neutral = False
+            self.timing_blocked = False
         health_ok = m['imu_health'] == 'healthy' and not self.needs_neutral
         if command_source != previous_source:
             self._release()
@@ -176,7 +186,10 @@ class HeadingControl:
         self.translating = np.linalg.norm(user[:2]) > moving_threshold
         error = effective_error = P = D = raw_correction = correction = 0.
         hold = False
-        if not active or smooth_zero:
+        if self.timing_blocked:
+            self.state, self.reason = 'RECOVERING', 'timing_gap_standing'
+            self.turning = False
+        elif not active or smooth_zero:
             self.state, self.reason = 'STOPPED', 'inactive_or_zero'
             self.turning = False
         elif command_source == 'PUSHCART':
@@ -250,7 +263,7 @@ class HeadingControl:
         self.applied_correction += float(np.clip(bounded-feedforward-self.applied_correction,-step,step))
         proposed = float(np.clip(feedforward+self.applied_correction,*self.limits[2]))
         decelerating = False
-        if smooth_zero and active:
+        if (smooth_zero or self.timing_blocked) and active:
             # Same dt/tau filter as the training switch bank. Suppress heading
             # corrections throughout the stop, then hand over at the threshold.
             self.output *= max(0., 1. - dt/self.filter_tau)
@@ -298,6 +311,7 @@ class HeadingControl:
                          slew_limit_flag=slew_limited, needs_neutral=self.needs_neutral,
                          effective_frame='body', active=bool(active and np.any(self.output)),
                          correction_enabled=hold and mode == 'active', decelerating=decelerating,
+                         motion_blocked=self.timing_blocked,
                          imu_yaw_rad=yaw, heading_origin_yaw_rad=self.origin,
                          yaw_relative_rad=wrap_angle(yaw-self.origin), target_yaw_rad=self.target,
                          target_relative_rad=None if self.target is None else wrap_angle(self.target-self.origin),

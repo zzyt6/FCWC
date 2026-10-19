@@ -48,7 +48,7 @@ def test_real_amcl_sway_needs_scan_refresh_and_missing_scan_cannot_fake_a_pose(m
                 client = node.create_client(ChangeState, '/amcl/change_state')
                 poses, faults = [], []
                 bridge = SimpleNamespace(
-                    lock=threading.RLock(), phase='NAVIGATING', localization_refinement_active=False,
+                    get_clock=node.get_clock, lock=threading.RLock(), phase='NAVIGATING', localization_refinement_active=False,
                     navigation_active=True, navigation_pose_received=False, navigation_motion_started=False,
                     navigation_last_motion_time=0., nomotion_update_inflight=False,
                     next_nomotion_update_time=0., amcl_generation=0, last_pose_time=0.,
@@ -90,6 +90,7 @@ def test_real_amcl_sway_needs_scan_refresh_and_missing_scan_cannot_fake_a_pose(m
                         transform.transform.rotation.w = 1.
                         tf.sendTransform(transform)
                         odom = Odometry()
+                        odom.header.stamp = stamp
                         odom.pose.pose.orientation.w = 1.
                         odom.pose.pose.position.x = x
                         odom.twist.twist.linear.x = .004*8*math.pi*math.cos(8*math.pi*(now-origin))

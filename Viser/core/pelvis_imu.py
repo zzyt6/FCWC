@@ -38,7 +38,7 @@ class PelvisImu:
         self.previous_yaw = self.previous_rate = self.filtered = None
         self.last = {}
 
-    def update(self, quaternion, omega, key, received_time, control_time):
+    def update(self, quaternion, omega, key, received_time, control_time, *, feedback_times=()):
         cfg = self.settings
         age = control_time - received_time
         if not np.isfinite([control_time, received_time]).all() or not 0 <= age <= cfg['imu_timeout_s']:
@@ -58,17 +58,34 @@ class PelvisImu:
         if gyro.shape != (3,) or not np.isfinite(gyro).all():
             raise ImuFault('Invalid pelvis gyroscope')
         dt = None if self.stamp is None else received_time-self.stamp
+        resumed = False
+        gap_detected = False
         if dt is not None and dt > cfg['imu_timeout_s']:
-            raise ImuFault('Pelvis IMU sample gap exceeds timeout')
+            # The policy consumes only the newest bridge packet, although
+            # Bridge.read() may have drained many continuous samples. Require
+            # real intermediate receive times spanning the entire gap before
+            # treating this as a consumer pause rather than a feedback loss.
+            previous = self.stamp
+            for stamp in feedback_times:
+                if not np.isfinite(stamp) or stamp <= previous:
+                    continue
+                if stamp >= received_time or stamp-previous > cfg['imu_timeout_s']:
+                    break
+                previous = stamp
+            gap_detected = received_time-previous > cfg['imu_timeout_s']
+            # Do not integrate/compare gyro or yaw across skipped samples.
+            # Start the usual warmup from the fresh, validated measurement.
+            self.filtered = self.good_since = self.previous_rate = None
+            resumed = True
         p, q, r = gyro
         # Three different rates; do not use scaled policy observations here.
         world_z = -np.sin(pitch)*p + np.cos(pitch)*(np.sin(roll)*q+np.cos(roll)*r)
         rate = ((np.sin(roll)*q+np.cos(roll)*r)/np.cos(pitch)
                 if abs(np.cos(pitch)) > .2 else None)
-        reason = ''
+        reason = 'sample_gap_recovering' if gap_detected else ''
         if max(abs(roll), abs(pitch)) > cfg['max_feedback_tilt_rad']:
             reason = 'tilt_outside_heading_approximation'
-        elif dt is not None and cfg['gyro_cutoff_hz'] >= .5/dt:
+        elif not resumed and dt is not None and cfg['gyro_cutoff_hz'] >= .5/dt:
             reason = 'sample_rate_below_filter_nyquist'
         elif dt is not None and self.previous_rate is not None:
             increment = wrap_angle(yaw-self.previous_yaw)
@@ -95,6 +112,8 @@ class PelvisImu:
                          measured_policy_yaw_rate=None, imu_sample_time=None,
                          imu_receive_time=received_time, imu_time_basis='host_receive_proxy',
                          imu_age=age, imu_dt=dt, new_sample=True,
+                         imu_consumer_resumed=resumed,
+                         imu_gap_detected=gap_detected,
                          consumed_sample_hz=None if dt is None else 1/dt,
                          imu_health=reason or 'healthy',
                          calibration_status='not_enabled_no_acceleration_stationarity_evidence')

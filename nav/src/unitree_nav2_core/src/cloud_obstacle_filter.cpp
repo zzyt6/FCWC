@@ -42,7 +42,7 @@ public:
     publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       get_parameter("output_topic").as_string(), rclcpp::SensorDataQoS());
     subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      get_parameter("input_topic").as_string(), rclcpp::SensorDataQoS(),
+      get_parameter("input_topic").as_string(), rclcpp::SensorDataQoS().keep_last(1),
       std::bind(&CloudObstacleFilter::callback, this, std::placeholders::_1));
   }
 
@@ -92,6 +92,10 @@ private:
 
   void callback(const sensor_msgs::msg::PointCloud2::SharedPtr message)
   {
+    const auto stamp = rclcpp::Time(message->header.stamp);
+    const double age = (now()-stamp).seconds();
+    if (stamp.nanoseconds() <= last_stamp_ || age < -.03 || age > .5) return;
+    last_stamp_ = stamp.nanoseconds();
     pcl::PointCloud<pcl::PointXYZI>::Ptr input(
       new pcl::PointCloud<pcl::PointXYZI>());
     pcl::fromROSMsg(*message, *input);
@@ -100,7 +104,9 @@ private:
     if (estimateGround(input, plane))
     {
       last_plane_ = plane;
-      last_plane_time_ = std::chrono::steady_clock::now();
+      last_plane_time_ = std::chrono::steady_clock::now() -
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(age));
       have_plane_ = true;
     }
     else if (!have_plane_ ||
@@ -108,13 +114,9 @@ private:
     {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 3000,
-        "No reliable live ground plane; publishing an empty obstacle cloud.");
-      sensor_msgs::msg::PointCloud2 empty = *message;
-      empty.height = 1;
-      empty.width = 0;
-      empty.row_step = 0;
-      empty.data.clear();
-      publisher_->publish(empty);
+        "No reliable live ground plane; obstacle observations paused.");
+      // An empty cloud becomes an all-infinity scan and would falsely clear
+      // obstacles. Let the observation deadline expire instead.
       return;
     }
     plane = last_plane_;
@@ -138,7 +140,7 @@ private:
     sensor_msgs::msg::PointCloud2 output;
     pcl::toROSMsg(*obstacles, output);
     output.header = message->header;
-    publisher_->publish(output);
+    if ((now()-stamp).seconds() <= .5) publisher_->publish(output);
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 3000,
@@ -152,6 +154,7 @@ private:
   double self_filter_radius_ = 0.60;
   double max_range_ = 4.0;
   bool have_plane_ = false;
+  int64_t last_stamp_ = 0;
   Eigen::Vector4f last_plane_ = Eigen::Vector4f::Zero();
   std::chrono::steady_clock::time_point last_plane_time_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;

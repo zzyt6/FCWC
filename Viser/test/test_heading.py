@@ -80,7 +80,7 @@ class ImuTests(unittest.TestCase):
             with self.assertRaises(ImuFault): self.make().update(q,[0]*3,(1,1),1.,1.)
         with self.assertRaises(ImuFault): self.make().update(quaternion(),[0,0,np.nan],(1,1),1.,1.)
         for key,t,now in [((1,0),1.02,1.02),((1,2),.99,1.),((2,2),1.02,1.02),
-                          ((1,2),1.2,1.2),((1,1),1.,1.11),((1,2),1.02,1.01)]:
+                          ((1,1),1.,1.11),((1,2),1.02,1.01)]:
             imu=self.make(); imu.update(quaternion(),[0]*3,(1,1),1.,1.)
             with self.assertRaises(ImuFault): imu.update(quaternion(),[0]*3,key,t,now)
 
@@ -97,6 +97,34 @@ class ImuTests(unittest.TestCase):
         imu.update(quaternion(),[0]*3,(1,1),1.,1.)
         self.assertEqual(imu.update(quaternion(),[0]*3,(1,2),1.06,1.06)['imu_health'],
                          'sample_rate_below_filter_nyquist')
+
+    def test_consumer_gap_requires_continuous_received_packets_and_restarts_filter(self):
+        imu=self.make()
+        imu.update(quaternion(),[0,0,.5],(1,1),1.,1.03)
+        stamps=np.arange(1.005,1.12,.005)
+        sample=imu.update(quaternion(.2),[0,0,.1],(1,25),1.12,1.121,feedback_times=stamps)
+        self.assertTrue(sample['imu_consumer_resumed'])
+        self.assertEqual(sample['imu_health'],'warming_up')
+        self.assertAlmostEqual(sample['filtered_yaw_rate_for_heading'],.1)
+        self.assertAlmostEqual(sample['imu_dt'],.12)
+        for i in range(1,15):
+            stamp=1.12+i*.02
+            sample=imu.update(quaternion(.2+i*.002),[0,0,.1],(1,25+i),stamp,stamp)
+        self.assertEqual(sample['imu_health'],'healthy')
+        self.assertFalse(sample['imu_consumer_resumed'])
+
+    def test_real_gap_rebuilds_heading_but_stale_or_invalid_session_still_fails(self):
+        for stamps in [(), [1.,1.2], [1.005,1.11,1.2], [float('nan'),1.2], [2.]]:
+            with self.subTest(stamps=stamps):
+                imu=self.make(); imu.update(quaternion(),[0]*3,(1,1),1.,1.)
+                sample=imu.update(quaternion(),[0]*3,(1,40),1.2,1.2,feedback_times=stamps)
+                self.assertTrue(sample['imu_gap_detected'])
+                self.assertEqual(sample['imu_health'],'sample_gap_recovering')
+                self.assertIsNone(sample['filtered_yaw_rate_for_heading'])
+        for key,received,now in [((1,40),1.2,1.31),((2,40),1.2,1.2),((1,0),1.2,1.2)]:
+            imu=self.make(); imu.update(quaternion(),[0]*3,(1,1),1.,1.)
+            with self.assertRaises(ImuFault):
+                imu.update(quaternion(),[0]*3,key,received,now,feedback_times=np.arange(1.,1.21,.005))
 
 
 class HeadingTests(unittest.TestCase):
@@ -345,9 +373,23 @@ class HeadingTests(unittest.TestCase):
         rig.control.stop('emergency');np.testing.assert_array_equal(rig.control.output,0)
         self.assertIsNone(rig.control.target)
 
-    def test_control_gap_not_disguised_by_dt_clipping(self):
-        rig=Rig()
-        with self.assertRaisesRegex(ImuFault,'Control loop gap'):rig.tick((.2,0,0),dt=.2)
+    def test_control_gap_with_fresh_feedback_zeroes_and_requires_neutral_recovery(self):
+        for continuous in (False,True):
+            rig=Rig();rig.tick((.2,0,0))
+            stamps=np.arange(rig.t,rig.t+.201,.005) if continuous else ()
+            out,h=rig.tick((.2,0,0),dt=.2,feedback_times=stamps)
+            self.assertTrue(h['motion_blocked'])
+            self.assertLess(out[0],.2)
+            self.assertIsNone(h['yaw_ref'])
+            for _ in range(30):
+                out,h=rig.tick((.2,0,0))
+                self.assertTrue(h['motion_blocked'])
+            np.testing.assert_array_equal(out,0)
+            out,h=rig.tick()
+            self.assertFalse(h['motion_blocked'])
+            np.testing.assert_array_equal(out,0)
+            out,h=rig.tick((.2,0,0))
+            self.assertGreater(out[0],0)
 
     def test_invalid_config_rejected(self):
         for patch in [dict(heading_kp=float('nan')),dict(command_frame='world'),dict(rate_control_enabled=True),

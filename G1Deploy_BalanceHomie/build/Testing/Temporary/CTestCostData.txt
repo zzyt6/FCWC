@@ -1,6 +1,6 @@
-control_core 170 0.000528483
-hand_core 132 2.70444e-05
-hand_dds 128 5.19668e-05
-command_trace 122 1.74274e-05
-hand_recovery 107 3.16274e-05
+control_core 173 0.000512714
+hand_core 135 2.54122e-05
+hand_dds 131 4.75861e-05
+command_trace 125 1.92756e-05
+hand_recovery 110 2.39004e-05
 ---

@@ -83,6 +83,8 @@ float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
 
+#include "measurement_queue.hpp"
+
 mutex mtx_buffer;
 condition_variable sig_buffer;
 
@@ -107,9 +109,14 @@ vector<PointVector>  Nearest_Points;
 vector<double>       extrinT(3, 0.0);
 vector<double>       extrinR(9, 0.0);
 vector<double>       initial_imu_forward(3, 0.0);
-deque<double>                     time_buffer;
-deque<PointCloudXYZI::Ptr>        lidar_buffer;
-deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
+struct PendingScan {
+    PointCloudXYZI::Ptr points;
+    std::chrono::steady_clock::time_point received;
+};
+MeasurementQueue<PendingScan> lidar_buffer(3, .25);
+// Preserve intermediate IMU integration even when obsolete scans are skipped.
+MeasurementQueue<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer(4000, 4.);
+bool measurement_history_lost = false;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -289,10 +296,10 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
-    if (!is_first_lidar && cur_time < last_timestamp_lidar)
+    if (!is_first_lidar && cur_time <= last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
+        mtx_buffer.unlock();
+        return; // Duplicate/reordered scans must not rewind the estimator.
     }
     if (is_first_lidar)
     {
@@ -301,8 +308,8 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(cur_time);
+    const auto queued = lidar_buffer.push(cur_time, {ptr, std::chrono::steady_clock::now()});
+    if (queued.dropped) lidar_pushed = false;
     last_timestamp_lidar = cur_time;
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
@@ -317,10 +324,10 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
-    if (!is_first_lidar && cur_time < last_timestamp_lidar)
+    if (!is_first_lidar && cur_time <= last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
+        mtx_buffer.unlock();
+        return;
     }
     if(is_first_lidar)
     {
@@ -342,8 +349,8 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(last_timestamp_lidar);
+    const auto queued = lidar_buffer.push(cur_time, {ptr, std::chrono::steady_clock::now()});
+    if (queued.dropped) lidar_pushed = false;
     
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
@@ -352,6 +359,11 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
+    for (const double value : {msg_in->angular_velocity.x, msg_in->angular_velocity.y,
+        msg_in->angular_velocity.z, msg_in->linear_acceleration.x,
+        msg_in->linear_acceleration.y, msg_in->linear_acceleration.z}) {
+        if (!std::isfinite(value)) return;
+    }
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -368,15 +380,22 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     mtx_buffer.lock();
 
-    if (timestamp < last_timestamp_imu)
+    if (timestamp <= last_timestamp_imu)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        imu_buffer.clear();
+        mtx_buffer.unlock();
+        return;
     }
 
     last_timestamp_imu = timestamp;
 
-    imu_buffer.push_back(msg);
+    const auto queued = imu_buffer.push(timestamp, msg);
+    if (queued.dropped && !flg_first_scan && !measurement_history_lost) {
+        // Never integrate over a history gap or publish a guessed current pose.
+        // Only localization stops; the independent body policy keeps standing.
+        measurement_history_lost = true;
+        std::cerr << "FAST-LIO IMU history overflow: localization requires restart; "
+                     "body control is independent" << std::endl;
+    }
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -385,6 +404,14 @@ double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
+    if (measurement_history_lost) return false;
+    while (!lidar_buffer.empty() &&
+        (std::chrono::duration<double>(std::chrono::steady_clock::now()-
+            lidar_buffer.front().value.received).count() > .5 ||
+         last_timestamp_imu-lidar_buffer.front().stamp > .5)) {
+        lidar_buffer.pop_front();
+        lidar_pushed = false;
+    }
     if (lidar_buffer.empty() || imu_buffer.empty()) {
         return false;
     }
@@ -392,8 +419,8 @@ bool sync_packages(MeasureGroup &meas)
     /*** push a lidar scan ***/
     if(!lidar_pushed)
     {
-        meas.lidar = lidar_buffer.front();
-        meas.lidar_beg_time = time_buffer.front();
+        meas.lidar = lidar_buffer.front().value.points;
+        meas.lidar_beg_time = lidar_buffer.front().stamp;
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
@@ -421,20 +448,21 @@ bool sync_packages(MeasureGroup &meas)
     }
 
     /*** push imu data, and pop from imu buffer ***/
-    double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+    double imu_time = imu_buffer.front().stamp;
     meas.imu.clear();
     while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
     {
-        imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+        imu_time = imu_buffer.front().stamp;
         if(imu_time > lidar_end_time) break;
-        meas.imu.push_back(imu_buffer.front());
+        meas.imu.push_back(imu_buffer.front().value);
         imu_buffer.pop_front();
     }
 
     lidar_buffer.pop_front();
-    time_buffer.pop_front();
     lidar_pushed = false;
-    return true;
+    // Process() returns early without clearing its output when IMU is empty.
+    // Never stamp the previous point cloud as a new measurement in that case.
+    return !meas.imu.empty();
 }
 
 int process_increments = 0;
@@ -949,13 +977,13 @@ public:
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 1, livox_pcl_cbk);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS().keep_last(1), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::SensorDataQoS().keep_last(200), imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -76,10 +77,12 @@ public:
       });
     reference_subscription_ = create_subscription<std_msgs::msg::Bool>(
       "/g1/navigation_reference_ready", rclcpp::QoS(1).transient_local().reliable(),
-      [this](const std_msgs::msg::Bool::SharedPtr message) {
+      [this](const std_msgs::msg::Bool::SharedPtr message, const rclcpp::MessageInfo & info) {
+        const auto sampled = sourceTime(info, .3);
+        if (message->data && !sampled) return;
         checkReference();
         reference_ready_ = message->data;
-        last_reference_ = std::chrono::steady_clock::now();
+        if (sampled) last_reference_ = *sampled;
         checkReference();
         if (!reference_ready_ && require_reference_) {
           command_received_ = false;
@@ -89,8 +92,10 @@ public:
       });
     enable_subscription_ = create_subscription<std_msgs::msg::Bool>(
       "/g1/motion_enable", rclcpp::QoS(1).transient_local().reliable(),
-      [this](const std_msgs::msg::Bool::SharedPtr message) {
-        last_enable_command_ = std::chrono::steady_clock::now();
+      [this](const std_msgs::msg::Bool::SharedPtr message, const rclcpp::MessageInfo & info) {
+        const auto sampled = sourceTime(info, motion_enable_timeout_);
+        if (message->data && !sampled) return;
+        if (sampled) last_enable_command_ = *sampled;
         enable_command_received_ = true;
         checkReference();
         if (!message->data) reference_fault_latched_ = false;
@@ -99,6 +104,7 @@ public:
         // opening a closed gate still requires a valid current reference.
         enabled_ = message->data && !reference_fault_latched_ && (enabled_ || referenceFresh());
         const bool changed = was_enabled != enabled_;
+        if (changed && enabled_) accept_commands_after_ = std::chrono::steady_clock::now();
         if (!enabled_) reference_unavailable_ = false;
         if (changed || !enabled_)
         {
@@ -115,11 +121,14 @@ public:
       });
     cmd_subscription_ = create_subscription<geometry_msgs::msg::Twist>(
       get_parameter("cmd_vel_topic").as_string(), 1,
-      [this](const geometry_msgs::msg::Twist::SharedPtr message) {
+      [this](const geometry_msgs::msg::Twist::SharedPtr message, const rclcpp::MessageInfo & info) {
         checkReference();
         if (!enabled_ || !referenceFresh()) return;
+        const auto sampled = sourceTime(info, command_timeout_);
+        if (!sampled || *sampled <= accept_commands_after_ ||
+          (command_received_ && *sampled <= last_command_)) return;
         command_ = *message;
-        last_command_ = std::chrono::steady_clock::now();
+        last_command_ = *sampled;
         command_received_ = true;
       });
     timer_ = create_wall_timer(
@@ -138,6 +147,20 @@ public:
   }
 
 private:
+  static std::optional<std::chrono::steady_clock::time_point> sourceTime(
+    const rclcpp::MessageInfo & info, double max_age)
+  {
+    // Twist/Bool have no Header. DDS publication time prevents a queued
+    // message from acquiring a fresh lease when its callback finally runs.
+    const auto source = info.get_rmw_message_info().source_timestamp;
+    const auto wall = std::chrono::system_clock::now().time_since_epoch();
+    const double age = std::chrono::duration<double>(wall).count() - double(source)*1e-9;
+    if (source <= 0 || age < -.001 || age > max_age) return std::nullopt;
+    return std::chrono::steady_clock::now() -
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(std::max(0., age)));
+  }
+
   void checkReference()
   {
     const auto now = std::chrono::steady_clock::now();
@@ -257,6 +280,7 @@ private:
   double motion_enable_timeout_ = 1.50;
   geometry_msgs::msg::Twist command_;
   std::chrono::steady_clock::time_point last_command_;
+  std::chrono::steady_clock::time_point accept_commands_after_;
   std::chrono::steady_clock::time_point last_enable_command_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr enabled_status_publisher_;

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -21,6 +22,23 @@
 namespace
 {
 std::atomic<bool> running{true};
+
+uint32_t crc32(const void * data, size_t bytes)
+{
+  uint32_t crc = 0xffffffff;
+  const auto * p = static_cast<const unsigned char *>(data);
+  for (size_t i = 0; i < bytes; i += 4) {
+    uint32_t word;
+    std::memcpy(&word, p+i, 4);
+    for (uint32_t bit = 0x80000000; bit; bit >>= 1) {
+      const bool high = crc & 0x80000000;
+      crc <<= 1;
+      if (high) crc ^= 0x04c11db7;
+      if (word & bit) crc ^= 0x04c11db7;
+    }
+  }
+  return crc;
+}
 
 void stopHandler(int)
 {
@@ -78,6 +96,11 @@ private:
   {
     const auto *state =
         static_cast<const unitree_hg::msg::dds_::LowState_ *>(message);
+    if (state->crc() != crc32(state, sizeof(*state)-sizeof(uint32_t))) return;
+    const uint32_t delta = state->tick()-last_tick_;
+    if (have_tick_ && (delta == 0 || delta > 0x7fffffffU)) return;
+    last_tick_ = state->tick();
+    have_tick_ = true;
     unitree_g1_kinematics::LowStatePacket packet;
     packet.sample_monotonic = std::chrono::duration<double>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -92,6 +115,8 @@ private:
   int socket_ = -1;
   sockaddr_in destination_{};
   std::uint64_t sequence_ = 0;
+  uint32_t last_tick_ = 0;
+  bool have_tick_ = false;
   unitree::robot::ChannelSubscriberPtr<unitree_hg::msg::dds_::LowState_> subscriber_;
 };
 

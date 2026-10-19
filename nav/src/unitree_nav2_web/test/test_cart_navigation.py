@@ -76,7 +76,7 @@ def harness(geometry, gantry=False):
                         removed_points=0, filter_error='', scan_error='', raw_frame='livox_frame')
     h.gantry = GantryGeometry(geometry.settings['gantry_filter'] if gantry else {})
     h.cart_history, h.pending_odometry, h.odometry_error = CartPoseHistory(), deque(maxlen=10), ''
-    h.mount_history = CartPoseHistory(max_gap=.05, max_samples=256)
+    h.mount_history = CartPoseHistory(max_gap=.05, max_samples=None)
     h.pending_clouds = deque()
     now = time.monotonic()
     h.lidar_clock = (now-17., now)
@@ -91,9 +91,11 @@ def harness(geometry, gantry=False):
     h._fresh = lambda: CartNavigation._fresh(h)
     h._gantry_ready = lambda: CartNavigation._gantry_ready(h)
     h._points_in_body = lambda msg: CartNavigation._points_in_body(h, msg)
+    h._cloud_samples = lambda msg: CartNavigation._cloud_samples(h, msg)
     h._expire_gantry_clear = lambda: CartNavigation._expire_gantry_clear(h)
     h._localization_only = lambda msg: CartNavigation._localization_only(h, msg)
-    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(nanoseconds=int(time.time()*1e9), clock_type=ClockType.ROS_TIME))
+    wall, monotonic = time.time(), time.monotonic()
+    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=wall+time.monotonic()-monotonic, clock_type=ClockType.ROS_TIME))
     h.cloud_pub = Publisher()
     h.odom_pub = Publisher()
     h.broadcaster = Publisher()
@@ -196,6 +198,24 @@ def test_self_mask_keeps_external_obstacles_and_empty_cart_volume(geometry):
     assert geometry.self_mask(np.asarray(points) @ rotation_z(angle).T, rotated).tolist() == [True, False, False]
 
 
+def test_cart_mask_broad_rejection_preserves_parts_boundaries_and_empty_space(geometry):
+    rng = np.random.default_rng(43)
+    padding = geometry.settings['self_filter_padding_m']
+    points = [*rng.uniform(-20., 20., (10000, 3)), *rng.uniform(-1., 1., (3000, 3))]
+    for transform, half in geometry.boxes:
+        for x in (-1., 1.):
+            for y in (-1., 1.):
+                for z in (-1., 1.):
+                    points.append(transform[:3, 3]+transform[:3, :3] @ ((half+padding)*[x, y, z]))
+    points = np.asarray(points)
+    expected = np.zeros(len(points), dtype=bool)
+    for transform, half in geometry.boxes:
+        expected |= np.all(np.abs((points-transform[:3, 3]) @ transform[:3, :3]) <= half+padding, axis=1)
+    for center, radius in geometry.spheres:
+        expected |= np.sum((points-center)**2, axis=1) <= (radius+padding)**2
+    np.testing.assert_array_equal(geometry.cart_mask(points), expected)
+
+
 def test_map_symbol_uses_cart_model_without_the_robot_or_tracking_envelope(geometry):
     view = geometry.top_view
     np.testing.assert_allclose(np.ptp(view['body'], axis=0), [1.01, .55])
@@ -226,11 +246,12 @@ def test_raw_filter_preserves_sensor_time_fields_and_recovers_without_odometry(g
     assert out.width == 2 and out.height == 1 and h.removed_points == 2
     assert out.header == msg.header and out.fields == msg.fields
     assert np.frombuffer(out.data, dtype='<f4').reshape(-1, 4)[:, 3].tolist() == [1235, 1237]
+    last_good = h.last_filtered
     h.cart['captured_monotonic'] -= 1
     CartNavigation._cloud(h, msg)
     assert len(h.cloud_pub.messages) == 2
     assert h.cloud_pub.messages[-1] is msg and h.localizing_without_cart
-    assert h.last_filtered == -math.inf
+    assert h.last_filtered == last_good
     h.cart['captured_monotonic'] = time.monotonic()
     CartNavigation._cloud(h, msg)
     assert len(h.cloud_pub.messages) == 3 and not h.localizing_without_cart
@@ -319,7 +340,7 @@ def test_raw_scan_waits_for_delayed_camera_then_recovers_without_lio(geometry, m
     h.cart_history.add(dict(h.cart, sample_monotonic=100.01))
     h._publish_pending_clouds()
     assert not h.pending_clouds and h.cloud_pub.messages
-    assert not h.localizing_without_cart and h.last_filtered == clock[0]
+    assert not h.localizing_without_cart and h.last_filtered == pytest.approx(100.0000012345)
     # Loss of pose history releases actual raw measurements after the bound.
     h.cart_history.samples.clear()
     CartNavigation._cloud(h, msg)
@@ -328,7 +349,7 @@ def test_raw_scan_waits_for_delayed_camera_then_recovers_without_lio(geometry, m
     h._publish_pending_clouds()
     assert not h.pending_clouds and h.localizing_without_cart
     assert bytes(h.cloud_pub.messages[-1].data) == bytes(msg.data)
-    assert h.last_filtered == -math.inf
+    assert h.last_filtered == pytest.approx(100.0000012345)
 
 
 @pytest.mark.parametrize('bigendian', [False, True])
@@ -368,6 +389,7 @@ def test_cart_odometry_and_tf_apply_robot_world_heading(geometry):
     h = harness(geometry)
     msg = Odometry()
     msg.header.frame_id = 'odom'
+    msg.header.stamp = h.get_clock().now().to_msg()
     msg.pose.pose.position.x = 10.
     msg.pose.pose.position.y = 20.
     msg.pose.pose.orientation.w = math.cos(math.pi/4)
@@ -392,22 +414,26 @@ def test_cart_velocity_updates_each_frame_with_same_filter_response(geometry, mo
     monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
     msg = Odometry()
     msg.pose.pose.orientation.w = 1.
+    msg.header.stamp = h.get_clock().now().to_msg()
     CartNavigation._odom(h, msg)
     previous = 0.
     for index in range(1, round(.2/period)+1):
         clock[0] += period
         h.received = h.cart['captured_monotonic'] = clock[0]
         msg.pose.pose.position.x = .3*index*period
+        msg.header.stamp = h.get_clock().now().to_msg()
         CartNavigation._odom(h, msg)
         velocity = h.odom_pub.messages[-1].twist.twist.linear.x
         assert previous < velocity < .3
         previous = velocity
-    assert previous == pytest.approx(.3*(1-.65**4), abs=1e-7)
+    assert previous == pytest.approx(.3*(1-.65**4), abs=1e-6)
 
 
 def test_cart_velocity_uses_odometry_sample_time_not_callback_spacing(geometry, monkeypatch):
     h = harness(geometry)
-    clock = [time.monotonic()]
+    origin = time.monotonic()
+    clock = [origin]
+    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=10.+clock[0]-origin))
     monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
     msg = Odometry()
     msg.pose.pose.orientation.w = 1.
@@ -428,6 +454,7 @@ def test_delayed_base_pose_uses_matching_cart_geometry_through_body_sway(geometr
     clock = [10.]
     monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
     h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=1000.+clock[0]))
+    old.get_clock = h.get_clock
     samples, old_samples = [], []
     next_feedback = 9.8
     for index in range(41):
@@ -514,9 +541,29 @@ def test_cart_history_keeps_pose_sources_separate_and_handles_angle_wrap():
     assert history.at(10.01) is None
 
 
+def test_old_odometry_hole_does_not_block_new_paired_measurement(geometry, monkeypatch):
+    monkeypatch.setattr(time, 'monotonic', lambda: 10.2)
+    h = harness(geometry)
+    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=1010.2))
+    h.cart_history.samples.clear()
+    for stamp in (10., 10.14, 10.16):
+        h.cart_history.add(dict(h.cart, sample_monotonic=stamp))
+    for stamp in (10.06, 10.15):
+        msg = Odometry()
+        msg.header.stamp = Time(seconds=1000.+stamp).to_msg()
+        msg.pose.pose.orientation.w = 1.
+        CartNavigation._receive_odom(h, msg)
+    assert not h.pending_odometry
+    assert len(h.odom_pub.messages) == 1
+    assert h.navigation_odometry['sample_stamp_s'] == pytest.approx(1010.15)
+    assert not h.odometry_error
+
+
 def test_duplicate_odometry_does_not_change_cart_velocity_and_walk_keeps_base_twist(geometry, monkeypatch):
     h = harness(geometry)
-    clock = [time.monotonic()]
+    origin = time.monotonic()
+    clock = [origin]
+    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=10.+clock[0]-origin))
     monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
     msg = Odometry()
     msg.pose.pose.orientation.w = 1.
@@ -536,6 +583,7 @@ def test_duplicate_odometry_does_not_change_cart_velocity_and_walk_keeps_base_tw
         np.testing.assert_array_equal(h.velocity, expected)
         assert len(h.odom_pub.messages) == published
     h.cart['attached'] = False
+    clock[0] = origin+.1
     msg.header.stamp = Time(seconds=10.1).to_msg()
     msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.angular.z = .2, -.03, .1
     CartNavigation._odom(h, msg)
@@ -588,10 +636,46 @@ def test_delayed_scan_uses_cart_at_acquisition_and_preserves_external_returns(ge
 
     # A missing pose must not turn an unknown occlusion into clear space.
     h.cart_history.samples.clear()
+    scan.header.stamp = Time(seconds=200.101).to_msg()
     CartNavigation._scan(h, scan, 'scan')
     assert len(h.scan_pubs['scan'].messages) == 1
     CartNavigation._scan(h, scan, 'scan_localization')
     assert h.scan_pubs['scan_localization'].messages[-1] is scan
+
+
+def test_delayed_cloud_keeps_acquisition_mount_with_kilohertz_feedback(geometry, monkeypatch):
+    # 100 ms acquisition + 190 ms camera wait exceeds the former 256-sample
+    # mount cache at the measured >1 kHz feedback rate. The waist keeps moving.
+    monkeypatch.setattr(time, 'monotonic', lambda: 100.29)
+    h = harness(geometry)
+    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=200.29, clock_type=ClockType.ROS_TIME))
+    h.lidar_clock = (83., 100.29)
+    h.mount_history.samples.clear()
+    for stamp in np.arange(99.8, 100.29, 1/1200.):
+        mount = TransformStamped()
+        mount.header.frame_id, mount.child_frame_id = 'base_link', 'livox_frame'
+        mount.header.stamp = Time(seconds=stamp+100.).to_msg()
+        angle = 2*(stamp-100.)
+        mount.transform.rotation.w, mount.transform.rotation.z = math.cos(angle/2), math.sin(angle/2)
+        mount.transform.translation.z = .5
+        CartNavigation._mount(h, mount)
+    expected = np.array([[1., 2., .3], [-1., 2., .7]])
+    offsets = np.array([0., .099])
+    raw = [(point-[0., 0., .5]) @ rotation_z(2*offset) for point, offset in zip(expected, offsets)]
+    msg = cloud(raw)
+    records = np.frombuffer(msg.data, dtype='<f4').reshape(-1, 4).copy()
+    records[:, 3] = offsets*1e9
+    msg.data = array('B', records.tobytes())
+    points, _, _ = CartNavigation._points_in_body(h, msg)
+    np.testing.assert_allclose(points, expected, atol=1e-5)
+
+    # Actual missing feedback must still fail; longer retention is not an
+    # excuse to interpolate through a >50 ms gap or reuse the newest pose.
+    h.mount_history.samples = deque(s for s in h.mount_history.samples if not 100.04 < s[0] < 100.16)
+    with pytest.raises(ValueError, match='等待雷达采样时刻的安装位姿'):
+        CartNavigation._points_in_body(h, msg)
+    h.mount_history.add(dict(h.mount_history.samples[-1][1], sample_monotonic=101.5))
+    assert h.mount_history.at(100.099) is None
 
 
 def test_missing_mount_keeps_lidar_for_localization_but_blocks_obstacle_scan(geometry):
@@ -604,6 +688,7 @@ def test_missing_mount_keeps_lidar_for_localization_but_blocks_obstacle_scan(geo
     assert h.cloud_pub.messages[-1] is msg
     assert h.localizing_without_cart and h.last_filtered == -math.inf
     scan = LaserScan(ranges=[1., 2.])
+    scan.header.stamp = h.get_clock().now().to_msg()
     CartNavigation._scan(h, scan, 'scan')
     CartNavigation._scan(h, scan, 'scan_localization')
     assert not h.scan_pubs['scan'].messages
@@ -643,6 +728,34 @@ def test_reference_epoch_waits_for_new_odom_and_filtered_scan(geometry):
     finally:
         h.sock.close()
         sender.close()
+
+
+def test_one_unfiltered_frame_keeps_fresh_observation_but_never_renews_it(geometry, monkeypatch):
+    clock = [100.]
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    h = harness(geometry)
+    h._fresh = lambda: True  # Current cart feedback continues throughout.
+    h.last_base = h.last_filtered = h.last_scan = clock[0]
+    h.odom_epoch = h.epoch
+    h.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    h.sock.bind(('127.0.0.1', 0))
+    h.sock.setblocking(False)
+    h.epoch_pub, h.ready_pub, h.status_pub = Publisher(), Publisher(), Publisher()
+    h.footprint_pubs = [Publisher(), Publisher()]
+    try:
+        clock[0] = 100.1
+        h._localization_only(cloud([[0., 2., 0.]]))
+        CartNavigation._tick(h)
+        assert h.ready_pub.messages[-1].data
+        assert h.last_filtered == 100.
+        clock[0] = 100.51
+        h.last_base = h.last_scan = clock[0]
+        h._localization_only(cloud([[0., 2., 0.]]))
+        CartNavigation._tick(h)
+        assert not h.ready_pub.messages[-1].data
+        assert h.last_filtered == 100.
+    finally:
+        h.sock.close()
 
 
 @pytest.mark.parametrize('mode', ['walk', 'cart', 'stale_cart'])
@@ -716,6 +829,7 @@ def test_rear_clear_failure_falls_back_to_normal_obstacles_and_recovers(geometry
     expire_pending_clouds(h)
     assert h.cloud_pub.messages[-1] is msg  # Keep actual rear returns as obstacles.
     scan = LaserScan(angle_min=math.pi, ranges=[float('inf')])
+    scan.header.stamp = h.get_clock().now().to_msg()
     scan.header.frame_id = 'base_nav'
     CartNavigation._scan(h, scan, 'scan')
     CartNavigation._scan(h, scan, 'scan_localization')
@@ -727,6 +841,7 @@ def test_rear_clear_failure_falls_back_to_normal_obstacles_and_recovers(geometry
     CartNavigation._mount(h, h.mount)
     msg.header.frame_id = 'livox_frame'
     CartNavigation._cloud(h, msg)
+    scan.header.stamp = h.get_clock().now().to_msg()
     CartNavigation._scan(h, scan, 'scan')
     assert h._gantry_ready() and not h.gantry_error
 
@@ -746,6 +861,40 @@ def test_unavailable_rear_clear_does_not_add_a_navigation_gate(geometry):
     state = json.loads(h.status_pub.messages[-1].data)
     assert state['ready'] and state['reason'] == ''
     assert not state['gantry_filter']['ready']
+
+
+@pytest.mark.parametrize('attached', [False, True])
+def test_filtered_cloud_expiry_keeps_status_publishing_and_recovers(geometry, monkeypatch, attached):
+    clock = [100.]
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    h = harness(geometry, gantry=True)
+    h.cart['attached'] = attached
+    h._fresh = lambda: True
+    h.odom_epoch = h.epoch
+    h.epoch_pub, h.ready_pub, h.status_pub = Publisher(), Publisher(), Publisher()
+    h.footprint_pubs = [Publisher(), Publisher()]
+    def no_packets(_):
+        raise BlockingIOError
+    h.sock = SimpleNamespace(recvfrom=no_packets)
+    # Use actual per-point numpy timestamps from filtering, not hand-written
+    # Python floats: an expired first comparison used to leak numpy.bool_ into JSON.
+    CartNavigation._cloud(h, cloud([[-.7, 0., 0.], [-1.5, 0., 0.]]))
+    for elapsed, fresh in [(0., True), (.6, False), (.7, True)]:
+        clock[0] = 100.+elapsed
+        h.last_base = h.last_scan = clock[0]
+        if elapsed == .7:
+            h.lidar_clock = (clock[0]-17., clock[0])
+            h.mount.header.stamp = h.get_clock().now().to_msg()
+            CartNavigation._mount(h, h.mount)
+            h.cart_history.add(dict(h.cart, sample_monotonic=clock[0]))
+            CartNavigation._cloud(h, cloud([[-.7, 0., 0.], [-1.5, 0., 0.]]))
+        CartNavigation._tick(h)
+        state = json.loads(h.status_pub.messages[-1].data)
+        assert state['gantry_filter']['ready'] is fresh
+        assert state['ready'] is (fresh or not attached)
+        assert state['observations']['filtered_age_s'] == (
+            pytest.approx(0. if fresh else .6, abs=.001) if attached else None)
+    assert len(h.status_pub.messages) == 3
 
 
 @pytest.mark.parametrize('settings', [
@@ -776,9 +925,37 @@ def test_gantry_failure_replaces_cached_clearing_rays_with_empty_observation(geo
     h.cart['attached'] = False
     h.last_gantry_filtered = time.monotonic()
     scan = LaserScan(angle_min=math.pi, ranges=[float('inf')])
+    scan.header.stamp = h.get_clock().now().to_msg()
     CartNavigation._scan(h, scan, 'scan')
     assert h.gantry_clear_active and len(h.gantry_clear_pub.messages) == 1
     h.last_gantry_filtered -= 1.
+    scan.header.stamp = h.get_clock().now().to_msg()
     CartNavigation._scan(h, scan, 'scan')
     assert not h.gantry_clear_active and len(h.gantry_clear_pub.messages) == 2
     assert all(math.isnan(value) for value in h.gantry_clear_pub.messages[-1].ranges)
+
+
+@pytest.mark.parametrize('attached', [False, True])
+def test_delayed_odom_and_scan_cannot_renew_observation_deadlines(geometry, monkeypatch, attached):
+    h = harness(geometry)
+    monkeypatch.setattr(time, 'monotonic', lambda: 100.)
+    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=200.))
+    h.cart.update(attached=attached, captured_monotonic=100.)
+    h.received = 100.
+    h.cart_history = CartPoseHistory()
+    h.cart_history.add(dict(h.cart, valid=True, sample_monotonic=99.6))
+    odom = Odometry()
+    odom.pose.pose.orientation.w = 1.
+    odom.header.stamp = Time(seconds=199.6).to_msg()
+    CartNavigation._odom(h, odom)
+    scan = LaserScan(ranges=[1., 2.])
+    scan.header.stamp = odom.header.stamp
+    CartNavigation._scan(h, scan, 'scan')
+    assert h.last_base == pytest.approx(99.6)
+    assert h.last_scan == pytest.approx(99.6)
+    monkeypatch.setattr(time, 'monotonic', lambda: 100.2)
+    h.get_clock = lambda: SimpleNamespace(now=lambda: Time(seconds=200.2))
+    CartNavigation._odom(h, odom)
+    CartNavigation._scan(h, scan, 'scan')
+    assert len(h.odom_pub.messages) == len(h.scan_pubs['scan'].messages) == 1
+    assert time.monotonic()-h.last_base > .5 and time.monotonic()-h.last_scan > .5

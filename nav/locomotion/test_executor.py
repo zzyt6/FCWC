@@ -93,7 +93,7 @@ class ExecutorTests(unittest.TestCase):
         return data['velocity'].copy()
 
     def send_request(self, code, payload, sequence):
-        packet = REQUEST_PACKET.pack(REQUEST_MAGIC, REQUEST_VERSION, code, payload, sequence)
+        packet = REQUEST_PACKET.pack(REQUEST_MAGIC, REQUEST_VERSION, code, payload, sequence, round(self.now*1e9))
         self.sender.sendto(packet, ('127.0.0.1', self.port))
 
     def waiting_to_prepare(self):
@@ -286,6 +286,68 @@ class ExecutorTests(unittest.TestCase):
         data = self.tick()
         self.assertEqual(data['stage'], 'DAMPED')
         np.testing.assert_array_equal(data['velocity'], 0)
+
+    def test_heading_recovery_closes_navigation_readiness_but_keeps_policy_running(self):
+        self.moving()
+        self.now += .12
+        data = self.tick()
+        self.assertTrue(data['heading']['motion_blocked'])
+        self.executor.step()
+        reports = []
+        while True:
+            try:
+                reports.append(json.loads(self.status.recv(65535)))
+            except BlockingIOError:
+                break
+        self.assertEqual(reports[-1]['stage'], 'POLICY')
+        self.assertFalse(reports[-1]['ready'])
+        self.assertIn('站立策略继续', reports[-1]['reason'])
+        self.assertIn('policy_hz', reports[-1]['timing'])
+        previous = self.control.policy_steps
+        for _ in range(80):data = self.tick()
+        self.assertEqual(data['stage'], 'POLICY')
+        self.assertEqual(data['selected_model'], 'balance')
+        self.assertGreater(self.control.policy_steps, previous+50)
+        np.testing.assert_array_equal(data['velocity'], 0)
+
+    def test_udp_burst_uses_newest_command_in_one_tick(self):
+        for index in range(180):
+            packet = VELOCITY_PACKET.pack(VELOCITY_MAGIC, VELOCITY_VERSION, 1, COMMAND,
+                                         index+1000, index*.001, 0., 0., self.executor.navigation_epoch,
+                                         round((self.now-.1+index*.0005)*1e9))
+            self.sender.sendto(packet, ('127.0.0.1', self.port))
+        self.executor.step()
+        self.assertAlmostEqual(float(self.executor.target[0]), .179, places=6)
+        self.assertAlmostEqual(self.executor.last_motion, self.now-.0105)
+
+    def test_reordered_gate_packet_cannot_erase_newer_velocity(self):
+        self.tick((.2, 0., 0.))
+        packet = VELOCITY_PACKET.pack(VELOCITY_MAGIC, VELOCITY_VERSION, 0, GATE_CLOSED,
+                                     self.sequence-1, 0., 0., 0., self.executor.navigation_epoch,
+                                     round((self.now-.03)*1e9))
+        self.sender.sendto(packet, ('127.0.0.1', self.port))
+        self.executor.step()
+        self.assertTrue(self.executor.enabled)
+
+    def test_expired_operator_request_cannot_change_prepare_pose(self):
+        self.waiting_to_prepare()
+        packet = REQUEST_PACKET.pack(REQUEST_MAGIC, REQUEST_VERSION, 7, 1, 100,
+                                     round((self.now-.6)*1e9))
+        self.sender.sendto(packet, ('127.0.0.1', self.port))
+        data = self.tick()
+        self.assertEqual(data['prepare_pose'], 'original')
+        self.assertEqual(self.executor.rejected, 1)
+
+    def test_frozen_controller_snapshot_cannot_report_navigation_ready(self):
+        self.now += .3
+        self.executor.step()
+        while True:
+            try:
+                report = json.loads(self.status.recv(65535))
+            except BlockingIOError:
+                break
+        self.assertFalse(report['ready'])
+        self.assertGreater(report['feedback_age_s'], .25)
 
     def test_warning_formatter_failure_cannot_stop_the_body_controller(self):
         self.moving()

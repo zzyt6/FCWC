@@ -1,17 +1,17 @@
-Start testing: Oct 19 21:16 CST
+Start testing: Oct 20 02:45 CST
 ----------------------------------------------------------
 1/5 Testing: command_trace
 1/5 Test: command_trace
 Command: "/home/unitree/CWC/G1Deploy_BalanceHomie/build/test_command_trace"
 Directory: /home/unitree/CWC/G1Deploy_BalanceHomie/build
-"command_trace" start time: Oct 19 21:16 CST
+"command_trace" start time: Oct 20 02:45 CST
 Output:
 ----------------------------------------------------------
 <end of output>
 Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"command_trace" end time: Oct 19 21:16 CST
+"command_trace" end time: Oct 20 02:45 CST
 "command_trace" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -19,7 +19,7 @@ Test Passed.
 2/5 Test: control_core
 Command: "/home/unitree/CWC/G1Deploy_BalanceHomie/build/test_control_core"
 Directory: /home/unitree/CWC/G1Deploy_BalanceHomie/build
-"control_core" start time: Oct 19 21:16 CST
+"control_core" start time: Oct 20 02:45 CST
 Output:
 ----------------------------------------------------------
 Control-core preparation, position warnings, local effort limits and push-cart upper PD passed
@@ -27,7 +27,7 @@ Control-core preparation, position warnings, local effort limits and push-cart u
 Test time =   0.09 sec
 ----------------------------------------------------------
 Test Passed.
-"control_core" end time: Oct 19 21:16 CST
+"control_core" end time: Oct 20 02:45 CST
 "control_core" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -35,7 +35,7 @@ Test Passed.
 3/5 Test: hand_core
 Command: "/home/unitree/CWC/G1Deploy_BalanceHomie/build/test_hand_core"
 Directory: /home/unitree/CWC/G1Deploy_BalanceHomie/build
-"hand_core" start time: Oct 19 21:16 CST
+"hand_core" start time: Oct 20 02:45 CST
 Output:
 ----------------------------------------------------------
 Dex3 primary/legacy state topics, mixed sources and health gates passed
@@ -45,7 +45,7 @@ Compensated zero/grasp, no accumulation, target limits, original targets and sto
 Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"hand_core" end time: Oct 19 21:16 CST
+"hand_core" end time: Oct 20 02:45 CST
 "hand_core" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -53,14 +53,14 @@ Test Passed.
 4/5 Test: hand_recovery
 Command: "/home/unitree/CWC/G1Deploy_BalanceHomie/build/test_hand_recovery"
 Directory: /home/unitree/CWC/G1Deploy_BalanceHomie/build
-"hand_recovery" start time: Oct 19 21:16 CST
+"hand_recovery" start time: Oct 20 02:45 CST
 Output:
 ----------------------------------------------------------
 <end of output>
 Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"hand_recovery" end time: Oct 19 21:16 CST
+"hand_recovery" end time: Oct 20 02:45 CST
 "hand_recovery" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -68,7 +68,7 @@ Test Passed.
 5/5 Test: hand_dds
 Command: "/home/unitree/CWC/G1Deploy_BalanceHomie/build/test_hand_dds"
 Directory: /home/unitree/CWC/G1Deploy_BalanceHomie/build
-"hand_dds" start time: Oct 19 21:16 CST
+"hand_dds" start time: Oct 20 02:45 CST
 Output:
 ----------------------------------------------------------
 Configured Dex3 SDK commands, recovery isolation and fixed stop damping passed
@@ -77,8 +77,8 @@ Dex3 robot XCDR1 layout and discovery type identifier passed
 Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"hand_dds" end time: Oct 19 21:16 CST
+"hand_dds" end time: Oct 20 02:45 CST
 "hand_dds" time elapsed: 00:00:00
 ----------------------------------------------------------
 
-End testing: Oct 19 21:16 CST
+End testing: Oct 20 02:45 CST

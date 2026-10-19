@@ -176,6 +176,10 @@ class Controller:
             self.backend.process.terminate()
         self.record_event(type='damping', reason=reason, stage=self.stage)
         self._publish_stopped()
+        if fault:
+            # Navigation normally runs without SessionRecorder. Preserve the
+            # exact fault in launch.log as well as the transient web status.
+            print('CONTROL FAULT: ' + reason, flush=True)
 
     def _publish_stopped(self):
         with self.lock:
@@ -804,9 +808,20 @@ class Controller:
                    and (live_command or self.zeroing),
             omega=state.omega, sample_key=(state.session, state.sequence),
             received_time=state.received_ns*1e-9, control_time=now_motion,
+            feedback_times=getattr(self.backend, 'feedback_times', ()),
             raw_command=raw_command,
             command_source=command_source,
             smooth_zero=self.zeroing)
+        timing_reason = '航向反馈正在重新对齐；速度归零，站立策略继续'
+        if heading['motion_blocked']:
+            self.web.zero()
+            self.commands.value.fill(0)
+            raw_command.fill(0)
+            live_command = False
+            self.zeroing = heading['decelerating']
+            self.reason = timing_reason
+        elif self.reason == timing_reason:
+            self.reason = ''
         if self.zeroing and not heading['decelerating']:
             self.zeroing = False
             self.record_event(type='smooth_zero_completed')

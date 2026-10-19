@@ -84,6 +84,9 @@ def gate(monkeypatch):
                     def reference(self, **values):
                         reference_state.update(values)
 
+                    def suspend(self, suspended):
+                        process.send_signal(signal.SIGSTOP if suspended else signal.SIGCONT)
+
                     def velocity(self, vx=.4, vy=0., wz=0.):
                         command = Twist()
                         command.linear.x = vx
@@ -109,6 +112,7 @@ def gate(monkeypatch):
                 yield result
             finally:
                 if process is not None and process.poll() is None:
+                    process.send_signal(signal.SIGCONT)
                     process.send_signal(signal.SIGINT)
                     try:
                         process.wait(timeout=5.)
@@ -225,6 +229,7 @@ def test_sustained_reference_loss_latches_closed_despite_late_renewals(gate):
     gate.pump(.05)
     gate.velocity()
     gate.wait(lambda items: any(p[2] for p in items))
+
     gate.reference(ready=False)
     deadline = time.monotonic()+.8
     while time.monotonic() < deadline:
@@ -243,3 +248,34 @@ def test_sustained_reference_loss_latches_closed_despite_late_renewals(gate):
     gate.pump(.05)
     gate.velocity()
     gate.wait(lambda items: any(p[2] for p in items))
+
+
+def test_delayed_dds_velocity_keeps_publication_age(gate):
+    gate.enable(True)
+    gate.pump(.06)
+    gate.suspend(True)
+    try:
+        gate.velocity(.5)
+        gate.pump(.28)  # Beyond the 250 ms command deadline, still within the gate lease.
+        gate.enable(True)
+    finally:
+        gate.suspend(False)
+    packets = gate.pump(.07)
+    assert packets and all(not p[2] for p in packets)
+    gate.velocity(.2)
+    packets = gate.wait(lambda items: any(p[2] for p in items))
+    assert [p for p in packets if p[2]][-1][5] == pytest.approx(.2)
+
+
+def test_delayed_authorization_cannot_reopen_gate(gate):
+    gate.suspend(True)
+    try:
+        gate.enable(True)
+        gate.pump(.5)
+    finally:
+        gate.suspend(False)
+    gate.pump(.1)
+    for _ in range(3):
+        gate.velocity(.3)
+        assert all(not p[2] for p in gate.pump(.04))
+    assert gate.acknowledged[-1] is False

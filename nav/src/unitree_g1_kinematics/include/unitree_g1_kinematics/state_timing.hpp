@@ -19,8 +19,17 @@ public:
   void observe(double sensor, double received)
   {
     if (!std::isfinite(sensor) || !std::isfinite(received)) {return;}
+    if (!samples_.empty() && sensor == last_sensor_) return;
+    if (!samples_.empty() && sensor < last_sensor_) {
+      // A delayed/duplicated IMU packet cannot redefine the sensor epoch.
+      // A real clock restart may establish a new epoch after the old one expires.
+      if (received-samples_.back().first <= .3) return;
+    }
+    if (!samples_.empty() && sensor > last_sensor_ && received-sensor-offset_ > 1.0) {
+      return; // A large positive transport delay is not a new sensor epoch.
+    }
     if (!samples_.empty() && (sensor < last_sensor_ || received < samples_.back().first ||
-      std::abs((received - sensor) - offset_) > 1.0))
+      (received - sensor) - offset_ < -1.0))
     {
       samples_.clear();
     }

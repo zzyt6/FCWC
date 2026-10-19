@@ -7,15 +7,16 @@ lifecycle requests (acquire / prepare / start policy / zero / stop / reset)
 are sent to the same loopback port that receives velocity packets.
 """
 import json
+import math
 import socket
 import struct
 import threading
 import time
 
 # Must match REQUEST_PACKET in nav/locomotion/g1_locomotion_executor.py.
-REQUEST_PACKET = struct.Struct("<IHBBQ")
+REQUEST_PACKET = struct.Struct("<IHBBQQ")
 REQUEST_MAGIC = 0x47314C52
-REQUEST_VERSION = 1
+REQUEST_VERSION = 2
 REQUEST_CODES = {
     "acquire": 1,
     "prepare": 2,
@@ -138,26 +139,40 @@ class LocomotionLink:
                 continue
             if not isinstance(status, dict) or status.get("magic") != STATUS_MAGIC:
                 continue
-            with self.lock:
-                self.status = status
-                self.received = self.clock()
+            self._accept_status(status)
+
+    def _accept_status(self, status):
+        stamp = status.get("sent_monotonic")
+        if (type(stamp) not in (int, float) or not math.isfinite(stamp)
+                or not 0 <= self.clock()-stamp <= STATUS_MAX_AGE_S):
+            return False
+        with self.lock:
+            if stamp <= self.received:
+                return False
+            self.status = status
+            # Loopback transport must not give an old report a new lease.
+            self.received = stamp
+        return True
 
     def snapshot(self):
-        now = self.clock()
         with self.lock:
             status = dict(self.status)
-            age = now - self.received
+            received = self.received
+        age = self.clock() - received
         online = 0.0 <= age <= STATUS_MAX_AGE_S
+        feedback_age = status.get("feedback_age_s")
+        feedback_fresh = (feedback_age is None or
+                          0 <= feedback_age+age <= status.get("feedback_timeout_s", .1))
         stage = status.get("stage") if online else None
         result = {
             "online": online,
-            "age_s": None if self.received < 0 else round(age, 3),
-            "ready": bool(online and status.get("ready")),
+            "age_s": None if received < 0 else round(age, 3),
+            "ready": bool(online and feedback_fresh and status.get("ready")),
             "stage": stage,
             "stage_text": STAGE_TEXT.get(stage, "运控执行进程未连接")
             if online
             else "运控执行进程未连接",
-            "healthy": bool(online and status.get("healthy")),
+            "healthy": bool(online and feedback_fresh and status.get("healthy")),
             "armed": bool(online and status.get("armed")),
             "owned": bool(online and status.get("owned")),
             "mode": status.get("mode") if online else None,
@@ -184,6 +199,7 @@ class LocomotionLink:
             "nav_target": status.get("nav_target") if online else None,
             "nav_command_fresh": bool(online and status.get("nav_command_fresh")),
             "heading": status.get("heading") if online else None,
+            "timing": status.get("timing", {}) if online else {},
             "high_policy": status.get("high_policy", {}) if online else {},
             "hands": status.get("hands", {}) if online else {},
             "cart": status.get("cart", {}) if online else {},
@@ -221,7 +237,8 @@ class LocomotionLink:
             self.sequence += 1
             sequence = self.sequence
             packet = REQUEST_PACKET.pack(
-                REQUEST_MAGIC, REQUEST_VERSION, REQUEST_CODES[kind], payload, sequence
+                REQUEST_MAGIC, REQUEST_VERSION, REQUEST_CODES[kind], payload, sequence,
+                round(self.clock()*1e9)
             )
             self.sender.sendto(packet, self.destination)
 

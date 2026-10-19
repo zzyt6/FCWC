@@ -129,14 +129,31 @@ class CartPoseHistory:
         while self.samples and stamp-self.samples[0][0] > 1.:
             self.samples.popleft()
 
-    def at(self, stamp):
+    def _bracket(self, stamp):
         before = after = None
-        for sample in self.samples:
+        # Pose reception may append while NumPy releases the GIL below.
+        for sample in tuple(self.samples):
             if sample[0] <= stamp:
                 before = sample
             if sample[0] >= stamp:
                 after = sample
                 break
+        return before, after
+
+    def can_at(self, stamp):
+        before, after = self._bracket(stamp)
+        if before and after and after[0]-before[0] <= self.max_gap:
+            return True
+        nearest = before or after
+        return nearest is not None and abs(nearest[0]-stamp) <= .01
+
+    def can_wait(self, stamp):
+        # add() accepts increasing acquisition times only. A hole behind the
+        # latest sample cannot be filled by waiting for later packets.
+        return not self.samples or stamp > self.samples[-1][0]
+
+    def at(self, stamp):
+        before, after = self._bracket(stamp)
         if before and after and after[0]-before[0] <= self.max_gap:
             fraction = (stamp-before[0])/(after[0]-before[0]) if after[0] > before[0] else 0.
             a, b = before[1], after[1]
@@ -304,6 +321,15 @@ class CartGeometry:
                 center = origin(joint.find('origin'))[:3, 3].copy()
                 center[2] -= .02
                 self.spheres.append((center, .10))
+        padding = self.settings['self_filter_padding_m']
+        bounds = []
+        for transform, half in self.boxes:
+            extent = np.abs(transform[:3, :3]) @ (half+padding)
+            bounds.append((transform[:3, 3]-extent, transform[:3, 3]+extent))
+        bounds.extend((center-radius-padding, center+radius+padding)
+                      for center, radius in self.spheres)
+        self.filter_min = np.min([low for low, _ in bounds], axis=0)-1e-9
+        self.filter_max = np.max([high for _, high in bounds], axis=0)+1e-9
         points = []
         for transform, half in self.boxes:
             for x in (-half[0], half[0]):
@@ -389,6 +415,15 @@ class CartGeometry:
 
     def cart_mask(self, points):
         """Filter all returns together after acquisition-time transforms."""
+        points = np.asarray(points)
+        result = np.zeros(len(points), dtype=bool)
+        # Most lidar returns are far from the cart. The enclosing box is only
+        # a cheap rejection test; the actual mask still uses every model part.
+        candidates = np.flatnonzero(np.all((points >= self.filter_min)
+                                          & (points <= self.filter_max), axis=1))
+        if not len(candidates):
+            return result
+        points = points[candidates]
         inside = np.zeros(len(points), dtype=bool)
         padding = self.settings['self_filter_padding_m']
         for transform, half in self.boxes:
@@ -396,7 +431,8 @@ class CartGeometry:
             inside |= np.all(np.abs(local) <= half+padding, axis=1)
         for center, radius in self.spheres:
             inside |= np.sum((points-center)**2, axis=1) <= (radius+padding)**2
-        return inside
+        result[candidates] = inside
+        return result
 
     def occluded_ranges(self, angles, ranges, pose):
         """2-D cart occlusion: preserve nearer hits; never ray-clear behind the cart."""

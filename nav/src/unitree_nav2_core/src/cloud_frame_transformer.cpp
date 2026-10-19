@@ -24,7 +24,7 @@ public:
     publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       get_parameter("output_topic").as_string(), rclcpp::SensorDataQoS());
     subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      get_parameter("input_topic").as_string(), rclcpp::SensorDataQoS(),
+      get_parameter("input_topic").as_string(), rclcpp::SensorDataQoS().keep_last(1),
       std::bind(&CloudFrameTransformer::cloudCallback, this, std::placeholders::_1));
     timing_subscription_ = create_subscription<sensor_msgs::msg::TimeReference>(
       "/g1/lidar_time_reference", 20,
@@ -49,11 +49,18 @@ private:
     // The cloud and odometry come from the same FAST-LIO frame. Use that
     // frame's converted acquisition stamp and waist transform, even if DDS
     // delivers the cloud before its TF/time-reference messages.
-    while (!pending_.empty()) {
-      const auto & message = pending_.front().second;
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      const auto & message = it->second;
       bool published = false;
+      bool obsolete = false;
       for (const auto & timing : timings_) {
         if (timing.time_ref != message->header.stamp) {continue;}
+        const auto stamp = rclcpp::Time(timing.header.stamp);
+        const double age = (now()-stamp).seconds();
+        if (age > .5 || age < -.03 || stamp.nanoseconds() <= last_published_stamp_) {
+          obsolete = true;
+          break;
+        }
         try {
           const auto transform = buffer_.lookupTransform(
             target_frame_, message->header.frame_id, rclcpp::Time(timing.header.stamp));
@@ -62,6 +69,7 @@ private:
           output.header.frame_id = target_frame_;
           output.header.stamp = timing.header.stamp;
           publisher_->publish(output);
+          last_published_stamp_ = stamp.nanoseconds();
           published = true;
         } catch (const tf2::TransformException &) {
           // Wait without blocking reception of the matching TF.
@@ -69,17 +77,18 @@ private:
         break;
       }
       const bool expired = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - pending_.front().first).count() > .3;
-      if (!published && !expired) {break;}
+        std::chrono::steady_clock::now() - it->first).count() > .3;
+      if (!published && !expired && !obsolete) {++it; continue;}
       if (expired && !published) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
           "Point cloud dropped: missing transform/time reference at acquisition time");
       }
-      pending_.pop_front();
+      it = pending_.erase(it);
     }
   }
 
   std::string target_frame_;
+  int64_t last_published_stamp_ = 0;
   tf2_ros::Buffer buffer_;
   tf2_ros::TransformListener listener_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;

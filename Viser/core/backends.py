@@ -1,4 +1,5 @@
 """Own the deployment's C++ bridge; only explicit acquire starts --control."""
+from collections import deque
 import os
 import errno
 import socket
@@ -22,6 +23,9 @@ class Bridge:
         self.process = None
         self.state = None
         self.previous_state = None
+        # Keep the receive times of healthy packets drained between policy
+        # ticks, so a slow consumer is not mistaken for an IMU stream outage.
+        self.feedback_times = deque(maxlen=256)
         self.armed = False
         self.sequence = 0
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -43,6 +47,7 @@ class Bridge:
         self.stop_process()
         self.state = None
         self.previous_state = None
+        self.feedback_times.clear()
         self.sequence = 0
         while True:
             try:
@@ -80,6 +85,11 @@ class Bridge:
             if self.state is not None and state.session != self.state.session:
                 raise RuntimeError('控制桥接意外重启，请退出并重新启动')
             if self.state is None or state.sequence >= self.state.sequence:
+                if not state.flags & 1:
+                    self.feedback_times.clear()
+                elif (self.state is None or (state.sequence > self.state.sequence
+                                             and state.received_ns > self.state.received_ns)):
+                    self.feedback_times.append(state.received_ns * 1e-9)
                 if self.state is not None and state.received_ns > self.state.received_ns:
                     self.previous_state = self.state
                 self.state = state

@@ -242,6 +242,10 @@ def test_stock_nav2_footprint_and_mode_reset_preserve_external_obstacles(monkeyp
                            lambda: publish_scan([float('nan'), 1., .25]))
                 until_cost(lambda: cost(-.25, 0.) != 100 and cost(-.75, 0.) == 100
                            and cost(-1.5, 0.) == 100 and cost(0., 1.) == 100, clear_rear)
+                # A dead auxiliary publisher cannot keep clearing new hits
+                # forever with its last cached rays. Real scans keep arriving.
+                until_cost(lambda: cost(-.25, 0.) == 100,
+                           lambda: publish_scan([float('nan'), 1., .25]))
             finally:
                 if process is not None and process.poll() is None:
                     process.send_signal(signal.SIGINT)

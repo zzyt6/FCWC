@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -122,7 +123,7 @@ public:
         clock.source = "lidar_imu_clock";
         clock_pub_->publish(clock);
       });
-    mount_pub_ = create_publisher<geometry_msgs::msg::TransformStamped>("/g1/lidar_mount", 20);
+    mount_pub_ = create_publisher<geometry_msgs::msg::TransformStamped>("/g1/lidar_mount", 100);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         get_parameter("fastlio_odom_topic").as_string(), 20,
@@ -173,8 +174,11 @@ private:
   void receiveLowState()
   {
     unitree_g1_kinematics::LowStatePacket packet;
-    while (::recv(lowstate_socket_, &packet, sizeof(packet), 0) == sizeof(packet))
+    for (int count = 0; count < 512; ++count)
     {
+      const auto size = ::recv(lowstate_socket_, &packet, sizeof(packet), MSG_TRUNC);
+      if (size < 0) break;
+      if (size != sizeof(packet)) continue;
       if (packet.magic != unitree_g1_kinematics::kLowStatePacketMagic ||
           packet.version != unitree_g1_kinematics::kLowStatePacketVersion)
         continue;
@@ -184,6 +188,13 @@ private:
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (!joint_history_.add(packet)) continue;
       }
+      // Keep every joint sample for odometry, but bound the navigation-only
+      // mount stream to 200 Hz (the cloud filter uses 5 ms point groups).
+      // Raw LowState exceeds 1 kHz on some robots and can starve the Python
+      // filter's other callbacks. Selected samples retain their actual time.
+      if (last_mount_sample_ && packet.sample_monotonic - *last_mount_sample_ < .005)
+        continue;
+      last_mount_sample_ = packet.sample_monotonic;
       KinematicState state;
       state.q = packet.q;
       state.mode_machine = packet.mode_machine;
@@ -484,6 +495,7 @@ private:
   double previous_pose_time_ = 0.;
   unitree_g1_kinematics::SensorClock sensor_clock_;
   unitree_g1_kinematics::JointHistory joint_history_;
+  std::optional<double> last_mount_sample_;
 
   int lowstate_socket_ = -1;
   rclcpp::TimerBase::SharedPtr lowstate_timer_;

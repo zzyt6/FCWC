@@ -55,3 +55,20 @@ TEST(StateTiming, JointHistoryRejectsGapsAndModeChanges)
   EXPECT_FALSE(history.at(1.2));
   ASSERT_TRUE(history.at(1.21));
 }
+
+TEST(StateTiming, ReorderedImuCannotMakeOldDataFresh)
+{
+  SensorClock clock;
+  clock.observe(10., 100.);
+  clock.observe(10.1, 100.1);
+  clock.observe(9.95, 100.12);  // Late delivery must not move the offset by 170 ms.
+  EXPECT_NEAR(*clock.hostTime(10.05, 100.13), 100.05, 1e-9);
+  clock.observe(10.1, 100.35);  // Replayed data cannot renew the clock watchdog.
+  EXPECT_FALSE(clock.hostTime(10.1, 100.41));
+  clock.observe(10.1, 102.);  // Nor can replay be mistaken for a clock restart.
+  clock.observe(10.2, 102.);  // A newer but two-second-delayed packet is still old.
+  EXPECT_FALSE(clock.hostTime(10.2, 102.));
+  clock.observe(12.01, 102.01);
+  ASSERT_TRUE(clock.hostTime(12.01, 102.02));
+  EXPECT_NEAR(*clock.hostTime(12.01, 102.02), 102.01, 1e-9);
+}

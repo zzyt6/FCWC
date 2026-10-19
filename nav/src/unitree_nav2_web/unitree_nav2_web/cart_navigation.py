@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import socket
+import threading
 import time
 
 import numpy as np
@@ -18,6 +19,7 @@ import rclpy
 from geometry_msgs.msg import Point32, Polygon, TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan, PointCloud2, TimeReference
@@ -25,6 +27,7 @@ from std_msgs.msg import Bool, String, UInt32
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from .cart_geometry import CartGeometry, CartPoseHistory, GantryGeometry, load_settings, quaternion_matrix, rotation_z
+from .sample_timing import sample_time as acquisition_time
 
 
 class PosePending(ValueError):
@@ -97,13 +100,22 @@ class CartNavigation(Node):
         self.filter_error = ''
         self.scan_error = ''
         self.mount = None
-        self.mount_history = CartPoseHistory(max_gap=.05, max_samples=256)
+        # Retain the full one-second time window even with an older producer
+        # publishing >1 kHz. 256 samples covered only ~240 ms, less than a
+        # 100 ms scan plus the allowed 200 ms wait for camera geometry.
+        self.mount_history = CartPoseHistory(max_gap=.05, max_samples=None)
         self.lidar_clock = None
         self.pending_clouds = deque()
-        self.create_subscription(TransformStamped, '/g1/lidar_mount', self._mount, 20)
+        # The producer caps this stream at 200 Hz. Queue enough real samples
+        # to bridge a cloud callback without dropping the interpolation pairs.
+        # Receive pose/clock history while a cloud is being filtered. A deep
+        # queue alone cannot help if filtering starves the receive callbacks.
+        self.pose_node = Node('navigation_pose_receiver', context=self.context,
+                              use_global_arguments=False)
+        self.pose_node.create_subscription(TransformStamped, '/g1/lidar_mount', self._mount, 100)
         self.broadcaster = TransformBroadcaster(self)
         sensor = QoSProfile(depth=3, reliability=ReliabilityPolicy.BEST_EFFORT)
-        self.create_subscription(TimeReference, '/g1/lidar_clock', self._lidar_clock, sensor)
+        self.pose_node.create_subscription(TimeReference, '/g1/lidar_clock', self._lidar_clock, sensor)
         self.gantry_clear_pub = self.create_publisher(LaserScan, '/navigation/rear_clear', sensor)
         self.gantry_clear_scan = None
         if self.gantry.enabled:
@@ -175,12 +187,16 @@ class CartNavigation(Node):
         if not -.03 <= age <= .3:
             return
         sensor = message.time_ref.sec+message.time_ref.nanosec*1e-9
-        self.lidar_clock = (now-age-sensor, now)
+        if (self.lidar_clock is not None and sensor <= getattr(self, '_clock_sensor', -math.inf)
+                and now-self.lidar_clock[1] <= .3):
+            return
+        self._clock_sensor = sensor
+        self.lidar_clock = (now-age-sensor, now-age)
 
     def _gantry_ready(self):
         now = time.monotonic()
-        return not self.gantry.enabled or (now-self.last_gantry_filtered <= .5
-                                           and now-self.last_scan <= .5)
+        return bool(not self.gantry.enabled or (now-self.last_gantry_filtered <= .5
+                                               and now-self.last_scan <= .5))
 
     def _tick(self):
         now = time.monotonic()
@@ -194,7 +210,7 @@ class CartNavigation(Node):
                 stamp, cart = state['sent_monotonic'], state['cart']
                 epoch = cart['epoch']
                 if (sender[0] != '127.0.0.1' or state.get('magic') != 'G1LOCO1'
-                        or not 0 <= now-stamp <= .3 or stamp <= self.received
+                        or not 0 <= time.monotonic()-stamp <= .3 or stamp <= self.received
                         or type(epoch) is not int or not 0 < epoch <= 0xffffffff
                         or (epoch & 1) != int(bool(cart['attached']))):
                     continue
@@ -208,6 +224,7 @@ class CartNavigation(Node):
                 continue
         self._publish_pending_clouds()
         self._publish_pending_odometry()
+        now = time.monotonic()
         attached = bool(self.cart.get('attached'))
         fresh = self._fresh()
         if self.gantry_clear_active and (not fresh or not self._gantry_ready()
@@ -271,11 +288,18 @@ class CartNavigation(Node):
                 cart = self.cart_history.at(sample_monotonic)
                 if cart is None:
                     self.odometry_error = '等待里程计测量时刻的小车位姿'
+                    if not self.cart_history.can_wait(sample_monotonic):
+                        self.pending_odometry.popleft()
+                        continue
                     break
             self.pending_odometry.popleft()
             self._odom(message, cart)
 
     def _odom(self, message, cart=None):
+        sampled = acquisition_time(self, message, .5)
+        if sampled is None:
+            self.odometry_error = '导航里程计测量时刻已过期或无效'
+            return
         cart = self.cart if cart is None else cart
         attached = bool(self.cart.get('attached'))
         if attached and not self._fresh():
@@ -357,14 +381,20 @@ class CartNavigation(Node):
                 transform.transform.rotation.w = math.cos(angle/2)
                 transform.transform.rotation.z = math.sin(angle/2)
                 self.broadcaster.sendTransform(transform)
-            self.last_base, self.odom_epoch = now, self.epoch
+            self.last_base, self.odom_epoch = sampled, self.epoch
             self.odometry_error = ''
         except (ValueError, KeyError, TypeError):
             return
 
     def _cloud(self, message):
-        self.last_raw = time.monotonic()
-        self.pending_clouds.append((self.last_raw, self.epoch, message))
+        received = time.monotonic()
+        if self.lidar_clock is not None and 0 <= received-self.lidar_clock[1] <= .3:
+            sampled = message.header.stamp.sec+message.header.stamp.nanosec*1e-9+self.lidar_clock[0]
+            if not -.03 <= received-sampled <= .5:
+                self.filter_error = '雷达采样时刻已过期或超前'
+                return
+            self.last_raw = sampled
+        self.pending_clouds.append((received, self.epoch, message))
         self._publish_pending_clouds()
 
     def _publish_pending_clouds(self):
@@ -387,6 +417,21 @@ class CartNavigation(Node):
     def _filter_cloud(self, message, wait=False):
         attached, fresh = self.cart.get('attached'), self._fresh()
         points = records = groups = None
+        if wait and attached and fresh:
+            # Camera geometry commonly trails the scan. Check it before
+            # repeatedly transforming thousands of points on each retry.
+            try:
+                _, _, groups = self._cloud_samples(message)
+                for _, stamp in groups:
+                    if not self.cart_history.can_at(stamp):
+                        if self.cart_history.can_wait(stamp):
+                            return False
+                        wait = False
+                        break
+            except PosePending:
+                return False
+            except (ValueError, KeyError, TypeError):
+                pass  # The regular filtering path reports malformed clouds.
         if self.gantry.enabled or (attached and fresh):
             try:
                 points, records, groups = self._points_in_body(message)
@@ -421,50 +466,67 @@ class CartNavigation(Node):
             if self.gantry.enabled:
                 keep &= ~self.gantry.self_mask(points)
                 self.gantry_removed_points = int((~keep).sum())
-                self.last_gantry_filtered, self.gantry_error = time.monotonic(), ''
+                self.last_gantry_filtered, self.gantry_error = min((stamp for _, stamp in groups), default=-math.inf), ''
             if cart_keep is not None:
                 self.removed_points = int((keep & ~cart_keep).sum())
                 keep &= cart_keep
             message = filtered_cloud(message, records, keep)
         if not attached or cart_keep is not None:
             if attached:
-                self.last_filtered, self.filter_error = time.monotonic(), ''
+                self.last_filtered, self.filter_error = min((stamp for _, stamp in groups), default=-math.inf), ''
             self.localizing_without_cart = False
             self.cloud_pub.publish(message)
         else:
             self._localization_only(message)
         return True
 
-    def _points_in_body(self, message):
+    def _cloud_samples(self, message):
         if message.header.frame_id != self.raw_frame:
             raise ValueError('雷达点云坐标系不匹配')
-        xyz, records = cloud_arrays(message)
         clock = self.lidar_clock
         now = time.monotonic()
         if clock is None or not 0 <= now-clock[1] <= .3:
             raise PosePending('等待雷达采样时钟')
-        field = next((f for f in message.fields if f.name == 'time'), None)
-        if field is None or field.datatype not in (7, 8) or field.count != 1:
-            raise ValueError('缺少雷达逐点采样时间')
-        dtype = np.dtype(dict(names=['time'], formats=[('>' if message.is_bigendian else '<')+
-            ('f4' if field.datatype == 7 else 'f8')], offsets=[field.offset], itemsize=message.point_step))
-        offsets = np.ndarray((message.height, message.width), dtype=dtype, buffer=message.data,
-            strides=(message.row_step, message.point_step))['time'].ravel().astype(float)*1e-9
-        if not np.isfinite(offsets).all() or np.any(offsets < 0.) or np.any(offsets > .2):
-            raise ValueError('雷达逐点采样时间超出有效范围')
+        cached = getattr(self, '_prepared_cloud', None)
+        if cached is None or cached[0] is not message:
+            xyz, records = cloud_arrays(message)
+            field = next((f for f in message.fields if f.name == 'time'), None)
+            if field is None or field.datatype not in (7, 8) or field.count != 1:
+                raise ValueError('缺少雷达逐点采样时间')
+            dtype = np.dtype(dict(names=['time'], formats=[('>' if message.is_bigendian else '<')+
+                ('f4' if field.datatype == 7 else 'f8')], offsets=[field.offset], itemsize=message.point_step))
+            offsets = np.ndarray((message.height, message.width), dtype=dtype, buffer=message.data,
+                strides=(message.row_step, message.point_step))['time'].ravel().astype(float)*1e-9
+            if not np.isfinite(offsets).all() or np.any(offsets < 0.) or np.any(offsets > .2):
+                raise ValueError('雷达逐点采样时间超出有效范围')
+            bins = np.floor(offsets/.005).astype(np.int32)
+            groups = []
+            for value in np.unique(bins):
+                indices = np.flatnonzero(bins == value)
+                # Timestamps cross into watchdogs and JSON status. Keep them
+                # native scalars so an expired comparison cannot yield np.bool_.
+                groups.append((indices, float((offsets[indices].min()+offsets[indices].max())*.5)))
+            cached = (message, xyz, records, offsets, groups)
+            self._prepared_cloud = cached
+        _, xyz, records, offsets, relative_groups = cached
         start = message.header.stamp.sec+message.header.stamp.nanosec*1e-9+clock[0]
         if len(offsets) and (now-start-offsets.min() > .5 or start+offsets.max()-now > .03):
             raise ValueError('雷达采样时刻已过期或超前')
-        bins = np.floor(offsets/.005).astype(np.int32)
-        groups, points = [], np.empty_like(xyz)
-        for value in np.unique(bins):
-            indices = np.flatnonzero(bins == value)
-            stamp = start+(offsets[indices].min()+offsets[indices].max())*.5
+        return xyz, records, [(indices, start+offset) for indices, offset in relative_groups]
+
+    def _points_in_body(self, message):
+        xyz, records, groups = self._cloud_samples(message)
+        mounts, points = [], np.empty_like(xyz)
+        for _, stamp in groups:
             mount = self.mount_history.at(stamp)
             if mount is None:
-                raise PosePending('等待雷达采样时刻的安装位姿')
+                error = PosePending if self.mount_history.can_wait(stamp) else ValueError
+                raise error('等待雷达采样时刻的安装位姿')
+            mounts.append(mount)
+        # Check the entire scan's history before doing point transforms. A
+        # pending tail must not repeatedly transform all earlier points.
+        for (indices, _), mount in zip(groups, mounts):
             points[indices] = xyz[indices] @ np.asarray(mount['body_rotation']).T + mount['position']
-            groups.append((indices, stamp))
         return points, records, groups
 
     def _expire_gantry_clear(self):
@@ -482,12 +544,19 @@ class CartNavigation(Node):
         # Camera/arm tracking must not starve FAST-LIO of lidar measurements.
         # With unknown cart geometry retain the remaining returns for localization;
         # do not guess a mask or publish an empty/free-space obstacle scan.
-        # The cart reference remains unready and navigation stays gated off.
+        # This frame never refreshes obstacle readiness; the last valid
+        # observation has its own freshness deadline.
         self.localizing_without_cart = True
-        self.last_filtered = -math.inf
+        # This frame cannot supply obstacle observations. Keep the timestamp
+        # of the last successful frame; _tick expires it after the existing
+        # 500 ms limit. One lost frame must not invalidate still-fresh scans.
         self.cloud_pub.publish(message)
 
     def _scan(self, message, topic):
+        sampled = acquisition_time(self, message, .5, stream=topic)
+        if sampled is None:
+            self.scan_error = '扫描测量时刻已过期、重复或无效'
+            return
         localization = topic == 'scan_localization'
         if self.cart.get('attached'):
             cart = None
@@ -515,9 +584,9 @@ class CartNavigation(Node):
             self.scan_error = ''
         self.scan_pubs[topic].publish(message)
         if localization:
-            self.last_localization_scan = time.monotonic()
+            self.last_localization_scan = sampled
         else:
-            self.last_scan = time.monotonic()
+            self.last_scan = sampled
         if not localization and self.gantry.enabled and self._gantry_ready() and self._fresh():
             # This is an explicit ignore region, not a physical free-space
             # measurement. Stock Nav2 uses it for clearing only. The origin
@@ -532,14 +601,21 @@ class CartNavigation(Node):
 
     def destroy_node(self):
         self.sock.close()
+        self.pose_node.destroy_node()
         return super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = CartNavigation()
+    pose_executor = SingleThreadedExecutor(context=node.context)
+    pose_executor.add_node(node.pose_node)
+    pose_thread = threading.Thread(target=pose_executor.spin, name='navigation-pose', daemon=True)
+    pose_thread.start()
     try:
         rclpy.spin(node)
     finally:
+        pose_executor.shutdown()
+        pose_thread.join()
         node.destroy_node()
         rclpy.shutdown()

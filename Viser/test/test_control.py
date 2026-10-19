@@ -826,6 +826,27 @@ class ControlTests(unittest.TestCase):
             offset=7
             np.testing.assert_allclose(model.history[-1,offset:offset+3],gravity,atol=1e-6)
 
+    def test_continuous_feedback_bridges_policy_consumption_delay(self):
+        self.active()
+        # Previous selected packet is 30 ms old, the next policy tick runs
+        # 90 ms later with current feedback. Its receive-time gap is 120 ms,
+        # although neither feedback age nor control interval exceeds 100 ms.
+        self.now += .04
+        self.bridge.state.received_ns = round((self.now-.03)*1e9)
+        self.bridge.state.sequence += 1
+        self.control.step()
+        before = self.bridge.state.received_ns*1e-9
+        self.now += .09
+        current = self.now-.000001
+        self.bridge.state.received_ns = round(current*1e9)
+        self.bridge.state.sequence += 24
+        self.bridge.feedback_times = np.arange(before+.005,current,.005).tolist()+[current]
+        self.control.step()
+        data = self.control.snapshot()
+        self.assertEqual(data['stage'],'POLICY')
+        self.assertTrue(data['heading']['imu_consumer_resumed'])
+        self.assertEqual(data['heading']['imu_health'],'warming_up')
+
     def test_shared_imu_fault_stops_before_inference_or_joint_command(self):
         self.active();steps=self.control.policy_steps;writes=len(self.bridge.writes)
         self.bridge.state.quaternion.fill(0)
@@ -836,6 +857,28 @@ class ControlTests(unittest.TestCase):
         self.control.damp('Invalid pelvis quaternion norm',fault=True)
         self.assertEqual(self.bridge.writes[-1][0],p.STOP)
         self.assertEqual(self.control.stage,'FAULT')
+
+    def test_heading_gap_keeps_fresh_balance_commands_and_motor_support(self):
+        self.active()
+        for _ in range(30):
+            self.event('move',velocity=[.2,0,0])
+        before_steps=self.control.policy_steps
+        before_writes=len(self.bridge.writes)
+        self.now+=.12
+        self.bridge.state.received_ns=round((self.now-.000001)*1e9)
+        self.bridge.state.sequence+=24
+        self.control.step()
+        self.assertTrue(self.control.snapshot()['heading']['motion_blocked'])
+        self.assertEqual(self.bridge.writes[-1][0],p.RUN)
+        self.assertEqual(self.control.stage,'POLICY')
+        for _ in range(80):self.step()
+        data=self.control.snapshot()
+        self.assertEqual(data['stage'],'POLICY')
+        self.assertEqual(data['selected_model'],'balance')
+        np.testing.assert_array_equal(data['velocity'],0)
+        self.assertGreater(self.control.policy_steps,before_steps+50)
+        self.assertTrue(all(write[0]==p.RUN for write in self.bridge.writes[before_writes:]))
+        self.assertTrue(np.isfinite(self.bridge.writes[-1][1]).all())
 
 
 if __name__ == '__main__':

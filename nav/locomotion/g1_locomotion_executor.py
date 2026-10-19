@@ -53,8 +53,8 @@ VELOCITY_MAGIC, VELOCITY_VERSION = 0x47315643, 3
 COMMAND, GATE_CLOSED, COMMAND_EXPIRED = 0, 1, 2
 MOTION_CONFIG = Path(__file__).with_name('motion_config.json')
 # Lifecycle request from the nav web bridge (unitree_nav2_web/locomotion.py).
-REQUEST_PACKET = struct.Struct('<IHBBQ')
-REQUEST_MAGIC, REQUEST_VERSION = 0x47314C52, 1
+REQUEST_PACKET = struct.Struct('<IHBBQQ')
+REQUEST_MAGIC, REQUEST_VERSION = 0x47314C52, 2
 REQUESTS = {1: 'acquire', 2: 'prepare', 3: 'policy', 4: 'zero', 5: 'stop', 6: 'reset',
             7: 'prepare_pose', 8: 'model_set'}
 PREPARE_POSES = {0: 'original', 1: 'arms_down'}
@@ -116,6 +116,7 @@ class Executor:
         self.accept_after = -float('inf')
         self.new_motion = self.motion_active = False
         self.packets = self.rejected = 0
+        self.velocity_sequences = {}
         self.last_status = -float('inf')
         self.last_request_sequence = -1
         self.cart_request = {}
@@ -126,7 +127,7 @@ class Executor:
         self.warning_board = WarningBoard(clock=clock)
 
     def _receive(self, now):
-        for _ in range(64):
+        for _ in range(512):
             try:
                 data, sender = self.sock.recvfrom(4096)
             except BlockingIOError:
@@ -136,7 +137,7 @@ class Executor:
                 self.rejected += 1
                 continue
             if len(data) == VELOCITY_PACKET.size:
-                magic, version, enabled, reason, _, vx, vy, wz, epoch, stamp_ns = VELOCITY_PACKET.unpack(data)
+                magic, version, enabled, reason, sequence, vx, vy, wz, epoch, stamp_ns = VELOCITY_PACKET.unpack(data)
                 velocity = np.asarray([vx, vy, wz], dtype=np.float32)
                 stamp = stamp_ns*1e-9
                 if (magic != VELOCITY_MAGIC or version != VELOCITY_VERSION
@@ -146,6 +147,13 @@ class Executor:
                         or stamp > now + 1e-6 or not np.isfinite(velocity).all()):
                     self.rejected += 1
                     continue
+                stream = (sender, epoch)
+                if sequence <= self.velocity_sequences.get(stream, -1):
+                    self.rejected += 1
+                    continue
+                if stream not in self.velocity_sequences and len(self.velocity_sequences) >= 8:
+                    del self.velocity_sequences[next(iter(self.velocity_sequences))]
+                self.velocity_sequences[stream] = sequence
                 self.packets += 1
                 self.last_packet = now
                 if enabled:
@@ -162,12 +170,13 @@ class Executor:
                     self.accept_after = max(self.accept_after, now)
                     self._stop_motion()
             elif len(data) == REQUEST_PACKET.size:
-                magic, version, request, payload, sequence = REQUEST_PACKET.unpack(data)
+                magic, version, request, payload, sequence, stamp_ns = REQUEST_PACKET.unpack(data)
                 if (magic != REQUEST_MAGIC or version != REQUEST_VERSION or request not in REQUESTS
                         or (request == 7 and payload not in PREPARE_POSES)
                         or (request == 8 and payload not in MODEL_SETS)
                         or (request not in (7, 8) and payload != 0)
-                        or sequence <= self.last_request_sequence):
+                        or sequence <= self.last_request_sequence
+                        or (request not in (4, 5) and not -1e-6 <= now-stamp_ns*1e-9 <= .5)):
                     self.rejected += 1
                     continue
                 self.last_request_sequence = sequence
@@ -194,6 +203,10 @@ class Executor:
                     self.cart_error = str(exc)
             else:
                 self.rejected += 1
+        # Never act on an arbitrary prefix of a saturated receive queue.
+        # Continue draining next tick, with motion zero until the queue empties.
+        self.enabled = False
+        self._stop_motion()
 
     def _stop_motion(self):
         self.target.fill(0)
@@ -420,7 +433,10 @@ class Executor:
         stage = data.get('stage', 'WAITING')
         dex3 = data.get('dex3') or {}
         owned = data.get('source') == 'web' and data.get('owner') == CLIENT
-        ready = stage == 'POLICY' and bool(data.get('healthy')) and owned
+        feedback_age = now-(data.get('state') or {}).get('received', -float('inf'))
+        feedback_fresh = 0 <= feedback_age <= self.control.cfg['state_timeout_s']
+        ready = (stage == 'POLICY' and bool(data.get('healthy')) and feedback_fresh and owned
+                 and not (data.get('heading') or {}).get('motion_blocked'))
         high = data.get('high_policy') or {}
         cart = self._cart_status(data, now)
         if self.cart_attached:
@@ -443,7 +459,7 @@ class Executor:
                         if self.control.model_sets is not None else self.control.policy)
         status = dict(
             magic='G1LOCO1', ready=ready, mode=self.control.mode, stage=stage,
-            stage_text=STAGES.get(stage, stage), healthy=bool(data.get('healthy')),
+            stage_text=STAGES.get(stage, stage), healthy=bool(data.get('healthy')) and feedback_fresh,
             armed=bool(self.control.backend.armed), reason=data.get('reason') or '',
             source=data.get('source'), owned=data.get('owner') == CLIENT,
             model_set=model_key,
@@ -464,7 +480,10 @@ class Executor:
             velocity=[float(v) for v in data.get('velocity', np.zeros(3))],
             nav_target=[float(v) for v in self.target], nav_command_fresh=fresh,
             nav_packet_age_s=None if self.last_packet < 0 else round(now - self.last_packet, 3),
+            feedback_age_s=feedback_age if np.isfinite(feedback_age) else None,
+            feedback_timeout_s=self.control.cfg['state_timeout_s'],
             heading=(data.get('heading') or {}).get('heading_state'),
+            timing=data.get('timing') or {},
             high_policy=high_status, cart=cart, hands=hand_status,
             cart_request=dict(self.cart_request), upper_pd_transitioning=bool(data.get('upper_pd_transitioning')),
             pushcart_error=getattr(self.control.config, 'pushcart_error', ''),

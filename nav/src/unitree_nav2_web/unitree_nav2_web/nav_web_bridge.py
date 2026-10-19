@@ -33,6 +33,7 @@ from tf2_ros import Buffer, TransformListener
 
 from unitree_nav2_web.locomotion import LocomotionLink, CART_ACTIONS
 from unitree_nav2_web.navigation_speed import NavigationSpeedSettings
+from .sample_timing import sample_time
 
 FOOTPRINT = "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
 # The motion gate refuses to open unless our own locomotion executor reports
@@ -234,7 +235,7 @@ class NavigationWebBridge(Node):
         self.create_subscription(
             PointCloud2,
             "/cloud_nav",
-            lambda _msg: setattr(self, "last_cloud_time", time.monotonic()),
+            self._cloud_callback,
             sensor_qos,
         )
         self.create_subscription(
@@ -332,12 +333,29 @@ class NavigationWebBridge(Node):
         return [f"运控尚未进入策略运行：{stage_text}"]
 
     def _reference_blockers(self, locomotion):
-        reference = self.navigation_reference
+        reference = self._reference_snapshot()
         epoch = (locomotion.get('cart') or {}).get('epoch')
-        if (not 0 <= time.monotonic()-self.reference_received <= .5
-                or not reference.get('ready') or epoch != reference.get('epoch')):
+        if not reference.get('ready') or epoch != reference.get('epoch'):
             return [reference.get('reason') or '导航参考点或车体过滤尚未就绪']
         return []
+
+    def _reference_snapshot(self):
+        """Age cached reports even when the filtering process stops publishing."""
+        reference = dict(self.navigation_reference)
+        age = time.monotonic()-self.reference_received
+        fresh = 0 <= age <= .5
+        reference.update(fresh=fresh, age_s=round(age, 3) if math.isfinite(age) else None)
+        if not fresh:
+            reason = '导航参考状态已超时：过滤节点未更新'
+            reference.update(ready=False, reason=reason)
+            if 'gantry_filter' in reference:
+                reference['gantry_filter'] = dict(reference['gantry_filter'], ready=False, reason=reason)
+        observations = dict(reference.get('observations') or {})
+        for key, value in observations.items():
+            if key.endswith('_age_s') and value is not None:
+                observations[key] = round(value+max(0., age), 3) if math.isfinite(age) else None
+        reference['observations'] = observations
+        return reference
 
     def _check_reference_gate(self, locomotion):
         """Keep authorization through brief gaps; the UDP node stops velocity immediately."""
@@ -409,6 +427,7 @@ class NavigationWebBridge(Node):
         def age(stamp):
             return round(now-stamp, 3) if stamp and math.isfinite(stamp) else None
         with self.lock:
+            reference = self._reference_snapshot()
             return dict(
                 monotonic=now, mode=self.navigation_reference.get('mode'),
                 cloud_age_s=age(self.last_cloud_time), odom_age_s=age(self.last_odom_time),
@@ -425,9 +444,11 @@ class NavigationWebBridge(Node):
                 navigation_command=locomotion.get('nav_target'),
                 navigation_command_fresh=locomotion.get('nav_command_fresh'),
                 robot_velocity_command=locomotion.get('velocity'),
-                reference_ready=self.navigation_reference.get('ready'),
-                reference_reason=self.navigation_reference.get('reason'),
-                observations=self.navigation_reference.get('observations'),
+                reference_ready=reference.get('ready'),
+                reference_age_s=reference.get('age_s'),
+                locomotion_timing=locomotion.get('timing'),
+                reference_reason=reference.get('reason'),
+                observations=reference.get('observations'),
                 locomotion_stage=locomotion.get('stage'), locomotion_reason=locomotion.get('reason'),
                 amcl_alive=self.amcl_process is not None and self.amcl_process.poll() is None,
                 update_requested=self.nomotion_update_inflight)
@@ -534,7 +555,7 @@ class NavigationWebBridge(Node):
                 },
                 "locomotion": locomotion,
                 "sent_monotonic": now,
-                "navigation_reference": self.navigation_reference,
+                "navigation_reference": self._reference_snapshot(),
                 "costmap_preparation": dict(ready=self.footprint_confirmed,
                                             pending=self.footprint_preparing,
                                             error=self.footprint_error),
@@ -1032,6 +1053,11 @@ class NavigationWebBridge(Node):
         self._publish_status()
         return {"x": x, "y": y, "z": 0.0, "yaw": yaw}
 
+    def _cloud_callback(self, message):
+        sampled = sample_time(self, message, 1.5, stream='cloud')
+        if sampled is not None:
+            self.last_cloud_time = sampled
+
     def _odom_callback(self, message):
         twist = message.twist.twist
         if (not _valid_navigation_pose(message.pose.pose)
@@ -1040,7 +1066,9 @@ class NavigationWebBridge(Node):
                             twist.angular.x, twist.angular.y, twist.angular.z))):
             self._handle_localization_fault("导航里程计含无效位姿或速度，已请求平滑停车")
             return
-        now = time.monotonic()
+        now = sample_time(self, message, 1.5, stream='odom')
+        if now is None:
+            return
         speed = math.hypot(
             float(message.twist.twist.linear.x),
             float(message.twist.twist.linear.y),
@@ -1108,6 +1136,9 @@ class NavigationWebBridge(Node):
         future.add_done_callback(completed)
 
     def _localization_scan_callback(self, message):
+        sampled = sample_time(self, message, 1.5, stream='localization_scan')
+        if sampled is None:
+            return
         finite = []
         points = []
         sectors = set()
@@ -1125,7 +1156,7 @@ class NavigationWebBridge(Node):
                 points.append((value * math.cos(angle), value * math.sin(angle)))
                 sectors.add(min(7, index * 8 // count))
         with self.lock:
-            self.last_localization_scan_time = time.monotonic()
+            self.last_localization_scan_time = sampled
             self.localization_scan_points = len(finite)
             self.localization_scan_bins = len(message.ranges)
             self.localization_scan_sectors = len(sectors)
@@ -1176,7 +1207,9 @@ class NavigationWebBridge(Node):
                 or not all(math.isfinite(value) for value in message.pose.covariance)):
             self._handle_localization_fault("AMCL 含无效位姿或协方差，已请求平滑停车")
             return
-        now = time.monotonic()
+        now = sample_time(self, message, 1.5, stream='amcl')
+        if now is None:
+            return
         fault = None
         with self.lock:
             self.last_pose_time = now

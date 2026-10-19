@@ -113,6 +113,12 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_measurement_queue test/test_measurement_queue.cpp)
+  target_include_directories(test_measurement_queue PRIVATE include)
+endif()
+
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}
