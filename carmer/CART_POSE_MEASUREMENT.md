@@ -74,7 +74,7 @@ python -B carmer/cart_pose_measure.py --map --duration 20
 终端应使用与导航相同的 `ROS_DOMAIN_ID`、RMW 和网络设置。此工具不会启动导航或 AMCL，
 不会让机器人进入运动状态。
 
-地图变换按图像接收时间减 `--camera-latency-ms` 查询，**不退回最新 TF 冒充同时刻数据**。
+地图变换按 V4L2 驱动提供的图像帧时间减 `--camera-latency-ms` 查询，**不退回最新 TF 冒充同时刻数据**。帧时间必须属于主机 monotonic 时钟且严格递增；不可用时报告错误，不用 `cap.read()` 完成时间替代。该参数现在只用于标定后的剩余时间偏差，不应再重复扣除读图延迟。驱动帧时间并不等同于相机、机器人和雷达之间的硬件同步。
 仅支持当前实机的系统时间，不支持 `/clock` 仿真时间。
 无地图 TF、无有效机器人反馈、无标签、图像过期时，对应位姿字段留空，并记录原因。
 初始几帧可能需要等待 TF 缓冲建立。地图未定位时仍可测试 `camera/robot/level`。
@@ -87,6 +87,68 @@ CSV 旁生成同名 `.meta.json`（参数、坐标定义）与 `.summary.json`�
 整个 `carmer/log/` 已加入 Git 忽略规则。
 通常不需要指定 `--output`；显式指定时会覆盖默认路径和文件名，程序仍拒绝覆盖已有 CSV。
 相机预热帧不计入记录时长。画面中的青色四边形是估计位姿下的 **90×50 cm 载物板边沿**。
+
+## 对比给定矩阵与 URDF 外参
+
+你提供的矩阵保存在 `carmer/cart_camera_extrinsics.json`，定义为**腰部 yaw 为 0** 时，
+从相机光学坐标系到物理 `pelvis` 坐标系的变换，平移单位米。
+它不是重力校平后的 `level` 变换，也不要求骨盆的 IMU roll/pitch 为 0。
+可编辑该 JSON，或通过 `--extrinsics-file /path/to/file.json` 指定同格式文件。
+
+```bash
+# 使用 URDF（默认行为）
+python -B carmer/cart_pose_measure.py --extrinsics urdf --duration 20
+
+# 使用你提供的矩阵
+python -B carmer/cart_pose_measure.py --extrinsics provided --duration 20
+
+# 推荐用于对比：对同一帧、同一份反馈同时计算两组结果
+python -B carmer/cart_pose_measure.py --extrinsics compare --duration 20
+
+# 只打印两份零腰角矩阵及差异，不访问相机或机器人
+python -B carmer/cart_pose_measure.py --show-extrinsics
+```
+
+`provided` 和 `compare` 模式需要机器人反馈，因此不能同时使用 `--camera-only`。
+腰角变化时使用以下公式，腰 roll/pitch 仍遵循本工程 URDF 的固定关节约束：
+
+```text
+T_provided(q) = T_urdf(q) @ inverse(T_urdf(0)) @ T_provided(0)
+T_pelvis_cart = T_provided(q) @ T_camera_cart
+T_level_cart  = T_level_pelvis(IMU) @ T_pelvis_cart
+```
+
+`q` 来自与该图像时间匹配的反馈。骨盆相对世界的倾斜只在后续 `level`/`map` 变换中应用，
+不会重复加到相机安装外参上。零腰角时恰好使用给定矩阵。
+
+对比模式的终端、预览和 CSV 同时提供：
+
+| 字段前缀 | 含义 |
+|---|---|
+| `robot_urdf` / `robot_provided` | 两种外参得到的小车物理 pelvis 位姿 |
+| `level_urdf` / `level_provided` | 两组经过同一次 IMU 校平的位姿 |
+| `map_urdf` / `map_provided` | 启用 `--map` 且有有效 TF 时的两组地图位姿 |
+| `provided_minus_urdf_level_x_m` 等 | 给定矩阵结果减去 URDF 结果的各轴位置差 |
+| `provided_vs_urdf_level_rotation_deg` 等 | 两个旋转矩阵的夹角，非 RPY 分量直接相减 |
+| `waist_yaw_deg`、`pelvis_roll_deg`、`pelvis_pitch_deg` | 本帧用于换算的腰角与 IMU 倾斜 |
+
+原有无后缀 `robot/level/map` 字段在 `provided` 模式下使用给定矩阵，在 `urdf` 和 `compare`
+模式下使用 URDF。对比时优先看带后缀的字段。`camera` 位姿和重投影误差来自共同的 PnP，
+因此**不会因为切换外参而改变，不能用它们判断哪份外参更准**。
+`.meta.json` 保存本次实际使用的两份零腰角矩阵和来源文件；`.summary.json` 包含各组统计。
+
+分别查看同一日志的两组结果：
+
+```bash
+python -B carmer/cart_pose_measure.py --summarize carmer/log/实际文件名.csv --reference level_urdf
+python -B carmer/cart_pose_measure.py --summarize carmer/log/实际文件名.csv --reference level_provided
+```
+
+当前两份零腰角外参的光心位置差（给定 − URDF）约为 `[-6.01, 0, -11.19] mm`，
+旋转相差约 `0.4°`。这不是所有距离下小车估计位置的固定差值，旋转差的影响取决于观测位置。
+验证时固定机器人，在多个距离和左右位置停放小车，独立测量小车原点相对骨盆原点的
+水平投影位置及朝向，再对照 `level_urdf` 和 `level_provided` 的均值。
+只测试“前进 20 cm”这类相对位移，不能验证相机平移外参的常量偏差；需要绝对位置参考。
 
 ## 按顺序验证精度
 
@@ -151,7 +213,7 @@ python -B carmer/cart_pose_measure.py --compare carmer/log/cart_pose_20261018_18
 本工具本身不执行上述机器人动作。
 
 地图位置明显变动而相对测量稳定：检查 AMCL/FAST-LIO 定位。
-站姿变化时位置系统偏移：检查相机光心外参；当前仍使用名义 URDF 安装参数。
+站姿变化时位置系统偏移：检查相机光心外参；可用 `--extrinsics compare` 对比名义 URDF 与给定参数。
 静止准确、运动时误差大：优先检查图像/反馈/TF 时间对齐和实测相机延迟。
 接收时间并非曝光硬件时间，默认延迟 0 ms 表示未标定，不保证已同步。
 不要单纯增大 `--max-age` 来掩盖延迟。
@@ -163,5 +225,6 @@ python -B -m unittest -v carmer.test_cart_pose_measure
 ```
 
 覆盖已知位姿投影恢复、真实 OpenCV 标签检测角点顺序、单标签、像素噪声、错误/丢失标签、
-含身体倾斜和相机偏移的地图变换，以及 CSV 统计与 ±180° 角度比较。
+含身体倾斜和相机偏移的地图变换、零腰角给定外参及非零腰角更新、同帧外参比较，
+以及 CSV 统计与 ±180° 角度比较。
 离线测试通过只说明算法与坐标处理符合测试条件，实物精度应以上面的测量结果为准。

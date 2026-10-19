@@ -27,6 +27,12 @@ add_executable(g1_lowstate_udp_bridge src/g1_lowstate_udp_bridge.cpp)
 target_include_directories(g1_lowstate_udp_bridge PRIVATE include)
 target_link_libraries(g1_lowstate_udp_bridge unitree_sdk2)
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_state_timing test/test_state_timing.cpp)
+  target_include_directories(test_state_timing PRIVATE include)
+endif()
+
 add_executable(g1_cmd_vel_udp_node src/g1_cmd_vel_udp_node.cpp)
 target_include_directories(g1_cmd_vel_udp_node PRIVATE include)
 ament_target_dependencies(g1_cmd_vel_udp_node geometry_msgs rclcpp std_msgs)

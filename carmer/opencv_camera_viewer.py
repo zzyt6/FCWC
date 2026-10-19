@@ -16,6 +16,7 @@ from datetime import datetime
 import errno
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -76,11 +77,15 @@ class CameraReader:
         self.last_sample = None
         self.recent = deque(maxlen=FPS + 1)
         self.fps = 0.0
+        self.frame_timestamp = None
+        self.timestamp_basis = "v4l2_monotonic"
         self.thread = threading.Thread(target=self._capture, daemon=True)
         self.thread.start()
 
     def _capture(self):
         try:
+            import cv2
+
             while not self.stop.is_set():
                 ok, frame = self.cap.read()
                 now = time.monotonic()
@@ -88,8 +93,18 @@ class CameraReader:
                     raise RuntimeError("Camera read failed; check USB connection and camera ownership.")
                 if frame.shape != (HEIGHT, WIDTH, 3):
                     raise RuntimeError(f"Expected {WIDTH}x{HEIGHT} BGR, got shape {frame.shape}")
+                # The V4L2 backend exposes the dequeued buffer's timestamp.
+                # cap.read() completion includes USB/queue/conversion delay and
+                # must not be used as the measurement time for robot feedback.
+                captured = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.
+                if (not math.isfinite(captured) or captured <= 0.
+                        or not -.002 <= now-captured <= 2.
+                        or (self.frame_timestamp is not None and captured <= self.frame_timestamp)):
+                    raise RuntimeError("Camera driver did not provide an increasing host-monotonic "
+                                       "V4L2 frame timestamp; cannot align image and robot feedback.")
                 with self.condition:
                     self.frame = frame
+                    self.frame_timestamp = captured
                     self.count += 1
                     self.recent.append(now)
                     if len(self.recent) > 1:
@@ -121,7 +136,7 @@ class CameraReader:
             if self.count == previous:
                 return None
             result = (self.count, self.frame, self.fps)
-            return result + (self.recent[-1],) if with_timestamp else result
+            return result + (self.frame_timestamp,) if with_timestamp else result
 
     def close(self):
         self.stop.set()

@@ -3,8 +3,9 @@ import json
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
 from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -37,6 +38,14 @@ def generate_launch_description():
     command_port = LaunchConfiguration("locomotion_command_port")
     status_port = LaunchConfiguration("locomotion_status_port")
     network_interface = os.environ.get("G1_NETWORK_INTERFACE", "eth0")
+    direct_livox = LaunchConfiguration("direct_livox")
+    direct_enabled = ["'", direct_livox, "'.lower() in ('true', '1')"]
+    raw_lidar_topic = PythonExpression([
+        "'/navigation/livox_points' if ", *direct_enabled,
+        " else '/utlidar/cloud_livox_mid360'"])
+    imu_topic = PythonExpression([
+        "'/livox/imu' if ", *direct_enabled, " else '/utlidar/imu_livox_mid360'"])
+    scan_time = ParameterValue(PythonExpression(["0.02 if ", *direct_enabled, " else 0.10"]), value_type=float)
 
     nav_nodes = [
         Node(
@@ -130,6 +139,12 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("http_port", default_value="8080"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
+            DeclareLaunchArgument("direct_livox", default_value="false",
+                                  description="Trial: directly acquire MID-360 at 50 Hz; restore Unitree lidar on exit"),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(share, "launch", "livox_source.launch.py")),
+                condition=IfCondition(direct_livox),
+                launch_arguments={"lidar_interface": network_interface}.items()),
             DeclareLaunchArgument(
                 "speed_settings_file",
                 default_value=os.path.join(root, "config", "navigation_speed.json"),
@@ -191,6 +206,7 @@ def generate_launch_description():
                         "lowstate_udp_port": 39001,
                         "fastlio_odom_topic": "/Odometry",
                         "base_odom_topic": "/Odometry_base",
+                        "imu_topic": imu_topic,
                         "base_frame": "base_link",
                         "navigation_frame": "base_nav",
                         "model_variant": "auto",
@@ -226,14 +242,17 @@ def generate_launch_description():
                 executable="cart_navigation",
                 name="cart_navigation",
                 output="both",
-                parameters=[{"config_file": cart_config}],
+                parameters=[{"config_file": cart_config, "raw_cloud_topic": raw_lidar_topic}],
             ),
             Node(
                 package="fast_lio",
                 executable="fastlio_mapping",
                 name="laser_mapping",
                 output="screen",
-                parameters=[fastlio_config, {"common.lid_topic": "/navigation/lidar"}],
+                parameters=[fastlio_config, {"common.lid_topic": "/navigation/lidar",
+                                             "common.imu_topic": imu_topic,
+                                             "preprocess.scan_rate": ParameterValue(PythonExpression(
+                                                 ["50 if ", *direct_enabled, " else 10"]), value_type=int)}],
             ),
             Node(
                 package="unitree_nav2_core",
@@ -279,7 +298,7 @@ def generate_launch_description():
                         "angle_min": -3.141592653589793,
                         "angle_max": 3.141592653589793,
                         "angle_increment": 0.008726646,
-                        "scan_time": 0.10,
+                        "scan_time": scan_time,
                         "range_min": 0.60,
                         "range_max": 4.0,
                         "use_inf": True,
@@ -308,7 +327,7 @@ def generate_launch_description():
                         "angle_min": -3.141592653589793,
                         "angle_max": 3.141592653589793,
                         "angle_increment": 0.008726646,
-                        "scan_time": 0.10,
+                        "scan_time": scan_time,
                         "range_min": 0.60,
                         "range_max": 8.0,
                         "use_inf": True,

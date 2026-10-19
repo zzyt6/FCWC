@@ -30,6 +30,8 @@ setup(
         "console_scripts": [
             "nav_web_bridge = unitree_nav2_web.nav_web_bridge:main",
             "cart_navigation = unitree_nav2_web.cart_navigation:main",
+            "livox_adapter = unitree_nav2_web.livox_adapter:main",
+            "livox_source = unitree_nav2_web.livox_source:main",
         ],
     },
 )

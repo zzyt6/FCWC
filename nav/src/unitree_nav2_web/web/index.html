@@ -90,11 +90,18 @@
           <summary><span>推车策略</span><em id="cartBadge" class="badge">普通导航</em></summary>
           <div class="cardBody">
             <div id="cartStatus" class="note">等待推车策略状态…</div>
-            <p class="hint">先启动混合策略站稳，放入小车并抓握。小车摆正后校准航向，再启动推车策略。推车模式下地图目标指向小车中心。</p>
+            <label for="cartPoseSource">小车位姿计算方式</label>
+            <select id="cartPoseSource" disabled>
+              <option value="grasp">固定抓握（假设双手无滑移）</option>
+              <option value="apriltag">视觉 AprilTag（真实小车参数）</option>
+            </select>
+            <button id="applyCartPoseSource" class="block" disabled>应用并保存位姿方式</button>
+            <p class="hint">停止导航并退出推车策略后可切换。视觉方式使用 URDF 相机外参，标签不可用时暂停导航。</p>
+            <p class="hint">先启动混合策略站稳，放入小车并抓握。固定抓握方式可摆正小车后校准航向；视觉方式按标签确定朝向。推车模式下地图目标指向小车中心。</p>
             <div class="buttonGrid">
               <button data-cart-action="hand_toggle" disabled>抓握 / 松手</button>
               <button id="cartCompensation" disabled>启用抓握补偿</button>
-              <button data-cart-action="cart_camera_start" disabled>启动航向相机</button>
+              <button data-cart-action="cart_camera_start" disabled>启动小车相机</button>
               <button data-cart-action="cart_yaw_zero" disabled>小车航向归零</button>
               <button data-cart-action="pushcart_enable" class="accent" disabled>启动推车策略</button>
               <button data-cart-action="pushcart_disable" disabled>退出推车策略</button>
@@ -110,7 +117,7 @@
               </div>
             </details>
             <button data-cart-action="cart_detach" class="block" disabled>已松手并移开小车，恢复普通导航</button>
-            <p class="hint">速度范围：vx −0.20～0.60、vy −0.15～0.15 m/s，wz −0.30～0.30 rad/s。切换后需重新打开运动门。</p>
+            <p class="hint">速度范围：vx −0.20～0.60、vy −0.30～0.30 m/s，wz −0.40～0.40 rad/s。切换后需重新打开运动门。</p>
           </div>
         </details>
 

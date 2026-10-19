@@ -34,6 +34,7 @@ def heading_packet(result):
                 reference_frame='pelvis_level', yaw_rad=float(yaw) if valid else None,
                 tag_ids=heading.get('tag_ids', []),
                 tags_in_pelvis=positions,
+                cart_pose_urdf=result.get('cart_pose_urdf'),
                 reason='ok' if valid else heading.get('reason', 'compensation_unavailable'))
 
 

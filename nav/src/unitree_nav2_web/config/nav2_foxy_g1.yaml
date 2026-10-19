@@ -88,14 +88,15 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 15.0
+    controller_frequency: 50.0
     odom_topic: /Odometry_navigation
     min_x_velocity_threshold: 0.01
     min_y_velocity_threshold: 0.01
     min_theta_velocity_threshold: 0.01
     progress_checker_plugin: "progress_checker"
     goal_checker_plugin: "goal_checker"
-    controller_plugins: ["FollowPath", "CartPush"]
+    # Load stock DWB before the ordinary-navigation adapter's dependencies.
+    controller_plugins: ["CartPush", "FollowPath"]
     progress_checker:
       plugin: "nav2_controller::PoseProgressChecker"
       required_movement_radius: 0.20
@@ -125,6 +126,11 @@ controller_server:
       closed_loop: false
       # DWB parameters (the shim delegates to DWB after heading alignment)
       debug_trajectory_details: false
+      # The web view uses the chosen path; full candidate/score visualizations
+      # allocate and serialize thousands of trajectories every control tick.
+      publish_evaluation: false
+      publish_trajectories: false
+      publish_cost_grid_pc: false
       min_vel_x: -0.12
       min_vel_y: -0.18
       max_vel_x: 0.60
@@ -139,9 +145,10 @@ controller_server:
       decel_lim_x: -0.30
       decel_lim_y: -0.20
       decel_lim_theta: -0.40
-      vx_samples: 15
-      vy_samples: 11
-      vtheta_samples: 17
+      # Bound work per 20 ms cycle; preserve all axes and collision resolution.
+      vx_samples: 9
+      vy_samples: 7
+      vtheta_samples: 11
       sim_time: 1.0
       linear_granularity: 0.05
       angular_granularity: 0.025
@@ -150,7 +157,7 @@ controller_server:
       trans_stopped_velocity: 0.05
       short_circuit_trajectory_evaluation: true
       stateful: true
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist", "CruiseSpeed"]
+      critics: ["RotateToGoal", "Oscillation", "GoalAlign", "PathAlign", "PathDist", "GoalDist", "CruiseSpeed", "BaseObstacle"]
       CruiseSpeed.class: "unitree_nav2_core::CruiseSpeedCritic"
       CruiseSpeed.scale: 24.0
       BaseObstacle.scale: 0.04
@@ -167,20 +174,25 @@ controller_server:
     # Cart-frame velocities enter the existing high-level push policy. The
     # launch file reads the actual axis limits from pushcart_navigation.json.
     CartPush:
-      plugin: "unitree_nav2_core::ApproachDWBLocalPlanner"
+      plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: true
-      trajectory_generator_name: "unitree_nav2_core::SpeedLimitedGenerator"
+      publish_evaluation: false
+      publish_trajectories: false
+      publish_cost_grid_pc: false
+      # Use Nav2's sampler and rollout directly, without projecting velocity
+      # samples onto a speed circle. UI speed constraints are checked below.
+      trajectory_generator_name: "dwb_plugins::StandardTrajectoryGenerator"
       navigation_speed_mode: "auto"
       navigation_speed: 0.35
       approach_distance: 0.80
       approach_speed: 0.10
       min_vel_x: -0.20
       max_vel_x: 0.60
-      min_vel_y: -0.15
-      max_vel_y: 0.15
-      max_vel_theta: 0.30
+      min_vel_y: -0.30
+      max_vel_y: 0.30
+      max_vel_theta: 0.40
       min_speed_xy: 0.0
-      max_speed_xy: 0.62
+      max_speed_xy: 0.35  # Updated atomically with the selected navigation speed.
       min_speed_theta: 0.0
       acc_lim_x: 0.30
       acc_lim_y: 0.20
@@ -188,10 +200,17 @@ controller_server:
       decel_lim_x: -0.30
       decel_lim_y: -0.20
       decel_lim_theta: -0.40
-      vx_samples: 15
-      vy_samples: 11
-      vtheta_samples: 17
-      sim_time: 1.5
+      vx_samples: 9
+      vy_samples: 13
+      vtheta_samples: 21
+      sim_time: 1.0
+      # Also resolve braking travel for a zero target velocity.
+      discretize_by_time: true
+      time_granularity: 0.05
+      # Foxy otherwise shortens the forward plan to prune_distance (1 m).
+      # A 1.0 s rollout plus the 0.60 m front alignment point can exceed that
+      # artificial endpoint. Keep the path visible across the local costmap.
+      shorten_transformed_plan: false
       linear_granularity: 0.04
       angular_granularity: 0.025
       transform_tolerance: 0.30
@@ -199,19 +218,31 @@ controller_server:
       trans_stopped_velocity: 0.05
       short_circuit_trajectory_evaluation: true
       stateful: true
-      critics: ["ObstacleFootprint", "RotateToGoal", "Oscillation", "PathDist", "GoalDist", "CartLookahead", "CruiseSpeed"]
+      # All scores are nonnegative. With short-circuiting, inexpensive critics
+      # can reject candidates already worse than the best before the full
+      # footprint sweep. Every candidate that can win still gets that sweep.
+      # Official Foxy path/goal critics, with a stronger cart-center PathDist.
+      # Keep the cart's real
+      # holonomic limits and footprint; the TurtleBot example's vy=0 does not apply.
+      # navigation2/0.4.7: nav2_bringup/bringup/params/nav2_params.yaml
+      critics: ["NavigationSpeedLimit", "RotateToGoal", "Oscillation", "Twirling", "GoalAlign", "PathAlign", "PathDist", "GoalDist", "CruiseSpeed", "ObstacleFootprint"]
+      NavigationSpeedLimit.class: "unitree_nav2_core::NavigationSpeedLimitCritic"
+      NavigationSpeedLimit.scale: 1.0
+      # Official holonomic-robot critic: prefer translation to unnecessary
+      # rotations when discrete path costs are similar. Turning remains legal.
+      Twirling.scale: 5.0
       ObstacleFootprint.scale: 1.0
-      RotateToGoal.scale: 28.0
+      RotateToGoal.scale: 32.0
       RotateToGoal.slowing_factor: 5.0
       RotateToGoal.lookahead_time: -1.0
-      PathDist.scale: 24.0
-      GoalDist.scale: 18.0
-      CartLookahead.class: "unitree_nav2_core::CartLookaheadCritic"
-      CartLookahead.scale: 12.0
-      CartLookahead.lookahead_base: 0.40
-      CartLookahead.lookahead_gain: 0.60
-      CartLookahead.lookahead_max: 1.00
-      CartLookahead.heading_weight: 0.40
+      PathAlign.scale: 32.0
+      # This is the heading probe, not the cart half-length. PathAlign turns
+      # off inside this distance to the goal; use the official default.
+      PathAlign.forward_point_distance: 0.325
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.325
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
       CruiseSpeed.class: "unitree_nav2_core::CruiseSpeedCritic"
       CruiseSpeed.scale: 18.0
 
@@ -219,7 +250,8 @@ local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: false
-      update_frequency: 8.0
+      # Collision checking reads this internal map, independently of display.
+      update_frequency: 50.0
       publish_frequency: 8.0
       global_frame: odom
       robot_base_frame: nav_control

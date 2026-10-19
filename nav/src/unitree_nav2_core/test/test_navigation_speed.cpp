@@ -2,9 +2,11 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include "unitree_nav2_core/navigation_speed.hpp"
+#include "dwb_core/exceptions.hpp"
 
 class NavigationSpeedTest : public ::testing::Test
 {
@@ -23,7 +25,8 @@ protected:
       {"FollowPath.acc_lim_theta", 0.40}, {"FollowPath.decel_lim_x", -0.30},
       {"FollowPath.decel_lim_y", -0.20}, {"FollowPath.decel_lim_theta", -0.40},
       {"FollowPath.vx_samples", 15}, {"FollowPath.vy_samples", 11},
-      {"FollowPath.vtheta_samples", 17}, {"FollowPath.sim_time", 1.0}});
+      {"FollowPath.vtheta_samples", 17}, {"FollowPath.sim_time", 1.0},
+      {"FollowPath.linear_granularity", 0.04}, {"FollowPath.angular_granularity", 0.025}});
     node = std::make_shared<nav2_util::LifecycleNode>("speed_test", "", false, options);
     generator = std::make_unique<unitree_nav2_core::SpeedLimitedGenerator>();
     generator->initialize(node, "FollowPath");
@@ -175,6 +178,105 @@ TEST_F(NavigationSpeedTest, CruisePreferenceReleasesForArrivalAndAutomaticMode)
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(slow), 0.0);
 }
 
+TEST_F(NavigationSpeedTest, StopPredictionIncludesTravelWhileBraking)
+{
+  geometry_msgs::msg::Pose2D origin;
+  nav_2d_msgs::msg::Twist2D moving, stop;
+  moving.x = 0.3;
+  auto trajectory = generator->generateTrajectory(origin, moving, stop);
+  ASSERT_GT(trajectory.poses.size(), 2u);
+  // With 0.3 m/s^2 braking, stopping from 0.3 m/s takes 1 s and about 0.15 m.
+  EXPECT_GT(trajectory.poses.back().x, 0.12);
+  EXPECT_LE(trajectory.poses.back().x, 0.15 + 1e-9);
+  for (size_t i = 1; i < trajectory.poses.size(); ++i) {
+    EXPECT_LE(std::hypot(trajectory.poses[i].x-trajectory.poses[i-1].x,
+      trajectory.poses[i].y-trajectory.poses[i-1].y), 0.04 + 1e-9);
+  }
+  moving.x = 0.;
+  moving.theta = 0.3;
+  trajectory = generator->generateTrajectory(origin, moving, stop);
+  EXPECT_GT(trajectory.poses.back().theta, 0.09);
+  EXPECT_LE(trajectory.poses.back().theta, 0.1125 + 1e-9);
+}
+
+TEST_F(NavigationSpeedTest, OfficialSamplesObeyLiveSpeedAndTrueGoalApproach)
+{
+  unitree_nav2_core::NavigationSpeedLimitCritic limit;
+  std::string name = "NavigationSpeedLimit", ns = "FollowPath";
+  limit.initialize(node, name, ns, nullptr);
+  dwb_plugins::StandardTrajectoryGenerator official;
+  // The fixture already initialized the spatial generator and declared these.
+  node->set_parameter(rclcpp::Parameter("FollowPath.discretize_by_time", true));
+  node->set_parameter(rclcpp::Parameter("FollowPath.time_granularity", 0.05));
+  official.initialize(node, ns);
+  geometry_msgs::msg::Pose2D pose, goal;
+  nav_2d_msgs::msg::Twist2D current;
+  nav_2d_msgs::msg::Path2D shortened;
+  shortened.poses.push_back(pose);  // Must not mistake this for the final goal.
+  goal.x = 2.;
+  for (const auto & mode : {"auto", "fixed"}) {
+    for (const double cap : {0.2, 0.6}) {
+      profile(mode, cap);
+      limit.prepare(pose, current, goal, shortened);
+      bool moving = false, turn = false, rejected = false;
+      for (const auto & command : official.getTwists(current)) {
+        auto trajectory = official.generateTrajectory(pose, current, command);
+        const double speed = std::hypot(command.x, command.y);
+        if (speed <= cap+1e-9) {
+          EXPECT_DOUBLE_EQ(limit.scoreTrajectory(trajectory), 0.);
+          moving |= speed > 0.1;
+          turn |= speed < 1e-9 && std::abs(command.theta) > 0.1;
+        } else {
+          EXPECT_THROW(limit.scoreTrajectory(trajectory), dwb_core::IllegalTrajectoryException);
+          rejected = true;
+        }
+      }
+      EXPECT_TRUE(moving);
+      EXPECT_TRUE(turn);
+      if (cap == 0.2) {EXPECT_TRUE(rejected);}
+    }
+  }
+  goal.x = 0.15;
+  limit.prepare(pose, current, goal, shortened);
+  dwb_msgs::msg::Trajectory2D slow;
+  slow.velocity.x = 0.1;
+  EXPECT_DOUBLE_EQ(limit.scoreTrajectory(slow), 0.);
+  slow.velocity.x = 0.11;
+  EXPECT_THROW(limit.scoreTrajectory(slow), dwb_core::IllegalTrajectoryException);
+  // Official time discretization must retain the motion while braking.
+  current.x = 0.3;
+  nav_2d_msgs::msg::Twist2D stop;
+  auto braking = official.generateTrajectory(pose, current, stop);
+  ASSERT_GT(braking.poses.size(), 2u);
+  EXPECT_GT(braking.poses.back().x, 0.12);
+  EXPECT_LE(braking.poses.back().x, 0.15);
+}
+
+TEST_F(NavigationSpeedTest, CartLookaheadDoesNotJumpWhenTheNearestWaypointChanges)
+{
+  unitree_nav2_core::CartLookaheadCritic critic;
+  std::string name = "CartLookahead", ns = "CartPush";
+  critic.initialize(node, name, ns, nullptr);
+  nav_2d_msgs::msg::Path2D path;
+  for (double x : {0., 1., 2.}) {
+    geometry_msgs::msg::Pose2D point;
+    point.x = x;
+    path.poses.push_back(point);
+  }
+  geometry_msgs::msg::Pose2D pose, goal;
+  goal.x = 2.;
+  nav_2d_msgs::msg::Twist2D velocity;
+  for (double x : {0.49, 0.51, 1.49, 1.51}) {
+    pose.x = x;
+    dwb_msgs::msg::Trajectory2D trajectory;
+    geometry_msgs::msg::Pose2D end;
+    end.x = x + 0.4;
+    trajectory.poses.push_back(end);
+    ASSERT_TRUE(critic.prepare(pose, velocity, goal, path));
+    EXPECT_NEAR(critic.scoreTrajectory(trajectory), 0.0, 1e-9);
+  }
+}
+
 TEST_F(NavigationSpeedTest, CartLookaheadRewardsLateralCorrectionAndIncreasesWithSpeed)
 {
   unitree_nav2_core::CartLookaheadCritic critic;
@@ -206,4 +308,46 @@ TEST_F(NavigationSpeedTest, CartLookaheadRewardsLateralCorrectionAndIncreasesWit
   EXPECT_DOUBLE_EQ(corrected.velocity.y, .15);  // The critic never rewrites DWB velocity.
   path.poses.clear();
   EXPECT_FALSE(critic.prepare(pose, velocity, goal, path));
+}
+
+TEST_F(NavigationSpeedTest, ZeroSamplesCannotAcquireSpuriousDirectionSigns)
+{
+  nav_2d_msgs::msg::Twist2D current;
+  current.x = .3;
+  for (const auto & command : generator->getTwists(current)) {
+    for (double axis : {command.x, command.y, command.theta}) {
+      EXPECT_TRUE(axis == 0. || std::abs(axis) >= 1e-7);
+    }
+  }
+}
+
+TEST_F(NavigationSpeedTest, CommandContinuityUsesSelectedCommandsAndSurvivesReplans)
+{
+  unitree_nav2_core::CommandChangeCritic critic;
+  std::string name = "CommandChange", ns = "FollowPath";
+  critic.initialize(node, name, ns, nullptr);
+  geometry_msgs::msg::Pose2D pose, goal;
+  nav_2d_msgs::msg::Path2D path;
+  nav_2d_msgs::msg::Twist2D measured, selected;
+  measured.y = -.18;  // A fluctuating velocity estimate is not command history.
+  selected.y = .1;
+  selected.theta = .15;
+  dwb_msgs::msg::Trajectory2D keep, reverse, brake;
+  keep.velocity = selected;
+  reverse.velocity.y = -.1;
+  reverse.velocity.theta = -.15;
+  critic.prepare(pose, measured, goal, path);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(reverse), 0.);
+  critic.debrief(selected);
+  critic.reset();  // Periodic BT global replans must not discard continuity.
+  critic.prepare(pose, measured, goal, path);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(keep), 0.);
+  EXPECT_GT(critic.scoreTrajectory(reverse), critic.scoreTrajectory(brake));
+  EXPECT_GT(critic.scoreTrajectory(brake), 0.);
+  EXPECT_TRUE(std::isfinite(critic.scoreTrajectory(reverse)));  // A soft preference.
+  // Scoring another candidate must not replace the actually selected command.
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(keep), 0.);
+  std::this_thread::sleep_for(std::chrono::milliseconds(320));
+  critic.prepare(pose, measured, goal, path);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(reverse), 0.);
 }

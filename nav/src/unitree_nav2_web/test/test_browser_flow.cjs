@@ -13,7 +13,7 @@ const web = path.resolve(__dirname, '../web');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'nav-browser-'));
 const actions = Object.fromEntries(['acquire', 'prepare', 'prepare_pose', 'model_set', 'policy', 'zero', 'stop', 'reset',
   'hand_toggle', 'hand_compensation', 'hand_edit', 'hand_load', 'hand_save', 'cart_camera_start',
-  'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable', 'cart_detach'].map(k => [k, true]));
+  'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable', 'cart_detach', 'cart_pose_source'].map(k => [k, true]));
 const lower = [[-1.05,-.724,0,-1.57,-1.75,-1.57,-1.75],[-1.05,-1.05,-1.75,0,0,0,0]];
 const upper = [[1.05,1.05,1.75,0,0,0,0],[1.05,.742,0,1.57,1.75,1.57,1.75]];
 const state = { phase: 'SELECT_MAP', message: '离线界面测试', map_ready: false, localized: false,
@@ -27,7 +27,7 @@ const state = { phase: 'SELECT_MAP', message: '离线界面测试', map_ready: f
     hands:{active:true,healthy:true,pose:'grasp',grasp_revision:0,grasp_dirty:false,lower,upper,
       grasp:lower.map((r,i)=>r.map((x,j)=>(x+upper[i][j])/2)),compensation_available:true},
     high_policy:{enabled:false,camera:{fresh:true,yaw_rad:.1},zero_calibration:{}},
-    cart:{attached:false,epoch:2,valid:true,position:[1,0,0]}},
+    cart:{attached:false,epoch:2,valid:true,position:[1,0,0],pose_source:'grasp',position_source:'抓握几何估计'}},
   navigation_reference:{ready:true,mode:'walk',epoch:2} };
 const calls=[], errors=[], dialogs=[];
 let stamp=0, sequence=0, offline=false, rejectMap=false, delayMs=0, browser;
@@ -72,6 +72,10 @@ const server = http.createServer(async (req,res)=>{
         if(action==='pushcart_enable') {high.enabled=true;loco.cart.attached=true;state.navigation_reference.mode='cart';}
         if(action==='pushcart_disable') high.enabled=false;
         if(action==='cart_detach') {loco.cart.attached=false;state.navigation_reference.mode='walk';}
+        if(action==='cart_pose_source') {
+          loco.cart.pose_source=url.searchParams.get('source');
+          loco.cart.position_source=loco.cart.pose_source==='apriltag'?'AprilTag 视觉位姿（URDF 外参）':'抓握几何估计';
+        }
         loco.cart_request={sequence:id,state:'handled'};
       },120);
       return send({ok:true,request_id:id});
@@ -155,6 +159,21 @@ const server = http.createServer(async (req,res)=>{
     await page.waitForFunction(()=>cartPending===null&&!cartBusy);
     assert.equal(calls.length,count+1);assert.equal(calls.at(-1).query.action,action);
   }
+  // A selection is local until applied, then waits for the executor acknowledgement.
+  for(const source of ['apriltag','grasp']) {
+    count=calls.length;await mutate('#cartPoseSource',source);await refresh();
+    assert.equal(calls.length,count);assert.equal(await page.$eval('#cartPoseSource',e=>e.value),source);
+    await click('#applyCartPoseSource');await waitCall(count);
+    assert.equal(await disabled('#cartPoseSource'),true);
+    await page.waitForFunction(()=>cartPending===null&&!cartBusy);
+    assert.equal(calls.at(-1).query.action,'cart_pose_source');assert.equal(calls.at(-1).query.source,source);
+    assert.equal(state.locomotion.cart.pose_source,source);
+    assert.equal(await page.$eval('#cartPoseSource',e=>e.value),source);
+    assert.equal(await disabled('#applyCartPoseSource'),true);
+  }
+  state.locomotion.actions.cart_pose_source=false;state.locomotion.high_policy.enabled=true;await refresh();
+  assert.equal(await disabled('#cartPoseSource'),true);assert.equal(await disabled('#applyCartPoseSource'),true);
+  state.locomotion.actions.cart_pose_source=true;state.locomotion.high_policy.enabled=false;await refresh();
   count=calls.length;await click('#cartCompensation');await waitCall(count);await page.waitForFunction(()=>cartPending===null&&!cartBusy);
   assert.equal(calls.at(-1).query.enabled,'true');
   assert.match(await page.$eval('#cartZeroStatus',e=>e.textContent),/标定完成/);
@@ -170,6 +189,7 @@ const server = http.createServer(async (req,res)=>{
   state.motion_gate={can_enable:true,blockers:[],suspended:false};await refresh();
   count=calls.length;await drag('#goalMode');await waitCall(count);await refresh();assert.equal(calls.at(-1).path,'/api/goal');
   assert.equal(await disabled('[data-cart-action="hand_toggle"]'),true);assert.equal(await disabled('#processMap'),true);
+  assert.equal(await disabled('#cartPoseSource'),true);assert.equal(await disabled('#applyCartPoseSource'),true);
   count=calls.length;await click('#stopButton');await waitCall(count);await refresh();assert.equal(state.motion_enabled,false);
   state.motion_enabled=true;await refresh();count=calls.length;await drag('#toolbarGoal');await waitCall(count);await refresh();
   count=calls.length;await click('#motionButton');await waitCall(count);await page.waitForFunction(()=>!motionBusy);assert.equal(state.motion_enabled,false);
@@ -202,8 +222,9 @@ const server = http.createServer(async (req,res)=>{
   offline=true;await page.waitForFunction(()=>!statusFresh(),{timeout:6000});await page.waitForFunction(()=>document.querySelector('#locoPolicy').disabled);
   assert.equal(await disabled('[data-cart-action="pushcart_enable"]'),true);assert.equal(await disabled('#motionButton'),true);assert.equal(await disabled('#stopButton'),false);
   assert.equal(await disabled('#locoModelSet'),true);
+  assert.equal(await disabled('#cartPoseSource'),true);assert.equal(await disabled('#applyCartPoseSource'),true);
   offline=false;await refresh();await page.setViewport({width:390,height:844});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   assert.deepEqual(errors,[]);
-  console.log('Browser OK: all Nav controls, 14 hand joints, pending requests, errors, stale status, desktop and mobile layout');
+  console.log('Browser OK: all Nav controls, both cart pose sources, 14 hand joints, pending requests, errors, stale status, desktop and mobile layout');
 })().catch(e=>{console.error(e.stack);process.exitCode=1;}).finally(async()=>{if(browser)await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));fs.rmSync(temporary,{recursive:true,force:true});});

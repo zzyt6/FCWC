@@ -79,39 +79,29 @@ import numpy as np
 if __package__:
     from .apriltag_detector import (DetectionWorker, TagPoseEstimator, load_intrinsics,
                                    make_detector, rotation_to_rpy)
+    from .camera_extrinsics import ZeroWaistCameraExtrinsics
+    from .cart_pose import (TAG_SIZE, BOARD_HEIGHT, TAG_CENTERS, TAG_CORNERS, BOARD_CORNERS,
+                            CartPoseEstimator, transform, rotation_distance, level_from_robot, frame_poses)
     from .opencv_camera_viewer import CameraReader, INTRINSICS_FILE, WARMUP, open_camera
     from .pelvis_attitude import DEFAULT_URDF, G1Kinematics, PelvisCompensator
     from .robot_feedback import RobotFeedback
 else:
     from apriltag_detector import (DetectionWorker, TagPoseEstimator, load_intrinsics,
                                   make_detector, rotation_to_rpy)
+    from camera_extrinsics import ZeroWaistCameraExtrinsics
+    from cart_pose import (TAG_SIZE, BOARD_HEIGHT, TAG_CENTERS, TAG_CORNERS, BOARD_CORNERS,
+                            CartPoseEstimator, transform, rotation_distance, level_from_robot, frame_poses)
     from opencv_camera_viewer import CameraReader, INTRINSICS_FILE, WARMUP, open_camera
     from pelvis_attitude import DEFAULT_URDF, G1Kinematics, PelvisCompensator
     from robot_feedback import RobotFeedback
 
 
-TAG_SIZE = .10
-BOARD_HEIGHT = .775
-TAG_CENTERS = {0: np.array([-.103, .149, .775]),
-               1: np.array([-.103, -.141, .775])}
-# OpenCV decoded corner order, expressed in the detector's OUTPUT tag frame.
-TAG_CORNERS = np.array([[.05, -.05, 0.], [-.05, -.05, 0.],
-                        [-.05, .05, 0.], [.05, .05, 0.]])
-BOARD_CORNERS = np.array([[-.45, -.25, .775], [.45, -.25, .775],
-                          [.45, .25, .775], [-.45, .25, .775]])
 FRAMES = ('camera', 'robot', 'level', 'map')
+COMPARISON_FRAMES = tuple(f'{frame}_{source}' for frame in FRAMES[1:] for source in ('urdf', 'provided'))
+ALL_FRAMES = FRAMES + COMPARISON_FRAMES
 WINDOW = 'Cart pose measurement - Q/Esc quits'
 LOG_DIR = Path(__file__).resolve().parent / 'log'
-
-
-def transform(rotation, position):
-    result = np.eye(4)
-    result[:3, :3], result[:3, 3] = rotation, position
-    return result
-
-
-def rotation_distance(a, b):
-    return math.degrees(math.acos(float(np.clip((np.trace(a.T @ b) - 1.) / 2., -1., 1.))))
+PROVIDED_EXTRINSICS_FILE = Path(__file__).with_name('cart_camera_extrinsics.json')
 
 
 def quaternion_rotation(xyzw):
@@ -123,90 +113,6 @@ def quaternion_rotation(xyzw):
     return np.array([[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
                      [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
                      [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]])
-
-
-def level_from_robot(up):
-    """Gravity-level axes, at the pelvis origin (NOT at ground height)."""
-    up = np.asarray(up, dtype=float)
-    up = up / np.linalg.norm(up)
-    forward = np.array([1., 0., 0.]) - up[0]*up
-    if np.linalg.norm(forward) < 1e-6:
-        raise ValueError('Pelvis forward is vertical')
-    forward /= np.linalg.norm(forward)
-    return transform(np.stack([forward, np.cross(up, forward), up]), np.zeros(3))
-
-
-class CartPoseEstimator:
-    """Joint planar PnP from raw corners; no grasp geometry or temporal filter."""
-    def __init__(self, camera_matrix, distortion, tag_ids=(0, 1), max_rmse_px=2.):
-        self.camera_matrix = np.asarray(camera_matrix, dtype=float)
-        self.distortion = np.asarray(distortion, dtype=float)
-        self.tag_ids = frozenset(tag_ids)
-        self.max_rmse_px = max_rmse_px
-
-    def _solve(self, tags):
-        anchor = np.array([0., 0., BOARD_HEIGHT])
-        object_points = np.concatenate([TAG_CORNERS + TAG_CENTERS[t['id']] - anchor for t in tags])
-        image_points = np.concatenate([np.asarray(t['corners_px'], dtype=float) for t in tags])
-        if image_points.shape != (len(tags)*4, 2) or not np.isfinite(image_points).all():
-            raise ValueError('Invalid tag corners')
-        _, rvecs, tvecs, _ = cv2.solvePnPGeneric(
-            object_points, image_points, self.camera_matrix, self.distortion,
-            flags=cv2.SOLVEPNP_IPPE)
-        candidates = []
-        for rvec, tvec in zip(rvecs, tvecs):
-            rvec, tvec = cv2.solvePnPRefineLM(object_points, image_points,
-                                            self.camera_matrix, self.distortion,
-                                            rvec.copy(), tvec.copy())
-            rotation = cv2.Rodrigues(rvec)[0]
-            position = tvec.reshape(3)
-            if (not np.isfinite(rotation).all() or not np.isfinite(position).all()
-                    or np.any((object_points @ rotation.T + position)[:, 2] <= 0)
-                    or rotation[:, 2] @ position >= 0):
-                continue  # All corners in front of lens; printed faces toward camera.
-            projected = cv2.projectPoints(object_points, rvec, tvec, self.camera_matrix, self.distortion)[0]
-            errors = np.linalg.norm(projected.reshape(-1, 2)-image_points, axis=1)
-            rmse = float(np.sqrt(np.mean(errors**2)))
-            per_tag = np.sqrt(np.mean(errors.reshape(-1, 4)**2, axis=1))
-            candidates.append((rmse, transform(rotation, position-rotation @ anchor), per_tag))
-        if not candidates:
-            return dict(valid=False, reason='no_front_facing_pnp_solution')
-        candidates.sort(key=lambda candidate: candidate[0])
-        rmse, pose, per_tag = candidates[0]
-        result = dict(valid=True, reason='ok', T=pose, rmse_px=rmse,
-                      per_tag_rmse_px={t['id']: float(e) for t, e in zip(tags, per_tag)},
-                      ambiguity_deg=0., ambiguity_gap_px=None)
-        if len(candidates) > 1:
-            gap = candidates[1][0] - rmse
-            angle = rotation_distance(pose[:3, :3], candidates[1][1][:3, :3])
-            result.update(ambiguity_deg=angle, ambiguity_gap_px=gap)
-            if gap < .1 and angle > 15.:
-                result.update(valid=False, reason='planar_pose_ambiguous')
-        if max(per_tag) > self.max_rmse_px:
-            result.update(valid=False, reason='reprojection_error_too_large')
-        return result
-
-    def estimate(self, tags):
-        selected = [tag for tag in tags if tag['id'] in self.tag_ids]
-        ids = [tag['id'] for tag in selected]
-        if not ids:
-            return dict(valid=False, reason='no_cart_tag', tag_ids=[], singles={})
-        if len(ids) != len(set(ids)):
-            return dict(valid=False, reason='duplicate_tag_id', tag_ids=ids, singles={})
-        try:
-            result = self._solve(selected)
-            singles = {tag['id']: self._solve([tag]) for tag in selected}
-        except (cv2.error, ValueError, KeyError) as exc:
-            return dict(valid=False, reason='invalid_corners: '+str(exc), tag_ids=ids, singles={})
-        result.update(tag_ids=ids, singles=singles)
-        if len(singles) == 2 and all(item['valid'] for item in singles.values()):
-            a, b = singles[0]['T'], singles[1]['T']
-            # Use independent single-tag results: a joint fit forces the known baseline.
-            centers = [singles[i]['T'][:3, :3] @ TAG_CENTERS[i] + singles[i]['T'][:3, 3] for i in (0, 1)]
-            result.update(baseline_m=float(np.linalg.norm(centers[0]-centers[1])),
-                          single_position_difference_m=float(np.linalg.norm(a[:3, 3]-b[:3, 3])),
-                          single_rotation_difference_deg=rotation_distance(a[:3, :3], b[:3, :3]))
-        return result
 
 
 class MapTransformReader:
@@ -280,20 +186,46 @@ class MapTransformReader:
         self.process.stdout.close()
 
 
-def frame_poses(estimate, compensation=None, map_from_robot=None):
-    """Compose column-vector transforms; do not mix physical and leveled pelvis."""
-    poses = {}
-    if not estimate['valid']:
+def measurement_poses(estimate, compensation=None, map_from_robot=None, *,
+                      extrinsics_mode='urdf', provided_extrinsics=None):
+    """Reuse one PnP, feedback sample and map lookup for both extrinsic choices.
+
+    In compare mode the original unsuffixed fields remain URDF-based. Explicit
+    *_urdf and *_provided fields make same-frame comparisons unambiguous.
+    """
+    if extrinsics_mode not in ('urdf', 'provided', 'compare'):
+        raise ValueError('Unknown extrinsics mode: '+extrinsics_mode)
+    poses = frame_poses(estimate, compensation, map_from_robot)
+    if extrinsics_mode == 'urdf' or 'robot' not in poses:
         return poses
-    poses['camera'] = estimate['T']
-    if compensation is not None and compensation.get('valid'):
-        robot_from_camera = transform(np.asarray(compensation['R_camera_to_pelvis']),
-                                      np.asarray(compensation['camera_position_in_pelvis_m']))
-        poses['robot'] = robot_from_camera @ poses['camera']
-        poses['level'] = level_from_robot(compensation['up_in_pelvis']) @ poses['robot']
-        if map_from_robot is not None and map_from_robot.get('valid'):
-            poses['map'] = map_from_robot['T'] @ poses['robot']
+    if provided_extrinsics is None:
+        raise ValueError('Provided camera extrinsics are required for this mode')
+    nominal = transform(np.asarray(compensation['R_camera_to_pelvis']),
+                        np.asarray(compensation['camera_position_in_pelvis_m']))
+    supplied = frame_poses(estimate, compensation, map_from_robot,
+                           provided_extrinsics.from_nominal(nominal))
+    if extrinsics_mode == 'provided':
+        return supplied
+    for frame in FRAMES[1:]:
+        if frame in poses:
+            poses[frame+'_urdf'] = poses[frame]
+            poses[frame+'_provided'] = supplied[frame]
     return poses
+
+
+def displayed_frames(extrinsics_mode):
+    return ('camera', *COMPARISON_FRAMES) if extrinsics_mode == 'compare' else FRAMES
+
+
+def extrinsics_differences(poses):
+    differences = {}
+    for frame in FRAMES[1:]:
+        a, b = poses.get(frame+'_urdf'), poses.get(frame+'_provided')
+        if a is not None and b is not None:
+            differences.update(zip((f'provided_minus_urdf_{frame}_{axis}' for axis in AXES[:3]),
+                                   (b[:3, 3]-a[:3, 3]).tolist()))
+            differences[f'provided_vs_urdf_{frame}_rotation_deg'] = rotation_distance(a[:3, :3], b[:3, :3])
+    return differences
 
 
 def pose_values(pose):
@@ -305,13 +237,23 @@ BASE_FIELDS = ['timestamp_unix', 'frame', 'age_ms', 'tag_ids', 'camera_reason', 
                'map_reason', 'rmse_px', 'baseline_m', 'single_position_difference_m',
                'single_rotation_difference_deg', 'ambiguity_deg', 'ambiguity_gap_px']
 AXES = ('x_m', 'y_m', 'z_m', 'roll_deg', 'pitch_deg', 'yaw_deg')
-CSV_FIELDS = BASE_FIELDS + [f'{name}_{axis}' for name in (*FRAMES, 'tag0_camera', 'tag1_camera') for axis in AXES]
+EXTRINSICS_FIELDS = ['extrinsics_mode', 'waist_yaw_deg', 'pelvis_roll_deg', 'pelvis_pitch_deg']
+DIFFERENCE_FIELDS = [name for frame in FRAMES[1:] for name in
+                     (*[f'provided_minus_urdf_{frame}_{axis}' for axis in AXES[:3]],
+                      f'provided_vs_urdf_{frame}_rotation_deg')]
+CSV_FIELDS = (BASE_FIELDS + EXTRINSICS_FIELDS
+              + [f'{name}_{axis}' for name in (*ALL_FRAMES, 'tag0_camera', 'tag1_camera') for axis in AXES]
+              + DIFFERENCE_FIELDS)
 
 
-def csv_row(packet, estimate, poses, stamp, age, robot_reason, map_reason):
+def csv_row(packet, estimate, poses, stamp, age, robot_reason, map_reason, *, extrinsics_mode='urdf'):
     row = dict(timestamp_unix=stamp, frame=packet['frame_number'], age_ms=age*1000,
                tag_ids=' '.join(map(str, estimate['tag_ids'])), camera_reason=estimate['reason'],
-               robot_reason=robot_reason, map_reason=map_reason)
+               robot_reason=robot_reason, map_reason=map_reason, extrinsics_mode=extrinsics_mode)
+    compensation = packet.get('pelvis_compensation') or {}
+    for field, key in [('waist_yaw_deg', 'waist_yaw_deg'), ('pelvis_roll_deg', 'roll_deg'),
+                       ('pelvis_pitch_deg', 'pitch_deg')]:
+        row[field] = compensation.get(key)
     for field in BASE_FIELDS[7:]:
         row[field] = estimate.get(field)
     all_poses = dict(poses)
@@ -320,6 +262,7 @@ def csv_row(packet, estimate, poses, stamp, age, robot_reason, map_reason):
             all_poses[f'tag{tag_id}_camera'] = single['T']
     for name, pose in all_poses.items():
         row.update(zip([f'{name}_{axis}' for axis in AXES], pose_values(pose)))
+    row.update(extrinsics_differences(poses))
     return row
 
 
@@ -356,7 +299,7 @@ def compare(first, second, reference):
                 first=a, second=b)
 
 
-def draw(packet, estimate, poses, matrix, distortion, robot_reason, map_reason):
+def draw(packet, estimate, poses, matrix, distortion, robot_reason, map_reason, *, extrinsics_mode='urdf'):
     image = packet['frame'].copy()
     for tag in packet['tags']:
         if tag['id'] not in TAG_CENTERS:
@@ -371,13 +314,12 @@ def draw(packet, estimate, poses, matrix, distortion, robot_reason, map_reason):
                                        pose[:3, 3], matrix, distortion)[0]
             if np.isfinite(pixels).all() and np.max(np.abs(pixels)) < 1e6:
                 cv2.polylines(image, [np.rint(pixels).astype(np.int32)], True, (255, 255, 0), 2, cv2.LINE_AA)
-    canvas = np.full((max(image.shape[0], 510), image.shape[1]+480, 3), 28, np.uint8)
-    canvas[:image.shape[0], :image.shape[1]] = image
     lines = ['CART ORIGIN: board center projected to ground',
              'X forward | Y left | Z up', 'Cyan: measured 90 x 50 cm top board',
+             'Camera extrinsics: '+extrinsics_mode,
              'Tags: '+str(estimate['tag_ids'])+' | '+estimate['reason'],
              'Reprojection RMS: '+str(round(estimate.get('rmse_px', -1), 3))+' px']
-    for name in FRAMES:
+    for name in displayed_frames(extrinsics_mode):
         if name in poses:
             x, y, z, roll, pitch, yaw = pose_values(poses[name])
             lines += [f'{name}: XYZ {x:+.3f} {y:+.3f} {z:+.3f} m',
@@ -388,10 +330,26 @@ def draw(packet, estimate, poses, matrix, distortion, robot_reason, map_reason):
     if 'baseline_m' in estimate:
         lines += [f"Single-tag baseline: {estimate['baseline_m']*100:.2f} cm (29.00)",
                   f"Single-tag cart gap: {estimate['single_position_difference_m']*100:.2f} cm"]
+    if 'level_provided' in poses:
+        delta = poses['level_provided'][:3, 3]-poses['level_urdf'][:3, 3]
+        lines += [f'Level delta (provided - URDF):',
+                  f'  XYZ {delta[0]:+.4f} {delta[1]:+.4f} {delta[2]:+.4f} m']
+    canvas = np.full((max(image.shape[0], 24*len(lines)+20), image.shape[1]+480, 3), 28, np.uint8)
+    canvas[:image.shape[0], :image.shape[1]] = image
     for index, line in enumerate(lines):
         cv2.putText(canvas, line, (image.shape[1]+12, 26+index*24),
                     cv2.FONT_HERSHEY_SIMPLEX, .47, (225, 225, 225), 1, cv2.LINE_AA)
     return canvas
+
+
+def print_extrinsics(provided):
+    print('Zero waist yaw; camera optical -> physical pelvis; translation in meters.')
+    print('URDF:\n'+np.array2string(provided.urdf_zero, precision=11, suppress_small=True))
+    print('Provided:\n'+np.array2string(provided.provided_zero, precision=11, suppress_small=True))
+    print('Translation difference (provided - URDF), m:',
+          provided.provided_zero[:3, 3]-provided.urdf_zero[:3, 3])
+    print('Rotation difference, deg:', rotation_distance(provided.urdf_zero[:3, :3],
+                                                        provided.provided_zero[:3, :3]))
 
 
 def run(args):
@@ -400,6 +358,9 @@ def run(args):
     estimator = CartPoseEstimator(matrix, distortion, args.tag_ids, args.max_rmse_px)
     if not args.no_display and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
         raise RuntimeError('No desktop display; add --no-display')
+    model = None if args.camera_only else G1Kinematics(args.robot_urdf)
+    provided = (ZeroWaistCameraExtrinsics(model, args.extrinsics_file)
+                if args.extrinsics != 'urdf' else None)
     output = args.output or LOG_DIR / ('cart_pose_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.csv')
     output.parent.mkdir(parents=True, exist_ok=True)
     metadata = dict(created_utc=datetime.now(timezone.utc).isoformat(),
@@ -409,7 +370,12 @@ def run(args):
                     camera_axes='X image right, Y image down, Z optical forward',
                     robot_frame='physical pelvis base_link', level_frame='gravity-level axes at pelvis origin',
                     map_frame='map, via TF map <- robot base_link at image receive time minus latency',
-                    extrinsics='nominal robot URDF + assumed optical axes, not separately calibrated',
+                    extrinsics_mode=args.extrinsics,
+                    primary_pose_source='provided' if args.extrinsics == 'provided' else 'urdf',
+                    extrinsics=(provided.metadata() if provided else
+                                'nominal robot URDF + assumed optical axes, not separately calibrated'),
+                    comparison_fields='*_urdf and *_provided use the same image, feedback and map transform; '
+                                      'unsuffixed robot/level/map are URDF in compare mode',
                     smoothing='none', intrinsics=str(args.intrinsics), camera_matrix=matrix.tolist(),
                     distortion=distortion.tolist(),
                     arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
@@ -427,7 +393,7 @@ def run(args):
         if not args.camera_only:
             feedback = RobotFeedback(args.network_interface)
             resources.callback(feedback.close)
-            compensator = PelvisCompensator(feedback, G1Kinematics(args.robot_urdf), source='imu',
+            compensator = PelvisCompensator(feedback, model, source='imu',
                                            timeout_s=.1, sync_tolerance_s=.03,
                                            camera_latency_s=args.camera_latency_ms/1000.)
         reader = CameraReader(open_camera(args.device), 0)
@@ -443,6 +409,9 @@ def run(args):
             cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
             resources.callback(cv2.destroyAllWindows)
         print('Read-only cart measurement. No pose smoothing. CSV: '+str(output), flush=True)
+        print('Camera extrinsics: '+args.extrinsics, flush=True)
+        if provided is not None:
+            print_extrinsics(provided)
         print('Map: '+('enabled, timestamped TF lookup' if mapper else 'disabled; use --map'), flush=True)
         previous, started, last_report = 0, None, 0.
         try:
@@ -475,21 +444,29 @@ def run(args):
                 if not 0 <= age <= args.max_age:
                     estimate.update(valid=False, reason='image_stale')
                     robot_reason = map_reason = 'image_stale'
-                poses = frame_poses(estimate, compensation, map_result)
-                writer.writerow(csv_row(packet, estimate, poses, stamp, age, robot_reason, map_reason))
+                poses = measurement_poses(estimate, compensation, map_result,
+                                          extrinsics_mode=args.extrinsics, provided_extrinsics=provided)
+                writer.writerow(csv_row(packet, estimate, poses, stamp, age, robot_reason, map_reason,
+                                        extrinsics_mode=args.extrinsics))
                 if now-last_report >= 1.:
                     stream.flush()
-                    status = ' | '.join(f'{name}: '+np.array2string(np.array(pose_values(pose)), precision=3)
-                                        for name, pose in poses.items())
-                    print(f"tags={estimate['tag_ids']} {estimate['reason']} | XYZ(m), RPY(deg) | {status} | map={map_reason}", flush=True)
+                    status = ' | '.join(f'{name}: '+np.array2string(np.array(pose_values(poses[name])), precision=4)
+                                        for name in displayed_frames(args.extrinsics) if name in poses)
+                    print(f"tags={estimate['tag_ids']} {estimate['reason']} | extrinsics={args.extrinsics} | "
+                          f"XYZ(m), RPY(deg) | {status} | map={map_reason}", flush=True)
+                    if 'level_provided' in poses:
+                        delta = poses['level_provided'][:3, 3]-poses['level_urdf'][:3, 3]
+                        print('level provided - URDF XYZ(m): '+np.array2string(delta, precision=5), flush=True)
                     last_report = now
                 if not args.no_display:
-                    cv2.imshow(WINDOW, draw(packet, estimate, poses, matrix, distortion, robot_reason, map_reason))
+                    cv2.imshow(WINDOW, draw(packet, estimate, poses, matrix, distortion, robot_reason, map_reason,
+                                           extrinsics_mode=args.extrinsics))
                     if cv2.waitKey(1) & 0xff in (27, ord('q'), ord('Q')):
                         break
         except KeyboardInterrupt:
             pass
-    report = {name: summarize(output, name) for name in FRAMES}
+    report = {name: summarize(output, name) for name in
+              (ALL_FRAMES if args.extrinsics == 'compare' else FRAMES)}
     output.with_suffix('.summary.json').write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps(report, indent=2))
 
@@ -499,6 +476,10 @@ def main():
     parser.add_argument('--device', default='auto')
     parser.add_argument('--intrinsics', type=Path, default=INTRINSICS_FILE)
     parser.add_argument('--robot-urdf', type=Path, default=DEFAULT_URDF)
+    parser.add_argument('--extrinsics', choices=('urdf', 'provided', 'compare'), default='urdf',
+                        help='camera -> pelvis transform; compare uses the same observations for both')
+    parser.add_argument('--extrinsics-file', type=Path, default=PROVIDED_EXTRINSICS_FILE,
+                        help='provided camera optical -> pelvis matrix at zero waist yaw, in meters')
     parser.add_argument('--network-interface', default='eth0')
     parser.add_argument('--camera-only', action='store_true', help='do not subscribe to robot feedback')
     parser.add_argument('--map', action='store_true', help='read map <- robot base_link from existing ROS TF')
@@ -515,7 +496,8 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--summarize', type=Path, help='summarize an existing CSV; no camera/robot access')
     mode.add_argument('--compare', type=Path, nargs=2, metavar=('BEFORE', 'AFTER'), help='compare two static CSV recordings')
-    parser.add_argument('--reference', choices=FRAMES, default='map', help='frame for summary/comparison')
+    mode.add_argument('--show-extrinsics', action='store_true', help='print both zero-waist matrices; no camera/robot access')
+    parser.add_argument('--reference', choices=ALL_FRAMES, default='map', help='frame for summary/comparison')
     args = parser.parse_args()
     for name in ('duration', 'camera_latency_ms'):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
@@ -527,10 +509,14 @@ def main():
         parser.error('--quad-decimate must be at least 1')
     if args.map and args.camera_only:
         parser.error('--map requires robot feedback; remove --camera-only')
+    if args.camera_only and args.extrinsics != 'urdf':
+        parser.error('--extrinsics provided/compare requires robot feedback; remove --camera-only')
     if args.summarize:
         print(json.dumps(summarize(args.summarize, args.reference), indent=2))
     elif args.compare:
         print(json.dumps(compare(*args.compare, args.reference), indent=2))
+    elif args.show_extrinsics:
+        print_extrinsics(ZeroWaistCameraExtrinsics(G1Kinematics(args.robot_urdf), args.extrinsics_file))
     else:
         run(args)
 

@@ -27,7 +27,8 @@ REQUEST_CODES = {
     "model_set": 8,
 }
 CART_ACTIONS = frozenset(('hand_toggle', 'hand_compensation', 'hand_edit', 'hand_load', 'hand_save',
-                          'cart_camera_start', 'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable', 'cart_detach'))
+                          'cart_camera_start', 'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable', 'cart_detach',
+                          'cart_pose_source'))
 # The request's payload byte selects a Viser pose; joint targets live in Viser.
 PREPARE_POSE_CODES = {"original": 0, "arms_down": 1}
 MODEL_SET_CODES = {"v81": 0, "v82": 1}
@@ -76,6 +77,8 @@ def locomotion_actions(status):
     editing = available and hands.get('editor_available') and not high.get('enabled') and not hands.get('file_busy')
     actions.update({name: bool(editing) for name in ('hand_edit', 'hand_load', 'hand_save')})
     actions.update(
+        cart_pose_source=bool(available and high and not high.get('enabled') and not high.get('motion_blocked')
+                              and (high.get('zero_calibration') or {}).get('status') != 'collecting'),
         hand_toggle=bool(available and stage in ('HOLDING', 'POLICY') and hands.get('healthy')
                          and status.get('armed') and not high.get('enabled') and hand_idle),
         hand_compensation=bool(available and status.get('armed') and stage in ('ZERO', 'HOLDING', 'POLICY')

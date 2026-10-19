@@ -1,6 +1,21 @@
 {
   "schema": "pushcart_navigation_v1",
-  "task_limits": [[-0.2, 0.6], [-0.15, 0.15], [-0.3, 0.3]],
+  "pose_source": "grasp",
+  "camera_quad_decimate": 2.0,
+  "task_limits": [
+    [
+      -0.2,
+      0.6
+    ],
+    [
+      -0.3,
+      0.3
+    ],
+    [
+      -0.4,
+      0.4
+    ]
+  ],
   "footprint_padding_m": 0.0,
   "tracking_margin_m": 0.0,
   "relative_yaw_margin_rad": 0.0,
@@ -10,7 +25,18 @@
     "frame": "base_link",
     "padding_m": 0.0,
     "boxes": [
-      {"min_m": [-1.0, -0.6, -2.0], "max_m": [-0.5, 0.6, 2.0]}
+      {
+        "min_m": [
+          -1.0,
+          -0.6,
+          -2.0
+        ],
+        "max_m": [
+          -0.5,
+          0.6,
+          2.0
+        ]
+      }
     ]
   }
 }

@@ -246,7 +246,18 @@ class ViserPushPolicy:
         self.history_time = -float('inf')
         self.history_key = None
 
+    def set_navigation_pose_source(self, source, now):
+        if self.enabled or self.motion_blocked:
+            raise ValueError('请先退出推车策略再切换位姿方式')
+        self.camera.set_pose_source(source, now)
+        self.cancel_zero_calibration('位姿方式已切换')
+        self._forget_history()
+        self.core.reset_task(preserve_history=True)
+        self.hold.reset()
+
     def zero_reason(self, control, state, now):
+        if getattr(self.camera, 'pose_source', 'grasp') == 'apriltag':
+            return '视觉位姿使用标签安装坐标，无需手动航向归零'
         if state is None or control.stage != 'POLICY' or not state.flags & 1:
             return '先完成准备并启动混合策略站立'
         if self.enabled or self.motion_blocked:

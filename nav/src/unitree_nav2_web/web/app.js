@@ -27,6 +27,7 @@ let modelSetError = '';
 let cartBusy = false;
 let cartError = '';
 let cartPending = null;
+let cartPoseDirty = false;
 let lifecyclePending = null;
 let mapBusy = false;
 let poseBusy = false;
@@ -719,7 +720,7 @@ function drawCart(dpr) {
       ctx.lineTo(...handle[1]); ctx.stroke();
     }
     const degrees = Math.atan2(Math.sin(pose.yaw), Math.cos(pose.yaw)) * 180 / Math.PI;
-    drawArrow(pose, color, 22 * dpr, `小车 ${degrees.toFixed(1)}°（位置估计）`);
+    drawArrow(pose, color, 22 * dpr, `小车地图航向 ${degrees.toFixed(1)}°（位置估计）`);
   }
   ctx.restore();
 }
@@ -750,12 +751,17 @@ function updateCartUi(loco) {
   const reply = loco.cart_request || {};
   if (cartPending && reply.sequence === cartPending.id && reply.state !== 'queued') {
     cartError = reply.state === 'rejected' ? reply.error || '操作未执行' : '';
+    if (reply.state === 'handled' && cartPending.action === 'cart_pose_source') cartPoseDirty = false;
     cartPending = null;
   } else if (cartPending && Date.now() - cartPending.started > 5000) {
     cartError = '操作未确认，请核对当前抓握及策略状态后重试';
     cartPending = null;
   }
   const busy = cartBusy || !!cartPending || !statusFresh();
+  const poseSelect = $('cartPoseSource');
+  if (!cartPoseDirty) poseSelect.value = cart.pose_source || 'grasp';
+  poseSelect.disabled = busy || !!status.navigation_active || !actions.cart_pose_source;
+  $('applyCartPoseSource').disabled = poseSelect.disabled || poseSelect.value === (cart.pose_source || 'grasp');
   setBadge('cartBadge', cart.attached ? '小车中心导航' : '普通导航', cart.attached ? 'ok' : '');
   document.querySelectorAll('[data-cart-action]').forEach(button => {
     button.disabled = busy || !!status.navigation_active || !actions[button.dataset.cartAction];
@@ -777,10 +783,13 @@ function updateCartUi(loco) {
     : ['grasp', 'grasp_compensated'].includes(hands.pose) ? '松手 / 手指归零' : '抓握小车';
   const lines = [high.enabled ? '推车高层运行中' : '推车高层未启用',
     `Dex3：${hands.pose || '未连接'}${hands.moving ? '（动作中）' : ''}`];
+  lines.push(cart.pose_source === 'apriltag' ? '位姿方式：视觉 AprilTag · URDF 相机外参' : '位姿方式：固定抓握（无滑移假设）');
   if (high.history_required) lines.push(`策略观测 ${high.history_frames || 0}/${high.history_required}`);
   lines.push(camera.fresh && Number.isFinite(camera.yaw_rad)
     ? `小车相对机身航向 ${(camera.yaw_rad * 180 / Math.PI).toFixed(1)}°（实测）` : '等待新鲜的小车航向');
-  if (cart.valid && cart.position) lines.push(`小车中心相对机身：${cart.position.slice(0, 2).map(v => v.toFixed(2)).join(', ')} m（抓握几何估计）`);
+  if (cart.valid && cart.position) lines.push(`小车中心相对机身：${cart.position.slice(0, 2).map(v => v.toFixed(3)).join(', ')} m（${cart.position_source || '抓握几何估计'}）`);
+  if (!cart.valid && cart.reason) lines.push(`位姿未就绪：${cart.reason}`);
+  if (Number.isFinite(cart.rmse_px)) lines.push(`视觉重投影误差：${cart.rmse_px.toFixed(3)} px`);
   if (reference.mode === 'cart') lines.push(`车体过滤：${reference.removed_points || 0} 点；${reference.ready ? '导航参考已就绪' : reference.reason || '等待参考点'}`);
   const calibration = high.zero_calibration || {};
   const zeroLines = [calibration.message || high.zero_reason || '等待航向标定'];
@@ -800,7 +809,7 @@ async function cartRequest(action, values = {}) {
   cartBusy = true; cartError = ''; updateCartUi(status.locomotion || {});
   try {
     const result = await api(`/api/locomotion?${new URLSearchParams({ action, ...values })}`);
-    cartPending = { id: result.request_id, started: Date.now() };
+    cartPending = { id: result.request_id, action, started: Date.now() };
     await refreshStatus();
   } catch (error) { cartError = error.message; }
   finally { cartBusy = false; updateUi(); draw(); }
@@ -811,6 +820,8 @@ document.querySelectorAll('[data-cart-action]').forEach(button => {
 $('cartCompensation').onclick = () => cartRequest('hand_compensation', {
   enabled: !status.locomotion?.hands?.compensation_enabled,
 });
+$('cartPoseSource').onchange = () => { cartPoseDirty = true; updateCartUi(status.locomotion || {}); };
+$('applyCartPoseSource').onclick = () => cartRequest('cart_pose_source', { source: $('cartPoseSource').value });
 
 function updateSpeedUi() {
   const speed = status.navigation_speed || {};

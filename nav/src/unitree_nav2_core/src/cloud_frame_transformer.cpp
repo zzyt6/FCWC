@@ -1,10 +1,12 @@
 #include <chrono>
 #include <functional>
+#include <deque>
 #include <memory>
 #include <string>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/time_reference.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.h>
@@ -24,28 +26,56 @@ public:
     subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       get_parameter("input_topic").as_string(), rclcpp::SensorDataQoS(),
       std::bind(&CloudFrameTransformer::cloudCallback, this, std::placeholders::_1));
+    timing_subscription_ = create_subscription<sensor_msgs::msg::TimeReference>(
+      "/g1/lidar_time_reference", 20,
+      [this](const sensor_msgs::msg::TimeReference::SharedPtr timing) {
+        timings_.push_back(*timing);
+        while (timings_.size() > 30) {timings_.pop_front();}
+        publishPending();
+      });
+    timer_ = create_wall_timer(std::chrono::milliseconds(5), [this]() {publishPending();});
   }
 
 private:
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr message)
   {
-    try
-    {
-      const auto transform = buffer_.lookupTransform(
-        target_frame_, message->header.frame_id, rclcpp::Time(0),
-        rclcpp::Duration(0, 100000000));
-      sensor_msgs::msg::PointCloud2 output;
-      tf2::doTransform(*message, output, transform);
-      output.header.frame_id = target_frame_;
-      // Keep the original sensor time inside FAST-LIO, but put the current
-      // body-frame scan onto the ROS clock before AMCL, costmaps, and Nav2.
-      output.header.stamp = now();
-      publisher_->publish(output);
-    }
-    catch (const tf2::TransformException &error)
-    {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 3000, "Point cloud TF unavailable: %s", error.what());
+    pending_.emplace_back(std::chrono::steady_clock::now(), message);
+    while (pending_.size() > 5) {pending_.pop_front();}
+    publishPending();
+  }
+
+  void publishPending()
+  {
+    // The cloud and odometry come from the same FAST-LIO frame. Use that
+    // frame's converted acquisition stamp and waist transform, even if DDS
+    // delivers the cloud before its TF/time-reference messages.
+    while (!pending_.empty()) {
+      const auto & message = pending_.front().second;
+      bool published = false;
+      for (const auto & timing : timings_) {
+        if (timing.time_ref != message->header.stamp) {continue;}
+        try {
+          const auto transform = buffer_.lookupTransform(
+            target_frame_, message->header.frame_id, rclcpp::Time(timing.header.stamp));
+          sensor_msgs::msg::PointCloud2 output;
+          tf2::doTransform(*message, output, transform);
+          output.header.frame_id = target_frame_;
+          output.header.stamp = timing.header.stamp;
+          publisher_->publish(output);
+          published = true;
+        } catch (const tf2::TransformException &) {
+          // Wait without blocking reception of the matching TF.
+        }
+        break;
+      }
+      const bool expired = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - pending_.front().first).count() > .3;
+      if (!published && !expired) {break;}
+      if (expired && !published) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+          "Point cloud dropped: missing transform/time reference at acquisition time");
+      }
+      pending_.pop_front();
     }
   }
 
@@ -54,6 +84,11 @@ private:
   tf2_ros::TransformListener listener_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
+  rclcpp::Subscription<sensor_msgs::msg::TimeReference>::SharedPtr timing_subscription_;
+  rclcpp::TimerBase::SharedPtr timer_;
+  std::deque<sensor_msgs::msg::TimeReference> timings_;
+  std::deque<std::pair<std::chrono::steady_clock::time_point,
+    sensor_msgs::msg::PointCloud2::SharedPtr>> pending_;
 };
 
 int main(int argc, char **argv)

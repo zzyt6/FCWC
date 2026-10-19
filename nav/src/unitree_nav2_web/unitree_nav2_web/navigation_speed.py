@@ -87,6 +87,10 @@ class NavigationSpeedSettings:
             Parameter("FollowPath.navigation_speed", value=speed).to_parameter_msg(),
             Parameter("CartPush.navigation_speed_mode", value=mode).to_parameter_msg(),
             Parameter("CartPush.navigation_speed", value=speed).to_parameter_msg(),
+            # Let the official iterator discard over-limit speeds before
+            # rolling them out. The speed critic also checks the cap, including
+            # while the kinematics parameter event is still in transit.
+            Parameter("CartPush.max_speed_xy", value=speed).to_parameter_msg(),
         ]
         self.pending = True
         self.error = ""

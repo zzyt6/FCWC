@@ -43,7 +43,7 @@ from core.controller import Controller, STAGES  # noqa: E402
 from core.joint_monitor import limits, live_warnings, WarningBoard  # noqa: E402
 from core.model_sets import ModelSets, MODEL_SET_LABELS  # noqa: E402
 from core.hand_grasp import HAND_LOWER, HAND_UPPER  # noqa: E402
-from unitree_nav2_web.cart_geometry import CartGeometry, load_settings  # noqa: E402
+from unitree_nav2_web.cart_geometry import CartGeometry, POSE_SOURCES, load_settings, save_pose_source, PelvisYawHistory  # noqa: E402
 from unitree_nav2_web.locomotion import locomotion_actions  # noqa: E402
 
 # Must match nav/src/unitree_g1_kinematics/include/unitree_g1_kinematics/velocity_packet.hpp
@@ -62,11 +62,11 @@ MODEL_SETS = {0: 'v81', 1: 'v82'}
 # Executor's single internal "browser" identity inside Viser's WebControl.
 CLIENT = 1
 COMMAND_TIMEOUT_S = 0.25
-STATUS_INTERVAL_S = 0.05
+EXECUTOR_PERIOD_S = 0.02
 NAV_CART_CONFIG = WORKSPACE / 'nav/config/pushcart_navigation.json'
 CART_ACTIONS = frozenset(('hand_toggle', 'hand_compensation', 'hand_edit', 'hand_load', 'hand_save',
                           'cart_camera_start', 'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable',
-                          'cart_detach'))
+                          'cart_detach', 'cart_pose_source'))
 
 
 class Executor:
@@ -77,13 +77,22 @@ class Executor:
         self.status_port = status_port
         self.geometry_port = geometry_port
         self.cart_settings = load_settings(cart_config)
+        self.cart_config_path = Path(cart_config)
+        self.cart_pose_source = self.cart_settings['pose_source']
         self.cart_geometry = CartGeometry(self.cart_settings)
+        self.pelvis_yaw_history = PelvisYawHistory()
         self.cart_limits = np.asarray(self.cart_settings['task_limits'])
         highs = ([entry['high'] for entry in controller.model_sets.entries.values()]
                  if controller.model_sets is not None else [controller.high_policy])
         for high in highs:
             if high is not None:
                 high.limits = self.cart_limits.copy()
+                if high.camera_process is not None:
+                    high.camera_process.publish_cart_pose = True
+                    high.camera_process.quad_decimate = self.cart_settings['camera_quad_decimate']
+                    high.camera_process.missing_tag_dir = WORKSPACE / 'nav/log/missing_tags'
+                if self.cart_pose_source != 'grasp':
+                    high.set_navigation_pose_source(self.cart_pose_source, clock())
         self.cart_attached = False
         self.navigation_epoch = (int(clock()*1e6) & 0xfffffffe) or 2
         self.cart_error = ''
@@ -111,6 +120,7 @@ class Executor:
         self.last_request_sequence = -1
         self.cart_request = {}
         self.cart_request_tick = None
+        self.pending_pose_source = None
         self.last_claim = -float('inf')
         self.warning_lower, self.warning_upper = limits(controller.config)
         self.warning_board = WarningBoard(clock=clock)
@@ -195,6 +205,9 @@ class Executor:
     def request(self, kind, *, pose=None, **payload):
         """Operator lifecycle request from the nav web page."""
         if kind in CART_ACTIONS:
+            if self.pending_pose_source is not None:
+                self.cart_error = '正在确认小车位姿切换，请稍候'
+                return False
             data = self.control.snapshot()
             operator = dict(data, online=True, owned=data.get('owner') == CLIENT and data.get('source') == 'web',
                             armed=bool(self.control.backend.armed), mode=self.control.mode,
@@ -208,7 +221,19 @@ class Executor:
                 return False
             self.enabled = self.new_motion = False
             self.accept_after = self.clock()
-            if kind == 'cart_detach':
+            if kind == 'cart_pose_source':
+                source = payload.get('source')
+                if set(payload) != {'source'} or source not in POSE_SOURCES:
+                    raise ValueError('请选择有效的小车位姿方式')
+                camera_source = ((data.get('high_policy') or {}).get('camera') or {}).get('pose_source', 'grasp')
+                if source != self.cart_pose_source or camera_source != source:
+                    self.pending_pose_source = dict(source=source, request_id=self.last_request_sequence,
+                                                    started=self.clock())
+                    # Only the control thread may change camera/policy history.
+                    self.control.emit('navigation_pose_source', CLIENT, source=source,
+                                      request_id=self.last_request_sequence)
+                    self._advance_navigation_epoch()
+            elif kind == 'cart_detach':
                 high = data.get('high_policy') or {}
                 hands = data.get('dex3') or {}
                 if high.get('enabled') or high.get('motion_blocked') or hands.get('pose') in ('grasp', 'grasp_compensated'):
@@ -256,7 +281,11 @@ class Executor:
             return
         self._stop_motion()
         self.cart_attached = attached
-        self.navigation_epoch = ((((self.navigation_epoch & 0xfffffffe)+2) & 0xfffffffe) or 2) | int(attached)
+        self._advance_navigation_epoch()
+
+    def _advance_navigation_epoch(self):
+        self._stop_motion()
+        self.navigation_epoch = ((((self.navigation_epoch & 0xfffffffe)+2) & 0xfffffffe) or 2) | int(self.cart_attached)
         self.accept_after = self.clock()
         self.enabled = self.new_motion = False
 
@@ -264,9 +293,18 @@ class Executor:
         high = data.get('high_policy') or {}
         camera = high.get('camera') or {}
         state = data.get('state') or {}
+        current_yaw = self.pelvis_yaw_history.add(state)
         result = dict(attached=self.cart_attached, mode='cart' if self.cart_attached else 'walk',
                       epoch=self.navigation_epoch, valid=False, error=self.cart_error,
+                      pose_source=self.cart_pose_source,
+                      pose_source_options=[dict(value=key, label=label) for key, label in POSE_SOURCES.items()],
                       task_limits=self.cart_settings['task_limits'])
+        if self.pending_pose_source is not None:
+            result['reason'] = '正在切换小车位姿方式'
+            return result
+        if camera.get('pose_source', 'grasp') != self.cart_pose_source:
+            result['reason'] = '相机位姿方式与导航不一致，请重新选择位姿方式'
+            return result
         stamp = camera.get('captured_monotonic')
         if not data.get('healthy'):
             result['reason'] = '机器人反馈不可用：' + (data.get('reason') or '反馈不新鲜或健康检查未通过')
@@ -276,12 +314,52 @@ class Executor:
             result['reason'] = '小车 AprilTag 航向不可用：' + (camera.get('reason') or '相机观测已过期')
             return result
         try:
-            result.update(self.cart_geometry.estimate(dict(zip(JOINT_NAMES, state['q'])), state['quat'], camera['yaw_rad']))
+            joints = dict(zip(JOINT_NAMES, state['q']))
+            if self.cart_pose_source == 'apriltag':
+                observation = camera.get('cart_pose_urdf') or {}
+                if (camera.get('pose_source') != 'apriltag' or observation.get('valid') is not True
+                        or observation.get('captured_monotonic') != stamp):
+                    raise ValueError(observation.get('reason', '等待同一帧的完整视觉位姿'))
+                captured_state = self.pelvis_yaw_history.at(stamp)
+                captured_joints = dict(zip(JOINT_NAMES, captured_state['q']))
+                result.update(self.cart_geometry.estimate_visual(
+                    captured_joints, captured_state['quat'], observation))
+                result['sample_monotonic'] = stamp
+            else:
+                yaw, correction = self.pelvis_yaw_history.align(camera['yaw_rad'], stamp, current_yaw)
+                result.update(self.cart_geometry.estimate(joints, state['quat'], yaw))
+                result['sample_monotonic'] = state['received']
+                result['heading_alignment'] = dict(camera_yaw_rad=camera['yaw_rad'],
+                    correction_rad=correction, feedback_monotonic=state['received'],
+                    captured_monotonic=stamp)
             result.update(valid=True, captured_monotonic=stamp)
         except (KeyError, ValueError, TypeError) as exc:
             result['error'] = '小车位置估计不可用：' + str(exc)
             result['reason'] = result['error']
         return result
+
+    def _confirm_pose_source(self, data, now):
+        pending = self.pending_pose_source
+        if pending is None:
+            return
+        reply = data.get('navigation_pose_result') or {}
+        if reply.get('request_id') == pending['request_id'] and reply.get('source') == pending['source']:
+            if reply.get('accepted'):
+                self.cart_pose_source = pending['source']
+                self.cart_error = ''
+                try:
+                    save_pose_source(self.cart_config_path, self.cart_pose_source)
+                except (OSError, ValueError) as exc:
+                    self.cart_error = '位姿方式已应用，但保存失败：'+str(exc)
+                self.cart_request.update(state='handled', error=self.cart_error)
+            else:
+                self.cart_error = reply.get('error', '位姿切换未执行')
+                self.cart_request.update(state='rejected', error=self.cart_error)
+            self.pending_pose_source = None
+        elif now-pending['started'] > 1.:
+            self.cart_error = '位姿切换未收到控制器确认，请重试'
+            self.cart_request.update(state='rejected', error=self.cart_error)
+            self.pending_pose_source = None
 
     def step(self):
         now = self.clock()
@@ -290,6 +368,9 @@ class Executor:
         now = self.clock()
         data = self.control.snapshot()
         high = data.get('high_policy') or {}
+        camera_process = self.control.high_policy.camera_process if self.control.high_policy is not None else None
+        if camera_process is not None:
+            camera_process.record_missing_tags(data.get('stage') == 'POLICY' and high.get('enabled'), now)
         if high.get('enabled') or high.get('motion_blocked'):
             self._set_attached(True)
         stopped = data.get('stage') in ('DAMPED', 'FAULT')
@@ -331,9 +412,11 @@ class Executor:
                          message='告警显示暂时不可用（机身控制继续）：' + str(exc)[:200])]
 
     def _report(self, data, now, fresh):
-        if now - self.last_status < STATUS_INTERVAL_S:
-            return
+        # One report per executor tick also carries the latest cart geometry.
+        # A second elapsed-time throttle would skip alternate ticks whenever
+        # the 50 Hz scheduler wakes a little earlier than the previous tick.
         self.last_status = now
+        self._confirm_pose_source(data, now)
         stage = data.get('stage', 'WAITING')
         dex3 = data.get('dex3') or {}
         owned = data.get('source') == 'web' and data.get('owner') == CLIENT
@@ -350,7 +433,8 @@ class Executor:
                        'recovering', 'recovery_pending', 'blocking_reason', 'grasp', 'grasp_revision', 'grasp_dirty', 'editor_available', 'editor_message',
                        'compensation_enabled', 'compensation_available', 'file_busy', 'q', 'ever_started')}
         hand_status.update(lower=HAND_LOWER.tolist(), upper=HAND_UPPER.tolist())
-        if self.cart_request.get('state') == 'queued' and (data.get('state') or {}).get('tick') != self.cart_request_tick:
+        if (self.cart_request.get('state') == 'queued' and self.pending_pose_source is None
+                and (data.get('state') or {}).get('tick') != self.cart_request_tick):
             self.cart_request['state'] = 'handled'
         # The controller may have switched since this snapshot was captured.
         # Report the hashes belonging to the snapshot's model, not a newer one.
@@ -452,9 +536,13 @@ def main():
                  config.motion_settings['heading_kp'], args.heading_source,
                  MODEL_SET_LABELS[controller.model_set], controller.policy.source_sha256['homie'],
                  args.command_port, args.status_port), flush=True)
+        deadline = time.monotonic()
         while not stop.is_set():
             executor.step()
-            stop.wait(.02)
+            # Include processing in the 20 ms period. Sleeping 20 ms after
+            # every step makes the receiver slower than its 50 Hz input.
+            deadline = max(deadline + EXECUTOR_PERIOD_S, time.monotonic())
+            stop.wait(max(0., deadline - time.monotonic()))
     finally:
         if controller:
             controller.close()

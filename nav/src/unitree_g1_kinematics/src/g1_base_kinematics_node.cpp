@@ -18,10 +18,13 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/time_reference.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
 #include "unitree_g1_kinematics/lowstate_packet.hpp"
+#include "unitree_g1_kinematics/state_timing.hpp"
 
 namespace
 {
@@ -86,6 +89,7 @@ public:
     declare_parameter<int>("lowstate_udp_port", 39001);
     declare_parameter<std::string>("fastlio_odom_topic", "/Odometry");
     declare_parameter<std::string>("base_odom_topic", "/Odometry_base");
+    declare_parameter<std::string>("imu_topic", "/utlidar/imu_livox_mid360");
     declare_parameter<std::string>("base_frame", "base_link");
     declare_parameter<std::string>("navigation_frame", "base_nav");
     declare_parameter<std::string>("model_variant", "auto");
@@ -100,21 +104,25 @@ public:
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(
         get_parameter("base_odom_topic").as_string(), 20);
     joint_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", 20);
-    mount_pub_ = create_publisher<geometry_msgs::msg::TransformStamped>("/g1/lidar_mount", 3);
-    mount_timer_ = create_wall_timer(std::chrono::milliseconds(50), [this]() {
-      KinematicState state;
-      { std::lock_guard<std::mutex> lock(state_mutex_); state = state_; }
-      if (!state.received || std::chrono::steady_clock::now()-state.receipt_time >
-          std::chrono::milliseconds(300)) return;
-      for (const auto q : state.q) if (!std::isfinite(q)) return;
-      const auto chain = localUrdfChain(state, isRevisionModel(state.mode_machine),
-        hasThreeDofWaist(state.mode_machine), isWaistLocked(state.mode_machine));
-      auto mount = Eigen::Isometry3d::Identity();
-      for (std::size_t i = 0; i+1 < chain.size(); ++i) mount = mount * chain[i];
-      std_msgs::msg::Header header;
-      header.stamp = now();
-      mount_pub_->publish(toTransform(mount, header, base_frame_, "livox_frame"));
-    });
+    timing_pub_ = create_publisher<sensor_msgs::msg::TimeReference>("/g1/lidar_time_reference", 20);
+    clock_pub_ = create_publisher<sensor_msgs::msg::TimeReference>("/g1/lidar_clock", rclcpp::SensorDataQoS());
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+      get_parameter("imu_topic").as_string(), rclcpp::SensorDataQoS(),
+      [this](const sensor_msgs::msg::Imu::SharedPtr imu) {
+        const double received = steadySeconds();
+        const double sensor = rclcpp::Time(imu->header.stamp).seconds();
+        sensor_clock_.observe(sensor, received);
+        const auto sampled = sensor_clock_.hostTime(sensor, received);
+        if (!sampled) return;
+        // Raw self-filtering precedes FAST-LIO. Its clock reference must be
+        // available directly from IMU, without waiting for filtered odometry.
+        sensor_msgs::msg::TimeReference clock;
+        clock.header.stamp = now() + rclcpp::Duration::from_seconds(*sampled-received);
+        clock.time_ref = imu->header.stamp;
+        clock.source = "lidar_imu_clock";
+        clock_pub_->publish(clock);
+      });
+    mount_pub_ = create_publisher<geometry_msgs::msg::TransformStamped>("/g1/lidar_mount", 20);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         get_parameter("fastlio_odom_topic").as_string(), 20,
@@ -154,8 +162,13 @@ private:
     std::array<double, 29> q{};
     uint8_t mode_machine = 0;
     bool received = false;
-    std::chrono::steady_clock::time_point receipt_time;
   };
+
+  static double steadySeconds()
+  {
+    return std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
 
   void receiveLowState()
   {
@@ -165,11 +178,22 @@ private:
       if (packet.magic != unitree_g1_kinematics::kLowStatePacketMagic ||
           packet.version != unitree_g1_kinematics::kLowStatePacketVersion)
         continue;
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      state_.q = packet.q;
-      state_.mode_machine = packet.mode_machine;
-      state_.received = true;
-      state_.receipt_time = std::chrono::steady_clock::now();
+      const double age = steadySeconds() - packet.sample_monotonic;
+      if (!std::isfinite(age) || age < 0. || age > .3) continue;
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!joint_history_.add(packet)) continue;
+      }
+      KinematicState state;
+      state.q = packet.q;
+      state.mode_machine = packet.mode_machine;
+      const auto chain = localUrdfChain(state, isRevisionModel(state.mode_machine),
+        hasThreeDofWaist(state.mode_machine), isWaistLocked(state.mode_machine));
+      auto mount = Eigen::Isometry3d::Identity();
+      for (std::size_t i = 0; i+1 < chain.size(); ++i) mount = mount * chain[i];
+      std_msgs::msg::Header header;
+      header.stamp = now() + rclcpp::Duration::from_seconds(packet.sample_monotonic-steadySeconds());
+      mount_pub_->publish(toTransform(mount, header, base_frame_, "livox_frame"));
     }
   }
 
@@ -256,34 +280,38 @@ private:
 
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
   {
-    const auto receipt_time = std::chrono::steady_clock::now();
+    receiveLowState();
+    const double receipt_time = steadySeconds();
     std_msgs::msg::Header navigation_header = odom->header;
-    // Unitree's MID-360 DDS publisher uses the sensor clock, which is several
-    // seconds behind this ROS host. FAST-LIO must retain that source time for
-    // IMU/LiDAR fusion, but Nav2 requires its public odom/TF chain on the ROS
-    // clock. Re-stamp only this navigation boundary at receipt time.
-    navigation_header.stamp = now();
+    const auto sample_time = sensor_clock_.hostTime(
+      rclcpp::Time(odom->header.stamp).seconds(), receipt_time);
+    if (!sample_time) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+        "Waiting for fresh LiDAR clock alignment; no arrival-time odometry substitution.");
+      return;
+    }
+    // Keep acquisition time through the public odometry/TF boundary. The
+    // sensor epoch differs from ROS time; processing latency is not that offset.
+    navigation_header.stamp = now() + rclcpp::Duration::from_seconds(*sample_time - receipt_time);
 
     KinematicState state;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      state = state_;
+      const auto matched = joint_history_.at(*sample_time);
+      if (matched) {
+        state.q = matched->q;
+        state.mode_machine = matched->mode_machine;
+        state.received = true;
+      }
     }
     if (!state.received)
     {
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 5000,
-          "Waiting for Unitree rt/lowstate; planar navigation odometry is not published yet.");
+          "Waiting for joints at the LiDAR measurement time; navigation odometry is paused.");
       return;
     }
-    if (std::chrono::steady_clock::now() - state.receipt_time >
-        std::chrono::milliseconds(500))
-    {
-      RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 5000,
-          "Unitree rt/lowstate is stale; planar navigation odometry is paused.");
-      return;
-    }
+    if (previous_pose_valid_ && *sample_time <= previous_pose_time_) return;
 
     const bool revision = isRevisionModel(state.mode_machine);
     const bool three_dof = hasThreeDofWaist(state.mode_machine);
@@ -337,8 +365,10 @@ private:
     base_odom.twist.twist = geometry_msgs::msg::Twist();
     if (previous_pose_valid_)
     {
-      const double dt = std::chrono::duration<double>(receipt_time - previous_pose_time_).count();
-      if (dt >= 0.02 && dt <= 0.50)
+      const double dt = *sample_time - previous_pose_time_;
+      // 50 Hz timestamps can differ by slightly less than 20 ms. Rejecting
+      // those while advancing the baseline silently froze measured velocity.
+      if (dt >= 0.005 && dt <= 0.50)
       {
         const Eigen::Vector3d world_delta =
           world_to_navigation.translation() - previous_world_to_navigation_.translation();
@@ -354,7 +384,13 @@ private:
           std::abs(body_angular.z()) <= 2.0;
         if (plausible)
         {
-          const double alpha = twist_initialized_ ? twist_smoothing_alpha_ : 1.0;
+          // Old filtered components belong to the preceding body frame.
+          const Eigen::Vector3d old_in_current = world_to_navigation.linear().transpose() *
+            previous_world_to_navigation_.linear() * Eigen::Vector3d(filtered_vx_, filtered_vy_, 0.);
+          filtered_vx_ = old_in_current.x();
+          filtered_vy_ = old_in_current.y();
+          const double alpha = twist_initialized_ ?
+            1. - std::pow(1. - twist_smoothing_alpha_, dt / .1) : 1.0;
           filtered_vx_ += alpha * (body_linear.x() - filtered_vx_);
           filtered_vy_ += alpha * (body_linear.y() - filtered_vy_);
           filtered_wz_ += alpha * (body_angular.z() - filtered_wz_);
@@ -368,9 +404,14 @@ private:
           twist_initialized_ = false;
         }
       }
+      else if (dt > .50)
+      {
+        filtered_vx_ = filtered_vy_ = filtered_wz_ = 0.;
+        twist_initialized_ = false;
+      }
     }
     previous_world_to_navigation_ = world_to_navigation;
-    previous_pose_time_ = receipt_time;
+    previous_pose_time_ = *sample_time;
     previous_pose_valid_ = true;
     base_odom.twist.twist.linear.x = filtered_vx_;
     base_odom.twist.twist.linear.y = filtered_vy_;
@@ -410,6 +451,11 @@ private:
     transforms.push_back(toTransform(
         chain[index++], navigation_header, "livox_frame", "livox_imu"));
     tf_broadcaster_->sendTransform(transforms);
+    sensor_msgs::msg::TimeReference timing;
+    timing.header = navigation_header;
+    timing.time_ref = odom->header.stamp;
+    timing.source = "lidar_acquisition";
+    timing_pub_->publish(timing);
 
     if (!model_logged_)
     {
@@ -427,7 +473,6 @@ private:
   std::string navigation_frame_;
   std::string model_variant_;
   std::mutex state_mutex_;
-  KinematicState state_;
   bool model_logged_ = false;
   double twist_smoothing_alpha_ = 0.35;
   bool previous_pose_valid_ = false;
@@ -436,15 +481,19 @@ private:
   double filtered_vy_ = 0.0;
   double filtered_wz_ = 0.0;
   Eigen::Isometry3d previous_world_to_navigation_ = Eigen::Isometry3d::Identity();
-  std::chrono::steady_clock::time_point previous_pose_time_;
+  double previous_pose_time_ = 0.;
+  unitree_g1_kinematics::SensorClock sensor_clock_;
+  unitree_g1_kinematics::JointHistory joint_history_;
 
   int lowstate_socket_ = -1;
   rclcpp::TimerBase::SharedPtr lowstate_timer_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::TimeReference>::SharedPtr timing_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::TimeReference>::SharedPtr clock_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr mount_pub_;
-  rclcpp::TimerBase::SharedPtr mount_timer_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 };
 

@@ -93,6 +93,36 @@ def test_camera_buttons_and_compensation_match_real_capabilities():
     assert not locomotion_actions(data)['hand_compensation']
 
 
+def test_pose_source_selection_requires_inactive_high_policy():
+    data = operator()
+    assert locomotion_actions(data)['cart_pose_source']
+    for flag in ('enabled', 'motion_blocked'):
+        data['high_policy'][flag] = True
+        assert not locomotion_actions(data)['cart_pose_source']
+        data['high_policy'][flag] = False
+
+
+@pytest.mark.parametrize('source', ['grasp', 'apriltag'])
+def test_http_pose_source_closes_gate_and_forwards_explicit_source(source):
+    h = _Harness()
+    h.navigation_active = False
+    h.locomotion.value['actions'] = {'cart_pose_source': True}
+    requests = []
+    h.locomotion.request = lambda kind, **payload: requests.append((kind, payload)) or 17
+    result = h.request_locomotion({'action':['cart_pose_source'], 'source':[source]})
+    assert requests == [('cart_pose_source', {'source':source})]
+    assert h.motion_commands == [False] and result['request_id'] == 17
+
+
+def test_http_invalid_pose_source_does_not_change_gate():
+    h = _Harness()
+    h.navigation_active = False
+    h.locomotion.value['actions'] = {'cart_pose_source': True}
+    with pytest.raises(ValueError):
+        h.request_locomotion({'action':['cart_pose_source'], 'source':['other']})
+    assert h.motion_enabled and not h.locomotion.requests
+
+
 @pytest.mark.parametrize('action', sorted(CART_ACTIONS))
 def test_http_cart_action_never_interrupts_active_navigation(action):
     h = _Harness(_Locomotion())

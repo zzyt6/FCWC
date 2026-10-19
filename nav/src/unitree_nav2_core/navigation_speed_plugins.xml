@@ -1,4 +1,10 @@
 <library path="navigation_speed">
+  <class type="unitree_nav2_core::NavigationSpeedLimitCritic" base_class_type="dwb_core::TrajectoryCritic">
+    <description>Enforce the selected speed and final approach cap without changing official samples.</description>
+  </class>
+  <class type="unitree_nav2_core::CommandChangeCritic" base_class_type="dwb_core::TrajectoryCritic">
+    <description>Prefer continuous lateral and angular commands among legal trajectories.</description>
+  </class>
   <class type="unitree_nav2_core::CartLookaheadCritic" base_class_type="dwb_core::TrajectoryCritic">
     <description>Cart tangent and adaptive lookahead tracking with lateral commands.</description>
   </class>

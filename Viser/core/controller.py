@@ -56,6 +56,7 @@ class Controller:
         self.thread = None
         self.stage = 'OBSERVE' if mode == 'observe' else 'WAITING'
         self.reason = ''
+        self.navigation_pose_result = {}
         self.request = p.WAIT
         self.prepare_pose = 'original'
         self.hand_pose = 0
@@ -402,6 +403,23 @@ class Controller:
                 continue
             owned = self.web.source == 'web' and self.web.owner == event['client']
             if self.stage in ('DAMPED', 'FAULT'):
+                continue
+            if event['kind'] == 'navigation_pose_source':
+                source = event.get('source')
+                reply = dict(request_id=event.get('request_id'), source=source, accepted=False,
+                             error='位姿切换需要保持静止、退出推车策略并持有控制权')
+                highs = ([entry['high'] for entry in self.model_sets.entries.values()]
+                         if self.model_sets is not None else [self.high_policy])
+                if (owned and state.flags & 1 and not state.buttons & (p.B | p.L2)
+                        and source in ('grasp', 'apriltag') and self.high_policy is not None
+                        and not self.zeroing and not np.any(self.heading.output) and not np.any(self.web.target)
+                        and all(high is None or (not high.enabled and not high.motion_blocked) for high in highs)):
+                    for high in highs:
+                        if high is not None:
+                            high.set_navigation_pose_source(source, self.clock())
+                    reply.update(accepted=True, error='')
+                self.navigation_pose_result = reply
+                self.record_event(type='navigation_pose_source', **reply)
                 continue
             if event['kind'] == 'cart_camera_start':
                 if owned and self.high_policy and self.high_policy.camera_process:
@@ -881,6 +899,7 @@ class Controller:
                                       pushcart=high.model.warmed if high is not None else False),
                     model_actions={name: value.copy() for name, value in actions.items()} if actions is not None else None,
                     high_policy=high.snapshot(self.clock()) if high is not None else None,
+                    navigation_pose_result=dict(self.navigation_pose_result),
                     homie_estimator={name: value.copy() for name, value in self.policy.homie_estimator.items()}
                                     if actions is not None else None,
                     homie_estimator_source=self.policy.homie_estimator_source if actions is not None else None,

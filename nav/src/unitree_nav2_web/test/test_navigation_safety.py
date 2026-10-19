@@ -186,6 +186,44 @@ class _Harness:
         self.faults.append(reason)
 
 
+def test_cart_overlay_uses_matched_tf_instead_of_stale_amcl_and_live_geometry():
+    import math
+    from geometry_msgs.msg import TransformStamped
+    from rclpy.time import Time
+    from tf2_ros import Buffer
+
+    buffer = Buffer()
+    now = [100.15]
+    bridge = SimpleNamespace(
+        # This cached AMCL pose deliberately disagrees with current TF.
+        current_pose=dict(x=-99., y=99., yaw=2.), tf_buffer=buffer,
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=now[0])))
+    cart = dict(valid=True, position=[10., 20., 0.], yaw=-2., position_source='grasp')
+    assert NavigationWebBridge._cart_map_pose(bridge, cart) is None
+
+    def transform(parent, child, stamp, x, y, yaw):
+        result = TransformStamped()
+        result.header.frame_id, result.child_frame_id = parent, child
+        result.header.stamp = Time(seconds=stamp).to_msg()
+        result.transform.translation.x, result.transform.translation.y = x, y
+        result.transform.rotation.w, result.transform.rotation.z = math.cos(yaw/2), math.sin(yaw/2)
+        return result
+
+    buffer.set_transform_static(transform('map', 'odom', 0., -2.3, 1.7, .7), 'test')
+    for stamp, x, body_yaw, relative_yaw in [(100., 1., .3, -.2), (100.1, 1.1, .4, -.1)]:
+        buffer.set_transform(transform('odom', 'base_nav', stamp, x, 2., body_yaw), 'test')
+        for child in ('cart_nav', 'nav_control'):
+            buffer.set_transform(transform('base_nav', child, stamp, .8, -.1, relative_yaw), 'test')
+    pose = NavigationWebBridge._cart_map_pose(bridge, cart)
+    expected = buffer.lookup_transform('map', 'nav_control', Time())
+    assert pose['x'] == pytest.approx(expected.transform.translation.x)
+    assert pose['y'] == pytest.approx(expected.transform.translation.y)
+    assert pose['yaw'] == pytest.approx(1.)  # map .7 + pelvis .4 + cart -.1
+    assert pose['position_source'] == 'grasp'
+    now[0] = 100.7
+    assert NavigationWebBridge._cart_map_pose(bridge, cart) is None  # Stale TF cannot draw a live cart.
+
+
 def test_locomotion_actions_follow_viser_lifecycle():
     offline = locomotion_actions({"online": False})
     assert not any(offline.values())
@@ -662,7 +700,7 @@ def test_model_selection_validates_stage_and_model_name():
 def test_nav2_parameters_keep_acceleration_bounds_and_allow_web_speed_range():
     params = yaml.safe_load((PACKAGE / "config" / "nav2_foxy_g1.yaml").read_text())
     controller = params["controller_server"]["ros__parameters"]
-    assert controller["controller_plugins"] == ["FollowPath", "CartPush"]
+    assert set(controller["controller_plugins"]) == {"FollowPath", "CartPush"}
     follow = controller["FollowPath"]
     # DWB prediction keeps its existing bounds; locomotion uses a 0.4 s filter.
     assert follow["acc_lim_x"] <= 0.3 and follow["acc_lim_y"] <= 0.2

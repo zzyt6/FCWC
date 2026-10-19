@@ -151,6 +151,7 @@ class NavigationWebBridge(Node):
         self.last_safety_event = ""
         self.last_navigation_guard = None
         self.last_navigation_diagnostic = None
+        self.last_navigation_sample = 0.0
         self.goal_handle = None
         self.amcl_process = None
         self.pending_amcl_map = None
@@ -378,6 +379,15 @@ class NavigationWebBridge(Node):
         if close:
             self._stop_for_navigation_reference('导航参考模式已切换')
         self._check_reference_gate(self.locomotion.snapshot())
+        now = time.monotonic()
+        if (self.navigation_active and reference.get('mode') == 'cart'
+                and now-getattr(self, 'last_navigation_sample', 0.) >= .1):
+            self.last_navigation_sample = now
+            try:
+                self.get_logger().info('Navigation sample: ' + json.dumps(
+                    self._navigation_diagnostic(), ensure_ascii=False))
+            except Exception:
+                pass  # Recording must never interrupt the reference safety gate.
 
     def _stop_for_navigation_reference(self, reason):
         # Preserve the first failed dependency. Waiting for the missing cart
@@ -404,7 +414,17 @@ class NavigationWebBridge(Node):
                 cloud_age_s=age(self.last_cloud_time), odom_age_s=age(self.last_odom_time),
                 scan_age_s=age(self.last_localization_scan_time), pose_age_s=age(self.last_pose_time),
                 camera_age_s=age(camera.get('captured_monotonic')),
+                camera_yaw_rad=camera.get('yaw_rad'), camera_fresh=camera.get('fresh'),
+                cart_pose_source=(self.navigation_reference.get('cart') or {}).get('pose_source'),
+                cart_relative_yaw_rad=(self.navigation_reference.get('cart') or {}).get('yaw'),
+                cart_position=(self.navigation_reference.get('cart') or {}).get('position'),
                 odom_speed=self.last_odom_speed, odom_angular_speed=self.last_odom_angular_speed,
+                odom_topic='/Odometry_base',
+                navigation_odometry=self.navigation_reference.get('odometry'),
+                cart_heading_alignment=(self.navigation_reference.get('cart') or {}).get('heading_alignment'),
+                navigation_command=locomotion.get('nav_target'),
+                navigation_command_fresh=locomotion.get('nav_command_fresh'),
+                robot_velocity_command=locomotion.get('velocity'),
                 reference_ready=self.navigation_reference.get('ready'),
                 reference_reason=self.navigation_reference.get('reason'),
                 observations=self.navigation_reference.get('observations'),
@@ -424,11 +444,23 @@ class NavigationWebBridge(Node):
     def _cart_map_pose(self, cart):
         if not cart.get('valid') or not self.current_pose:
             return None
-        base = self.current_pose
-        x, y = cart['position'][:2]
-        c, s = math.cos(base['yaw']), math.sin(base['yaw'])
-        return dict(x=base['x']+c*x-s*y, y=base['y']+s*x+c*y,
-                    yaw=base['yaw']+cart['yaw'], position_source=cart.get('position_source'))
+        try:
+            # AMCL pose messages arrive only on localization updates. Combining
+            # the last such pose with live cart geometry mixes acquisition times
+            # and can draw a different heading from the one DWB actually uses.
+            # cart_nav is published alongside nav_control from the matched state.
+            transform = self.tf_buffer.lookup_transform('map', 'cart_nav', Time())
+            age = (self.get_clock().now().nanoseconds
+                   - Time.from_msg(transform.header.stamp).nanoseconds)*1e-9
+            if not 0. <= age <= .5:
+                return None
+            translation, rotation = transform.transform.translation, transform.transform.rotation
+            yaw = math.atan2(2*(rotation.w*rotation.z + rotation.x*rotation.y),
+                             1-2*(rotation.y**2 + rotation.z**2))
+            return dict(x=translation.x, y=translation.y, yaw=yaw,
+                        position_source=cart.get('position_source'))
+        except Exception:
+            return None
 
     def status(self):
         now = time.monotonic()
@@ -1683,7 +1715,12 @@ class NavigationWebBridge(Node):
                 if self.navigation_active:
                     raise ValueError('请先停止导航并等待速度归零，再操作推车或抓握')
             payload = {}
-            if kind == 'hand_edit':
+            if kind == 'cart_pose_source':
+                source = query.get('source', [''])[0]
+                if source not in ('grasp', 'apriltag'):
+                    raise ValueError('请选择固定抓握或视觉 AprilTag 位姿')
+                payload = dict(source=source)
+            elif kind == 'hand_edit':
                 payload = dict(joint=int(query.get('joint', [''])[0]), angle_rad=float(query.get('angle_rad', [''])[0]))
                 if not 0 <= payload['joint'] < 14 or not math.isfinite(payload['angle_rad']):
                     raise ValueError('无效的抓握关节或角度')

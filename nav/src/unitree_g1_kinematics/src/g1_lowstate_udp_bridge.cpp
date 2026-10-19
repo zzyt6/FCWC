@@ -79,6 +79,8 @@ private:
     const auto *state =
         static_cast<const unitree_hg::msg::dds_::LowState_ *>(message);
     unitree_g1_kinematics::LowStatePacket packet;
+    packet.sample_monotonic = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
     packet.sequence = sequence_++;
     packet.mode_machine = state->mode_machine();
     for (std::size_t index = 0; index < packet.q.size(); ++index)

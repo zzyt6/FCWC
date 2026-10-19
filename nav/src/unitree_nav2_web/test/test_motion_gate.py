@@ -182,12 +182,12 @@ def test_cart_epoch_clears_old_commands_and_clamps_all_three_axes(gate):
     gate.velocity(-.8, .5, -.8)
     packets = gate.wait(lambda items: any(p[2] for p in items))
     active = [p for p in packets if p[2]][-1]
-    assert active[5:8] == pytest.approx((-.2, .15, -.3))
+    assert active[5:8] == pytest.approx((-.2, .3, -.4))
     assert active[8] == 3
     gate.velocity(.9, -.5, .8)
     packets = gate.wait(lambda items: any(p[2] and p[5] > 0 for p in items))
     active = [p for p in packets if p[2] and p[5] > 0][-1]
-    assert active[5:8] == pytest.approx((.6, -.15, .3))
+    assert active[5:8] == pytest.approx((.6, -.3, .4))
     gate.reference(publish=False)
     deadline = time.monotonic()+.5
     while time.monotonic() < deadline:

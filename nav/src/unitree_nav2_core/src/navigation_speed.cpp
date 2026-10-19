@@ -4,11 +4,13 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 
 #include "nav2_util/node_utils.hpp"
 #include "nav2_core/exceptions.hpp"
+#include "dwb_core/exceptions.hpp"
 #include "nav_2d_utils/tf_help.hpp"
 #include "pluginlib/class_list_macros.hpp"
 
@@ -106,7 +108,12 @@ void SpeedLimitedGenerator::startNewIteration(const nav_2d_msgs::msg::Twist2D & 
   candidates_.clear();
   index_ = 0;
   std::set<std::tuple<long long, long long, long long>> seen;
-  const auto add = [&](const nav_2d_msgs::msg::Twist2D & twist) {
+  const auto add = [&](nav_2d_msgs::msg::Twist2D twist) {
+      // The stock iterator can return +/- 1e-17 for its zero sample. Those
+      // residual signs must not arm OscillationCritic's direction locks.
+      if (std::abs(twist.x) < 1e-7) {twist.x = 0.;}
+      if (std::abs(twist.y) < 1e-7) {twist.y = 0.;}
+      if (std::abs(twist.theta) < 1e-7) {twist.theta = 0.;}
       const auto key = std::make_tuple(
         std::llround(twist.x * 1e7), std::llround(twist.y * 1e7),
         std::llround(twist.theta * 1e7));
@@ -143,6 +150,76 @@ void SpeedLimitedGenerator::setGoalDistance(double distance)
   goal_distance_ = distance;
 }
 
+dwb_msgs::msg::Trajectory2D SpeedLimitedGenerator::generateTrajectory(
+  const geometry_msgs::msg::Pose2D & start_pose,
+  const nav_2d_msgs::msg::Twist2D & start_vel,
+  const nav_2d_msgs::msg::Twist2D & cmd_vel)
+{
+  rollout_start_velocity_ = start_vel;
+  return StandardTrajectoryGenerator::generateTrajectory(start_pose, start_vel, cmd_vel);
+}
+
+std::vector<double> SpeedLimitedGenerator::getTimeSteps(
+  const nav_2d_msgs::msg::Twist2D & cmd_vel)
+{
+  // Stock spatial sampling only uses the target speed. A stop target can then
+  // put the whole braking interval into one integration step, skipping travel
+  // and collisions before the vehicle stops. Bound spacing by both velocities.
+  auto sampling_velocity = cmd_vel;
+  sampling_velocity.x = std::max(std::abs(cmd_vel.x), std::abs(rollout_start_velocity_.x));
+  sampling_velocity.y = std::max(std::abs(cmd_vel.y), std::abs(rollout_start_velocity_.y));
+  sampling_velocity.theta = std::max(std::abs(cmd_vel.theta), std::abs(rollout_start_velocity_.theta));
+  return StandardTrajectoryGenerator::getTimeSteps(sampling_velocity);
+}
+
+void ApproachDWBLocalPlanner::configure(
+  const rclcpp_lifecycle::LifecycleNode::SharedPtr & node, std::string name,
+  const std::shared_ptr<tf2_ros::Buffer> & tf,
+  const std::shared_ptr<nav2_costmap_2d::Costmap2DROS> & costmap_ros)
+{
+  DWBLocalPlanner::configure(node, name, tf, costmap_ros);
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".decision_log_period", rclcpp::ParameterValue(0.));
+  decision_log_period_ = node->get_parameter(name + ".decision_log_period").as_double();
+  if (!std::isfinite(decision_log_period_) || decision_log_period_ < 0.) {
+    throw std::invalid_argument("decision_log_period must be finite and nonnegative");
+  }
+}
+
+dwb_msgs::msg::TrajectoryScore ApproachDWBLocalPlanner::coreScoringAlgorithm(
+  const geometry_msgs::msg::Pose2D & pose, const nav_2d_msgs::msg::Twist2D velocity,
+  std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & results)
+{
+  const auto started = std::chrono::steady_clock::now();
+  auto best = DWBLocalPlanner::coreScoringAlgorithm(pose, velocity, results);
+  const auto finished = std::chrono::steady_clock::now();
+  if (decision_log_period_ > 0. &&
+    std::chrono::duration<double>(finished - decision_logged_).count() >= decision_log_period_)
+  {
+    decision_logged_ = finished;
+    const auto & command = best.traj.velocity;
+    const auto & end = best.traj.poses.empty() ? pose : best.traj.poses.back();
+    std::ostringstream trace;
+    trace << "DWB decision: {\"controller\":\"" << dwb_plugin_name_ << "\",\"pose\":["
+          << pose.x << ',' << pose.y << ',' << pose.theta << "],\"velocity\":["
+          << velocity.x << ',' << velocity.y << ',' << velocity.theta << "],\"command\":["
+          << command.x << ',' << command.y << ',' << command.theta << "],\"endpoint\":["
+          << end.x << ',' << end.y << ',' << end.theta << "],\"scoring_ms\":"
+          << std::chrono::duration<double, std::milli>(finished - started).count()
+          << ",\"total\":" << best.total << ",\"costs\":{";
+    for (size_t i = 0; i < best.scores.size(); ++i) {
+      if (i) {trace << ',';}
+      const auto & score = best.scores[i];
+      trace << '"' << score.name << "\":" << score.raw_score * score.scale;
+    }
+    trace << "}}";
+    // Only the winning trajectory is serialized, at a bounded rate. Full DWB
+    // evaluation remains disabled so diagnostics do not allocate every rollout.
+    RCLCPP_INFO(node_->get_logger(), "%s", trace.str().c_str());
+  }
+  return best;
+}
+
 geometry_msgs::msg::TwistStamped ApproachDWBLocalPlanner::computeVelocityCommands(
   const geometry_msgs::msg::PoseStamped & pose, const geometry_msgs::msg::Twist & velocity)
 {
@@ -171,6 +248,50 @@ nav_2d_msgs::msg::Twist2D SpeedLimitedGenerator::nextTwist()
   return candidates_.at(index_++);
 }
 
+void CommandChangeCritic::onInit()
+{
+  lateral_limit_ = nh_->get_parameter(dwb_plugin_name_ + ".max_vel_y").as_double();
+  angular_limit_ = nh_->get_parameter(dwb_plugin_name_ + ".max_vel_theta").as_double();
+  if (lateral_limit_ <= 0. || angular_limit_ <= 0.) {
+    throw std::invalid_argument("CommandChange requires positive lateral and angular limits");
+  }
+}
+
+bool CommandChangeCritic::prepare(const geometry_msgs::msg::Pose2D &,
+  const nav_2d_msgs::msg::Twist2D &, const geometry_msgs::msg::Pose2D &,
+  const nav_2d_msgs::msg::Path2D &)
+{
+  active_ = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - selected_at_).count() <= 0.3;
+  return true;
+}
+
+double CommandChangeCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory)
+{
+  if (!active_) {return 0.;}
+  const double lateral = (trajectory.velocity.y - previous_.y) / lateral_limit_;
+  const double angular = (trajectory.velocity.theta - previous_.theta) / angular_limit_;
+  return lateral*lateral + angular*angular;
+}
+
+void CommandChangeCritic::debrief(const nav_2d_msgs::msg::Twist2D & command)
+{
+  const auto now = std::chrono::steady_clock::now();
+  const double dt = std::chrono::duration<double>(now - selected_at_).count();
+  // Score against recent command history, not just the immediately preceding
+  // 20 ms tick: alternating corrections can otherwise walk through zero in
+  // several individually cheap steps. This changes scoring only, never the
+  // selected and collision-checked command sent to the policy.
+  if (dt > 0.3) {
+    previous_ = command;
+  } else {
+    const double alpha = 1. - std::exp(-std::max(0., dt) / 0.3);
+    previous_.y += alpha * (command.y - previous_.y);
+    previous_.theta += alpha * (command.theta - previous_.theta);
+  }
+  selected_at_ = now;
+}
+
 void CruiseSpeedCritic::onInit() {declareProfile(nh_, dwb_plugin_name_);}
 
 bool CruiseSpeedCritic::prepare(
@@ -192,6 +313,54 @@ double CruiseSpeedCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & tr
 {
   return weight_ * std::max(0.0, 1.0 -
          std::hypot(trajectory.velocity.x, trajectory.velocity.y) / speed_);
+}
+
+void NavigationSpeedLimitCritic::onInit()
+{
+  declareProfile(nh_, dwb_plugin_name_);
+  for (const auto & item : std::vector<std::pair<std::string, double>>{
+      {"approach_distance", 0.8}, {"approach_speed", 0.1}, {"xy_goal_tolerance", 0.15}})
+  {
+    nav2_util::declare_parameter_if_not_declared(
+      nh_, dwb_plugin_name_ + "." + item.first, rclcpp::ParameterValue(item.second));
+  }
+  approach_distance_ = nh_->get_parameter(dwb_plugin_name_ + ".approach_distance").as_double();
+  approach_speed_ = nh_->get_parameter(dwb_plugin_name_ + ".approach_speed").as_double();
+  goal_tolerance_ = nh_->get_parameter(dwb_plugin_name_ + ".xy_goal_tolerance").as_double();
+  if (!std::isfinite(approach_distance_) || !std::isfinite(approach_speed_) ||
+    !std::isfinite(goal_tolerance_) || goal_tolerance_ <= 0. ||
+    approach_distance_ <= goal_tolerance_ || approach_speed_ <= 0.05 || approach_speed_ > 0.2)
+  {
+    throw std::invalid_argument("Invalid goal approach distance, speed or tolerance");
+  }
+  const auto initial = validateProfile(nh_->get_parameters({
+    dwb_plugin_name_ + ".navigation_speed", dwb_plugin_name_ + ".navigation_speed_mode"}),
+    dwb_plugin_name_);
+  if (!initial.successful) {throw std::invalid_argument(initial.reason);}
+  parameter_callback_ = nh_->add_on_set_parameters_callback(
+    [ns = dwb_plugin_name_](const std::vector<rclcpp::Parameter> & parameters) {
+      return validateProfile(parameters, ns);
+    });
+}
+
+bool NavigationSpeedLimitCritic::prepare(
+  const geometry_msgs::msg::Pose2D & pose, const nav_2d_msgs::msg::Twist2D &,
+  const geometry_msgs::msg::Pose2D & goal, const nav_2d_msgs::msg::Path2D &)
+{
+  const double requested = nh_->get_parameter(dwb_plugin_name_ + ".navigation_speed").as_double();
+  const double distance = std::hypot(goal.x-pose.x, goal.y-pose.y);
+  const double fraction = std::clamp(
+    (distance-goal_tolerance_) / (approach_distance_-goal_tolerance_), 0., 1.);
+  speed_limit_ = approach_speed_ + fraction*(requested-approach_speed_);
+  return true;
+}
+
+double NavigationSpeedLimitCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory)
+{
+  if (std::hypot(trajectory.velocity.x, trajectory.velocity.y) > speed_limit_ + 1e-9) {
+    throw dwb_core::IllegalTrajectoryException(name_, "Requested navigation speed limit");
+  }
+  return 0.;
 }
 
 void CartLookaheadCritic::onInit()
@@ -217,12 +386,27 @@ bool CartLookaheadCritic::prepare(
 {
   if (plan.poses.empty()) {return false;}
   size_t nearest = 0;
+  double along_segment = 0.0;
   double best = std::numeric_limits<double>::infinity();
-  for (size_t i = 0; i < plan.poses.size(); ++i) {
-    const double distance = std::hypot(plan.poses[i].x-pose.x, plan.poses[i].y-pose.y);
-    if (distance < best) {best = distance; nearest = i;}
+  // Project onto the polyline instead of snapping to its nearest vertex.
+  // Otherwise the lookahead jumps by one waypoint spacing at every midpoint.
+  for (size_t i = 0; i+1 < plan.poses.size(); ++i) {
+    const auto & a = plan.poses[i];
+    const auto & b = plan.poses[i+1];
+    const double dx = b.x-a.x, dy = b.y-a.y;
+    const double length_squared = dx*dx+dy*dy;
+    if (length_squared <= 1e-12) {continue;}
+    const double fraction = std::clamp(
+      ((pose.x-a.x)*dx+(pose.y-a.y)*dy)/length_squared, 0.0, 1.0);
+    const double distance = std::hypot(a.x+fraction*dx-pose.x, a.y+fraction*dy-pose.y);
+    if (distance < best) {
+      best = distance;
+      nearest = i;
+      along_segment = fraction*std::sqrt(length_squared);
+    }
   }
-  double remaining = std::min(maximum_, base_+gain_*std::hypot(velocity.x, velocity.y));
+  double remaining = along_segment+
+    std::min(maximum_, base_+gain_*std::hypot(velocity.x, velocity.y));
   target_ = plan.poses.back();
   for (size_t i = nearest; i+1 < plan.poses.size(); ++i) {
     const auto & a = plan.poses[i];
@@ -251,5 +435,7 @@ double CartLookaheadCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & 
 
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::SpeedLimitedGenerator, dwb_core::TrajectoryGenerator)
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::CruiseSpeedCritic, dwb_core::TrajectoryCritic)
+PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::NavigationSpeedLimitCritic, dwb_core::TrajectoryCritic)
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::ApproachDWBLocalPlanner, nav2_core::Controller)
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::CartLookaheadCritic, dwb_core::TrajectoryCritic)
+PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::CommandChangeCritic, dwb_core::TrajectoryCritic)

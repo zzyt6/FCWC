@@ -592,7 +592,7 @@ class DetectionWorker:
     """Keep only the latest completed image/result pair instead of queuing stale frames."""
 
     def __init__(self, reader, detector, pose_estimator=None, pose_smoother=None, cart_heading_estimator=None, *, profile=False,
-                 pelvis_compensator=None, heading_smoother=None):
+                 pelvis_compensator=None, heading_smoother=None, cart_pose_estimator=None, missing_tag_frames=None):
         self.reader = reader
         self.detector = detector
         self.detector_settings = {
@@ -604,6 +604,8 @@ class DetectionWorker:
         self.cart_heading_estimator = cart_heading_estimator
         self.pelvis_compensator = pelvis_compensator
         self.heading_smoother = heading_smoother
+        self.cart_pose_estimator = cart_pose_estimator
+        self.missing_tag_frames = missing_tag_frames
         self.profile_samples = deque(maxlen=120) if profile else None
         self.condition = threading.Condition()
         self.stop = threading.Event()
@@ -691,6 +693,7 @@ class DetectionWorker:
                     "detection_ms": (detection_finished - started) * 1000,
                     "processing_ms": (now - started) * 1000,
                     "frame_timestamp_monotonic": frame_timestamp,
+                    "frame_timestamp_basis": getattr(self.reader, "timestamp_basis", "unspecified"),
                     "detector_settings": self.detector_settings,
                 }
                 if self.pose_smoother is not None:
@@ -704,9 +707,18 @@ class DetectionWorker:
                 if self.pose_estimator is not None:
                     packet["camera_matrix"] = self.pose_estimator.camera_matrix.tolist()
                     packet["distortion_coefficients"] = self.pose_estimator.distortion.tolist()
+                if self.cart_pose_estimator is not None:
+                    if __package__:
+                        from .cart_pose import urdf_cart_observation
+                    else:
+                        from cart_pose import urdf_cart_observation
+                    packet['cart_pose_urdf'] = urdf_cart_observation(packet, self.cart_pose_estimator)
+                    packet['processing_ms'] = (time.monotonic()-started)*1000.
                 if stages is not None:
                     stages['process'] = packet['processing_ms']
                     packet['stage_timings_ms'] = stages
+                if self.missing_tag_frames is not None:
+                    self.missing_tag_frames.submit(packet)
                 with self.condition:
                     if stages is not None:
                         self.profile_samples.append(stages)
@@ -786,8 +798,8 @@ def _config_defaults(parser, path):
     if unknown:
         parser.error(f"Unknown config setting(s) in {path}: {', '.join(unknown)}")
     defaults = {}
-    nullable = {'axis_length', 'cart_tag_id', 'cart_tag_ids', 'cart_to_tag_rpy_deg'}
-    booleans = {'no_display', 'profile', 'no_smoothing'}
+    nullable = {'axis_length', 'cart_tag_id', 'cart_tag_ids', 'cart_to_tag_rpy_deg', 'missing_tag_dir'}
+    booleans = {'no_display', 'profile', 'no_smoothing', 'missing_tag_control_stdin'}
     for key, value in values.items():
         action = actions[key]
         dest = action.dest
@@ -833,12 +845,18 @@ def parse_args(argv=None):
     parser.add_argument("--device", default="auto", help="RealSense color V4L2 device, or auto to probe all /dev/video* nodes")
     parser.add_argument('--heading-udp-port', type=int, default=0,
                         help='publish gravity-leveled cart yaw to loopback UDP; 0 disables publishing')
+    parser.add_argument('--publish-cart-pose', action='store_true',
+                        help='also estimate real cart pose using raw ID 0/1 corners and URDF extrinsics')
     parser.add_argument("--no-display", action="store_true", help="detect and report to the terminal without a window")
     parser.add_argument("--display", dest="no_display", action="store_false", help="enable the window even if disabled in config")
     parser.add_argument("--profile", action="store_true", help="report rolling mean/p95 milliseconds for detection, pose, smoothing, yaw, drawing and GUI calls")
     parser.add_argument("--no-profile", dest="profile", action="store_false", help="disable profiling even if enabled in config")
     parser.add_argument("--frames", type=int, default=0, help=f"stop after N captured frames plus {WARMUP} warm-up frames; 0 runs until quit")
     parser.add_argument("--snapshot-dir", type=Path, default=SNAPSHOT_DIR)
+    parser.add_argument('--missing-tag-dir', type=Path,
+                        help='save raw PNG and frame metadata when no selected cart tag is detected')
+    parser.add_argument('--missing-tag-control-stdin', action='store_true',
+                        help='save only frames captured while navigation enables recording through stdin')
     parser.add_argument("--intrinsics", type=Path, default=INTRINSICS_FILE, help="factory 640x480 color intrinsics JSON")
     parser.add_argument("--tag-size", type=float, default=0.10, help="black square edge in meters, excluding white margin (default: 0.10)")
     parser.add_argument("--axis-length", type=float, help="drawn axis length in meters (default: the tag edge, 0.10)")
@@ -903,6 +921,10 @@ def parse_args(argv=None):
     args.config = config_path
     for name in ('snapshot_dir', 'intrinsics', 'robot_urdf'):
         setattr(args, name, getattr(args, name).expanduser().resolve())
+    if args.missing_tag_dir is not None:
+        args.missing_tag_dir = args.missing_tag_dir.expanduser().resolve()
+    if args.missing_tag_control_stdin and args.missing_tag_dir is None:
+        parser.error('--missing-tag-control-stdin requires --missing-tag-dir')
     for action in parser._actions:
         value = getattr(args, action.dest, None)
         if action.type is float and value is not None and not np.isfinite(value).all():
@@ -957,6 +979,15 @@ def _run(args, resources):
     detector = make_detector(args.quad_decimate)
     camera_matrix, distortion = load_intrinsics(args.intrinsics)
     pose_estimator = TagPoseEstimator(camera_matrix, distortion, args.tag_size, args.axis_length)
+    cart_pose_estimator = None
+    if args.publish_cart_pose:
+        if args.pelvis_attitude_source != 'imu':
+            raise ValueError('--publish-cart-pose requires --pelvis-attitude-source imu')
+        if __package__:
+            from .cart_pose import CartPoseEstimator
+        else:
+            from cart_pose import CartPoseEstimator
+        cart_pose_estimator = CartPoseEstimator(camera_matrix, distortion)
     pose_smoother = None if args.no_smoothing else AdaptivePoseSmoother(
         pose_estimator, min_cutoff_hz=args.smooth_min_cutoff_hz,
         beta=args.smooth_beta, xy_beta=args.smooth_xy_beta, reset_gap_s=args.smooth_reset_gap,
@@ -1038,10 +1069,22 @@ def _run(args, resources):
               "pose=PnP/RPY/projection; read_wait=wait for next captured frame. "
               "GUI timings measure local calls, not arrival at the Windows screen. "
               "Detect and view run concurrently; do not add their totals.", flush=True)
+    missing_frames = None
+    if args.missing_tag_dir is not None:
+        if __package__:
+            from .missing_tag_frames import MissingTagFrames
+        else:
+            from missing_tag_frames import MissingTagFrames
+        selected_ids = args.cart_tag_ids if args.cart_tag_ids is not None else (
+            [args.cart_tag_id] if args.cart_tag_id is not None else [0, 1])
+        missing_frames = MissingTagFrames(args.missing_tag_dir, selected_ids,
+                                         control_fd=sys.stdin.fileno() if args.missing_tag_control_stdin else None)
+        resources.callback(missing_frames.close)
     reader = CameraReader(open_camera(args.device), args.frames)
     try:
         worker = DetectionWorker(reader, detector, pose_estimator, pose_smoother, cart_heading_estimator,
-                                 profile=args.profile, pelvis_compensator=compensator, heading_smoother=heading_smoother)
+                                 profile=args.profile, pelvis_compensator=compensator, heading_smoother=heading_smoother,
+                                 cart_pose_estimator=cart_pose_estimator, missing_tag_frames=missing_frames)
     except Exception:
         reader.close()
         raise

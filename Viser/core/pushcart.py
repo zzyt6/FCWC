@@ -17,6 +17,11 @@ class CameraProcess:
     def __init__(self, port, mode, interface, tag_ids=(0, 1)):
         self.port, self.mode, self.interface = port, mode, interface
         self.tag_ids = tuple(tag_ids)
+        self.publish_cart_pose = False  # Navigation opts in before starting the shared camera.
+        self.quad_decimate = 1.
+        self.missing_tag_dir = None
+        self.missing_tag_error = ''
+        self._recording_process = self._recording_enabled = None
         self.process = None
         self.reader = None
         self.lines = deque(maxlen=8)
@@ -47,20 +52,56 @@ class CameraProcess:
             env['LD_PRELOAD'] = str(omp) + (':' + env['LD_PRELOAD'] if env.get('LD_PRELOAD') else '')
         with self.lock:
             self.lines.clear()
-        self.process = subprocess.Popen(
-            [sys.executable, '-B', str(WORKSPACE / 'carmer/apriltag_detector.py'),
-             '--no-display', '--heading-udp-port', str(self.port), '--network-interface', self.interface,
-             '--cart-tag-ids', *map(str, self.tag_ids)],
+        command = [sys.executable, '-B', str(WORKSPACE / 'carmer/apriltag_detector.py'),
+                   '--no-display', '--heading-udp-port', str(self.port), '--network-interface', self.interface,
+                   '--cart-tag-ids', *map(str, self.tag_ids)]
+        if self.publish_cart_pose:
+            command += ['--publish-cart-pose', '--pelvis-attitude-source', 'imu',
+                        '--quad-decimate', f'{self.quad_decimate:g}',
+                        '--tag-size', '0.10', '--robot-urdf', str(WORKSPACE / 'G1_URDF/g1.urdf')]
+        if self.missing_tag_dir is not None:
+            command += ['--missing-tag-dir', str(self.missing_tag_dir), '--missing-tag-control-stdin']
+        process = subprocess.Popen(
+            command,
             # Explicit CLI IDs also override any broader standalone camera config.
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+            stdin=subprocess.PIPE if self.missing_tag_dir is not None else None)
+        if self.missing_tag_dir is not None:
+            os.set_blocking(process.stdin.fileno(), False)
+        self.process = process
         self.reader = threading.Thread(target=self._read, args=(self.process,), daemon=True)
         self.reader.start()
+
+    def record_missing_tags(self, enabled, now):
+        """Nonblocking capture-time gate; called only by the navigation executor."""
+        process = self.process
+        if self.missing_tag_dir is None or process is None or process.poll() is not None:
+            return
+        enabled = bool(enabled)
+        if process is self._recording_process and enabled == self._recording_enabled:
+            return
+        message = f'{int(enabled)} {now:.9f}\n'.encode('ascii')
+        try:
+            if os.write(process.stdin.fileno(), message) != len(message):
+                raise OSError('Incomplete camera recording control message')
+        except BlockingIOError:
+            return  # Retry on the next executor tick; never block body control.
+        except (OSError, ValueError) as exc:
+            error = str(exc)
+            if error != self.missing_tag_error:
+                print('MISSING_TAG warning: recording control failed: ' + error, flush=True)
+            self.missing_tag_error = error
+            return
+        self.missing_tag_error = ''
+        self._recording_process, self._recording_enabled = process, enabled
 
     def _read(self, process):
         with process.stdout:
             for line in process.stdout:
                 with self.lock:
                     self.lines.append(line.strip()[:400])
+                if line.startswith('MISSING_TAG '):
+                    print(line.rstrip(), flush=True)
 
     def snapshot(self):
         code = self.process.poll() if self.process is not None else None
@@ -72,7 +113,9 @@ class CameraProcess:
             if error is not None:
                 message, code = str(error), -1
         return dict(running=self.process is not None and code is None, starting=starting,
-                    exit_code=code, error=message if code else '')
+                    exit_code=code, error=message if code else '',
+                    missing_tag_directory=str(self.missing_tag_dir) if self.missing_tag_dir is not None else None,
+                    missing_tag_error=self.missing_tag_error)
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
@@ -91,6 +134,8 @@ class CameraProcess:
                 self.process.wait(timeout=2)
         if self.reader is not None:
             self.reader.join(timeout=1)
+        if self.process is not None and self.process.stdin is not None:
+            self.process.stdin.close()
 
 
 def load_feature(config, mode, interface, path=CONFIG, *, model_version='v81', camera=None,

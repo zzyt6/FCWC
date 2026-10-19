@@ -1,10 +1,13 @@
 """Measured-heading / grasp-geometry cart reference; no ROS or motor I/O."""
+from collections import deque
 import json
 import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
+
+POSE_SOURCES = {'grasp': '固定抓握（无滑移假设）', 'apriltag': '视觉 AprilTag（URDF 外参）'}
 
 
 def rotation_z(yaw):
@@ -22,9 +25,150 @@ def quaternion_matrix(q):
                      [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]])
 
 
+def interpolate_rotation(a, b, fraction):
+    # Polar projection keeps interpolated short-interval rotations on SO(3).
+    # Elementwise matrix interpolation alone would shrink the cart geometry.
+    blend = (1.-fraction)*np.asarray(a) + fraction*np.asarray(b)
+    u, _, vh = np.linalg.svd(blend)
+    return u @ np.diag([1., 1., np.linalg.det(u @ vh)]) @ vh
+
+
+class PelvisYawHistory:
+    """Express a delayed camera heading in the current pelvis frame, for Nav only."""
+    def __init__(self):
+        self.samples = deque(maxlen=128)
+        self.session = None
+
+    def add(self, state):
+        stamp = state.get('received')
+        try:
+            if stamp is None or not math.isfinite(stamp) or 'quat' not in state:
+                return None
+            rotation = quaternion_matrix(state['quat'])
+        except (ValueError, TypeError):
+            return None
+        yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+        session = state.get('session')
+        if (session != self.session or (self.samples and
+                (stamp < self.samples[-1][0] or stamp-self.samples[-1][0] > .5))):
+            self.samples.clear()
+        self.session = session
+        if not self.samples or stamp > self.samples[-1][0]:
+            snapshot = {key: np.array(state[key], copy=True) for key in ('q', 'quat') if key in state}
+            self.samples.append((stamp, yaw, snapshot))
+        return yaw
+
+    def at(self, captured):
+        """Arm and body feedback at the camera time, using the same history."""
+        before = after = None
+        for sample in self.samples:
+            if sample[0] <= captured:
+                before = sample
+            if sample[0] >= captured:
+                after = sample
+                break
+        if before and after and max(captured-before[0], after[0]-captured) <= .03:
+            fraction = (captured-before[0])/(after[0]-before[0]) if after[0] > before[0] else 0.
+            a, b = before[2], after[2]
+            if 'q' in a and 'q' in b:
+                qa, qb = a['quat'], b['quat']
+                if np.dot(qa, qb) < 0:
+                    qb = -qb
+                quaternion = qa+fraction*(qb-qa)
+                quaternion /= np.linalg.norm(quaternion)
+                return dict(q=a['q']+fraction*(b['q']-a['q']), quat=quaternion)
+        nearest = min((s for s in (before, after) if s is not None),
+                      key=lambda s: abs(s[0]-captured), default=None)
+        if nearest and abs(nearest[0]-captured) <= .03 and 'q' in nearest[2]:
+            return nearest[2]
+        raise ValueError('等待图像时刻的机身和手臂反馈')
+
+    def align(self, camera_yaw, captured, current_yaw):
+        if not self.samples or current_yaw is None:
+            raise ValueError('等待图像时刻的骨盆航向反馈')
+        before = after = None
+        for sample in self.samples:
+            if sample[0] <= captured:
+                before = sample
+            if sample[0] >= captured:
+                after = sample
+                break
+        # Match the camera's 30 ms state-alignment tolerance; never silently
+        # substitute current feedback for a missing historical observation.
+        if before and after and max(captured-before[0], after[0]-captured) <= .03:
+            delta = math.atan2(math.sin(after[1]-before[1]), math.cos(after[1]-before[1]))
+            fraction = (captured-before[0])/(after[0]-before[0]) if after[0] > before[0] else 0.
+            captured_yaw = before[1]+fraction*delta
+        else:
+            nearest = min((s for s in (before, after) if s is not None), key=lambda s: abs(s[0]-captured))
+            if abs(nearest[0]-captured) > .03:
+                raise ValueError('缺少图像时刻的骨盆航向反馈，等待时间对齐')
+            captured_yaw = nearest[1]
+        correction = math.atan2(math.sin(captured_yaw-current_yaw), math.cos(captured_yaw-current_yaw))
+        return math.atan2(math.sin(camera_yaw+correction), math.cos(camera_yaw+correction)), correction
+
+
+class CartPoseHistory:
+    """Pair relative cart geometry with the base pose at its measurement time."""
+    def __init__(self, max_gap=.15, max_samples=128):
+        self.samples = deque(maxlen=max_samples)
+        self.max_gap = max_gap
+        self.key = None
+
+    def add(self, cart):
+        key = (cart.get('epoch'), cart.get('pose_source'))
+        if key != self.key:
+            self.samples.clear()
+            self.key = key
+        stamp = cart.get('sample_monotonic')
+        if not cart.get('valid') or stamp is None or not math.isfinite(stamp):
+            return
+        if self.samples and stamp <= self.samples[-1][0]:
+            return
+        self.samples.append((stamp, dict(cart)))
+        while self.samples and stamp-self.samples[0][0] > 1.:
+            self.samples.popleft()
+
+    def at(self, stamp):
+        before = after = None
+        for sample in self.samples:
+            if sample[0] <= stamp:
+                before = sample
+            if sample[0] >= stamp:
+                after = sample
+                break
+        if before and after and after[0]-before[0] <= self.max_gap:
+            fraction = (stamp-before[0])/(after[0]-before[0]) if after[0] > before[0] else 0.
+            a, b = before[1], after[1]
+            result = dict(a)
+            result['position'] = (np.asarray(a['position']) + fraction*(
+                np.asarray(b['position'])-a['position'])).tolist()
+            delta = math.atan2(math.sin(b['yaw']-a['yaw']), math.cos(b['yaw']-a['yaw']))
+            result['yaw'] = a['yaw'] + fraction*delta
+            if 'palms' in a and 'palms' in b:
+                result['palms'] = (np.asarray(a['palms']) + fraction*(
+                    np.asarray(b['palms'])-a['palms'])).tolist()
+            for name in ('body_rotation', 'rotation'):
+                if name in a and name in b:
+                    result[name] = interpolate_rotation(a[name], b[name], fraction).tolist()
+            result['sample_monotonic'] = stamp
+            return result
+        # A tiny endpoint tolerance covers host receive timestamp skew, not
+        # processing delay. Never reuse a current pose for an older LiDAR frame.
+        nearest = before or after
+        if nearest and abs(nearest[0]-stamp) <= .01:
+            return dict(nearest[1])
+        return None
+
+
 def load_settings(path):
     path = Path(path).resolve()
     settings = json.loads(path.read_text())
+    if settings.setdefault('pose_source', 'grasp') not in POSE_SOURCES:
+        raise ValueError('Invalid cart pose source')
+    decimate = settings.setdefault('camera_quad_decimate', 1.)
+    if type(decimate) not in (float, int) or not math.isfinite(decimate) or decimate < 1:
+        raise ValueError('camera_quad_decimate must be a finite number >= 1')
     limits = np.asarray(settings['task_limits'], dtype=float)
     if (settings.get('schema') != 'pushcart_navigation_v1' or limits.shape != (3, 2)
             or not np.isfinite(limits).all() or np.any(limits[:, 0] >= 0)
@@ -36,8 +180,13 @@ def load_settings(path):
     exported = json.loads((workspace / 'G1_high_policy_deploy/robot/models/v82_config.json').read_text())
     task = exported['task_command_range']
     allowed = np.array([task['vx'], [-task['vy_max'], task['vy_max']], [-task['wz_max'], task['wz_max']]])
+    # Navigation explicitly permits +/-0.30 m/s lateral commands. The exported
+    # model still documents its +/-0.25 m/s training range; this deployment
+    # override must not rewrite that metadata or expand the other axis bounds.
+    lateral_limit = max(float(task['vy_max']), .30)
+    allowed[1] = [-lateral_limit, lateral_limit]
     if np.any(limits[:, 0] < allowed[:, 0]) or np.any(limits[:, 1] > allowed[:, 1]):
-        raise ValueError('Navigation limits exceed the deployed cart model range')
+        raise ValueError('Navigation limits exceed the cart deployment range')
     # Nav2 provides the normal obstacle inflation. The combined footprint
     # defaults to the model geometry without an additional tracking envelope.
     for key, default in (('footprint_padding_m', 0.), ('tracking_margin_m', 0.),
@@ -46,6 +195,17 @@ def load_settings(path):
         if type(value) not in (float, int) or not math.isfinite(value) or not 0 <= value <= .5:
             raise ValueError('Invalid cart geometry margin: ' + key)
     return settings
+
+
+def save_pose_source(path, source):
+    if source not in POSE_SOURCES:
+        raise ValueError('Invalid cart pose source')
+    path = Path(path)
+    settings = json.loads(path.read_text())
+    settings['pose_source'] = source
+    temporary = path.with_name(path.name+'.tmp')
+    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2)+'\n')
+    temporary.replace(path)
 
 
 def origin(element):
@@ -194,6 +354,20 @@ class CartGeometry:
                     body_rotation=leveled.tolist(),
                     position_source='抓握几何估计', heading_source='相机实测')
 
+    def estimate_visual(self, joints, quaternion, observation):
+        if observation.get('valid') is not True:
+            raise ValueError(observation.get('reason', '缺少完整视觉位姿'))
+        # Keep arm geometry for the combined collision envelope. The cart
+        # center and orientation come entirely from the measured tag pose.
+        pose = self.estimate(joints, quaternion, observation['yaw_rad'])
+        matrix = np.asarray(observation['T_level_cart'], dtype=float)
+        if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+            raise ValueError('无效视觉位姿矩阵')
+        pose.update(position=matrix[:3, 3].tolist(), rotation=matrix[:3, :3].tolist(),
+                    position_source='AprilTag 视觉测量（URDF 外参）', heading_source='AprilTag 联合位姿',
+                    tag_ids=observation['tag_ids'], rmse_px=observation.get('rmse_px'))
+        return pose
+
     def footprint(self, pose, cart_mode):
         if not cart_mode:
             return [[-.30, -.25], [.32, -.25], [.32, .25], [-.30, .25]]
@@ -209,7 +383,12 @@ class CartGeometry:
         return convex_hull((np.asarray(points)[:, None, :] + offsets).reshape(-1, 2)).tolist()
 
     def self_mask(self, points_in_base, pose):
-        points = (np.asarray(points_in_base)-pose['position']) @ rotation_z(pose['yaw'])
+        rotation = np.asarray(pose['rotation']) if 'rotation' in pose else rotation_z(pose['yaw'])
+        points = (np.asarray(points_in_base)-pose['position']) @ rotation
+        return self.cart_mask(points)
+
+    def cart_mask(self, points):
+        """Filter all returns together after acquisition-time transforms."""
         inside = np.zeros(len(points), dtype=bool)
         padding = self.settings['self_filter_padding_m']
         for transform, half in self.boxes:

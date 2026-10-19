@@ -33,8 +33,8 @@ public:
     declare_parameter<bool>("require_navigation_reference", true);
     declare_parameter<double>("cart_min_vx", -0.2);
     declare_parameter<double>("cart_max_vx", 0.6);
-    declare_parameter<double>("cart_max_vy", 0.15);
-    declare_parameter<double>("cart_max_vyaw", 0.3);
+    declare_parameter<double>("cart_max_vy", 0.3);
+    declare_parameter<double>("cart_max_vyaw", 0.4);
     require_reference_ = get_parameter("require_navigation_reference").as_bool();
     cart_min_vx_ = get_parameter("cart_min_vx").as_double();
     cart_max_vx_ = get_parameter("cart_max_vx").as_double();
@@ -106,7 +106,7 @@ public:
           command_ = geometry_msgs::msg::Twist();
         }
         // Every close reaches the executor even if a reopen arrives before
-        // the next 50 ms timer. Reopening requires a new cmd_vel callback.
+        // the next 20 ms timer. Reopening requires a new cmd_vel callback.
         if (!enabled_) sendPacket(false, 0.0F, 0.0F, 0.0F);
         publishEnabled();
         if (changed)
@@ -123,7 +123,7 @@ public:
         command_received_ = true;
       });
     timer_ = create_wall_timer(
-      std::chrono::milliseconds(50), std::bind(&G1CmdVelUdpNode::sendCommand, this));
+      std::chrono::milliseconds(20), std::bind(&G1CmdVelUdpNode::sendCommand, this));
     publishEnabled();
     RCLCPP_WARN(
       get_logger(), "G1 cmd_vel safety gate starts DISABLED; enable only after localization is valid.");
@@ -248,7 +248,7 @@ private:
   bool reference_fault_latched_ = false;
   std::chrono::steady_clock::time_point reference_unavailable_since_;
   std::uint32_t reference_epoch_ = 0;
-  double cart_min_vx_ = -0.2, cart_max_vx_ = 0.6, cart_max_vy_ = 0.15, cart_max_vyaw_ = 0.3;
+  double cart_min_vx_ = -0.2, cart_max_vx_ = 0.6, cart_max_vy_ = 0.3, cart_max_vyaw_ = 0.4;
   std::chrono::steady_clock::time_point last_reference_;
   double max_vx_ = 0.35;
   double max_vy_ = 0.20;

@@ -1,0 +1,43 @@
+{
+  "description": "实际标定板：5×5 格，方格 39 mm，标记黑框 27.3 mm；length 单位为米。",
+  "board": {
+    "squares_x": 5,
+    "squares_y": 5,
+    "square_length_m": 0.039,
+    "marker_length_m": 0.0273,
+    "dictionary": "DICT_4X4_50",
+    "legacy_pattern": false
+  },
+  "camera": {
+    "device": "auto",
+    "width": 640,
+    "height": 480
+  },
+  "capture": {
+    "sample_count": 25,
+    "min_charuco_corners": 12,
+    "min_coverage_fraction": 0.02,
+    "max_frame_age_s": 0.5
+  },
+  "calibration": {
+    "min_views": 12,
+    "max_view_rms_px": 1.5,
+    "max_global_rms_px": 1.0,
+    "min_normal_span_deg": 15.0,
+    "save_undistorted_images": true
+  },
+  "reference": {
+    "position_in_torso_m": null,
+    "rpy_in_torso_deg": null,
+    "sample_count": 8,
+    "max_view_rms_px": 1.0,
+    "max_translation_spread_m": 0.015,
+    "max_rotation_spread_deg": 1.5
+  },
+  "output": {
+    "session_dir": "log/charuco",
+    "intrinsics_file": "calibrate_camera/charuco_intrinsics.json",
+    "extrinsics_file": "calibrate_camera/camera_to_torso.json"
+  },
+  "robot_urdf": "../G1_URDF/g1.urdf"
+}
