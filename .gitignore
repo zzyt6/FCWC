@@ -4,3 +4,6 @@ data/
 artifacts/
 environment-linux-aarch64-explicit.txt
 /G1Deploy_BalanceHomie/reports/
+# Push-cart episodes (Data/README.md documents them)
+/Data/*
+!/Data/README.md

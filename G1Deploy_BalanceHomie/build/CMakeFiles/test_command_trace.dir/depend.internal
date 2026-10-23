@@ -3,5 +3,6 @@
 
 CMakeFiles/test_command_trace.dir/tests/test_command_trace.cpp.o
  ../cpp/command_trace.hpp
+ ../cpp/motor_telemetry.hpp
  ../cpp/protocol.hpp
  /home/unitree/CWC/G1Deploy_BalanceHomie/tests/test_command_trace.cpp

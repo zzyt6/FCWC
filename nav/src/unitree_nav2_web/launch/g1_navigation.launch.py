@@ -195,6 +195,8 @@ def generate_launch_description():
             DeclareLaunchArgument("start_locomotion", default_value="true"),
             DeclareLaunchArgument("locomotion_mode", default_value="control"),
             DeclareLaunchArgument("locomotion_record", default_value="on", choices=["on", "off"]),
+            # One CWC/Data/<time>_nav folder per push-cart episode (enable -> disable).
+            DeclareLaunchArgument("pushcart_data", default_value="on", choices=["on", "off"]),
             DeclareLaunchArgument("locomotion_policy", default_value="auto"),
             DeclareLaunchArgument("heading_source", default_value="NAVIGATION"),
             # "config" keeps run_mode from nav/locomotion/motion_config.json;
@@ -227,6 +229,8 @@ def generate_launch_description():
                     # Per-tick task/student/camera telemetry, comparable with
                     # Viser push sessions; stored under nav/log/sessions.
                     "--recording", LaunchConfiguration("locomotion_record"),
+                    "--pushcart-data", LaunchConfiguration("pushcart_data"),
+                    "--pushcart-data-ros", LaunchConfiguration("pushcart_data"),
                 ],
                 name="g1_locomotion_executor",
                 # Keep model-loading/bridge tracebacks after the terminal closes.
@@ -424,6 +428,9 @@ def generate_launch_description():
                         ),
                         "nav2_params_file": nav2_params,
                         "cart_bt_xml": os.path.join(share, "behavior_trees", "cart_push.xml"),
+                        "pushcart_data": ParameterValue(PythonExpression([
+                            "'", LaunchConfiguration("pushcart_data"), "' == 'on'",
+                        ]), value_type=bool),
                         "speed_settings_file": LaunchConfiguration("speed_settings_file"),
                         "footprint": footprint,
                         "initial_pose_requires_policy": ParameterValue(PythonExpression([

@@ -3556,6 +3556,16 @@ string
 hand_core.hpp
 /home/unitree/CWC/G1Deploy_BalanceHomie/cpp/hand_core.hpp
 
+/home/unitree/CWC/G1Deploy_BalanceHomie/cpp/motor_telemetry.hpp
+algorithm
+-
+cstdint
+-
+iterator
+-
+limits
+-
+
 /home/unitree/CWC/G1Deploy_BalanceHomie/cpp/protocol.hpp
 array
 -
@@ -3565,6 +3575,8 @@ cstring
 -
 cmath
 -
+motor_telemetry.hpp
+/home/unitree/CWC/G1Deploy_BalanceHomie/cpp/motor_telemetry.hpp
 
 generated_config.hpp
 array

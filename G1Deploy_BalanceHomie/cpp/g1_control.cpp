@@ -60,7 +60,7 @@ void print_joint_bounds(const char* kind,uint32_t mask,uint32_t previous,const f
 struct Options {
   std::string interface;
   bool control=false,release=false,simulate=false,scripted=false,single_waist=false;
-  bool prepare_full_body=false,dex3=false;
+  bool prepare_full_body=false,dex3=false,motor_telemetry=false;
   std::array<float,14> hand_grasp{};
   std::optional<std::array<float,14>> hand_zero;
   HandPd hand_pd;
@@ -75,6 +75,7 @@ Options options(int argc,char** argv) {
     else if(arg=="--simulate") o.simulate=true;
     else if(arg=="--single-waist") o.single_waist=true;
     else if(arg=="--prepare-full-body") o.prepare_full_body=true;
+    else if(arg=="--motor-telemetry") o.motor_telemetry=true;
     else if(arg=="--dex3-pd" && i+1<argc) o.hand_pd=HandPd::parse(argv[++i]);
     else if((arg=="--dex3-grasp" || arg=="--dex3-zero-compensated") && i+1<argc) {
       if(arg=="--dex3-grasp") o.dex3=true;
@@ -97,6 +98,7 @@ Options options(int argc,char** argv) {
                  "Offline: --simulate [--control --scripted] [--duration N]\n"
                  "Single-waist G1: --single-waist disables SDK motor slots 13/14.\n"
                  "Viser: --prepare-full-body uses PREPARE packet targets for all active joints.\n"
+                 "--motor-telemetry appends read-only motor data to the existing state packets.\n"
                  "--dex3-grasp <14 comma-separated radians> enables coordinated hand control.\n"
                  "--dex3-pd <kp,kd> sets active hand gains (Viser passes its JSON config).\n"
                  "--dex3-zero-compensated <14 comma-separated radians> sets offsets for separate compensated open/grasp targets.\n";
@@ -141,8 +143,16 @@ class Udp {
     }
     command.magic=0; return true;
   }
-  void send(const StatePacket& packet) {
-    sendto(fd,&packet,sizeof(packet),0,reinterpret_cast<sockaddr*>(&destination),sizeof(destination));
+  void send(const StatePacket& packet,const MotorTelemetry* motor=nullptr) {
+    if(motor) {
+      // One datagram keeps the optional fields tied to the same body/hand samples.
+      std::array<char,sizeof(StatePacket)+sizeof(MotorTelemetry)> data;
+      std::memcpy(data.data(),&packet,sizeof(packet));
+      std::memcpy(data.data()+sizeof(packet),motor,sizeof(*motor));
+      sendto(fd,data.data(),data.size(),0,reinterpret_cast<sockaddr*>(&destination),sizeof(destination));
+    } else {
+      sendto(fd,&packet,sizeof(packet),0,reinterpret_cast<sockaddr*>(&destination),sizeof(destination));
+    }
   }
 };
 
@@ -307,7 +317,9 @@ class Robot {
     std::lock_guard<std::mutex> guard(mutex_);
     auto& feedback=hand_feedback_sources_.samples[source];
     const auto now=monotonic_ns();
-    if(!receive_hand_feedback(msg,side,now,config::max_temperature_c,feedback)) {
+    if(receive_hand_feedback(msg,side,now,config::max_temperature_c,feedback)) {
+      if(opt_.motor_telemetry) feedback.motor_telemetry[side]=hand_telemetry(msg,source);
+    } else {
       auto& logged=last_bad_hand_sample_log_[source][side];
       if(!logged || now-logged>=1000000000ULL) {
         std::cout<<"DEX3 SAMPLE discarded side="<<(side==0?"left":"right")
@@ -329,6 +341,7 @@ class Robot {
     last_tick_=msg.tick();
     Feedback next; next.valid=true; next.packet.sequence=latest_.packet.sequence+1;
     next.packet.received_ns=monotonic_ns(); next.packet.mode_machine=msg.mode_machine();
+    if(opt_.motor_telemetry) next.motor_telemetry=body_telemetry(msg);
     for(int i=0;i<29;++i) {
       next.packet.q[i]=msg.motor_state()[i].q(); next.packet.dq[i]=msg.motor_state()[i].dq();
       next.motor_temperature[i]=msg.motor_state()[i].temperature();
@@ -511,7 +524,14 @@ int main(int argc,char** argv) {
       for(int i=0;i<29;++i) {
         packet.applied_kp[i]=output.kp[i]; packet.applied_kd[i]=output.kd[i];
       }
-      udp.send(packet);
+      if(opt.motor_telemetry) {
+        MotorTelemetry motor;
+        motor.body=feedback.motor_telemetry;
+        for(int side=0;side<2;++side) motor.hands[side]=hand_feedback.motor_telemetry[side];
+        udp.send(packet,&motor);
+      } else {
+        udp.send(packet);
+      }
       // 输出机身健康检查与准备过程诊断。
       if((!healthy && (!last_health_log || (now-last_health_log)*1e-9>=1.0)) ||
          (healthy && !previous_health)) {

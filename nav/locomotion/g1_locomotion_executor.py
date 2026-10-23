@@ -608,6 +608,12 @@ def main():
     parser.add_argument('--recording', choices=('on', 'off'), default='off',
                         help='Archive per-tick telemetry in nav/log/sessions (its own 10-session limit, '
                              'so the Viser reference sessions are never pruned)')
+    parser.add_argument('--pushcart-data', choices=('on', 'off'), default='on',
+                        help='control mode: save each push-cart episode (enable -> disable) to CWC/Data/<time>_nav')
+    parser.add_argument('--pushcart-data-ros', choices=('on', 'off'), default='off',
+                        help='expect odometry and /cmd_vel recording in the existing navigation web bridge')
+    parser.add_argument('--pushcart-data-dir',
+                        help='Parent directory for push-cart episodes; required to record synthetic sim episodes')
     args = parser.parse_args()
     ports = (args.command_port, args.status_port, args.geometry_port)
     if any(not 1024 <= port <= 65535 for port in ports) or len(set(ports)) != 3:
@@ -634,6 +640,14 @@ def main():
                                 model_sets=model_sets)
         executor = Executor(controller, args.command_port, args.status_port, args.heading_source,
                             cart_config=args.cart_config, geometry_port=args.geometry_port)
+        if (args.pushcart_data == 'on' and controller.high_policy is not None
+                and (args.mode == 'control' or args.pushcart_data_dir)):
+            from core.pushcart_data import DATA_ROOT, PushcartDataRecorder
+            controller.data_recorder = PushcartDataRecorder(
+                'nav', mode=args.mode, interface=args.interface, config=config,
+                root=args.pushcart_data_dir or DATA_ROOT, ros=args.pushcart_data_ros == 'on')
+            backend.record_motor = True
+            controller.data_recorder.attach_camera(controller.high_policy.camera_process)
         controller.start()
         print('G1 LOCOMOTION EXECUTOR READY mode=%s interface=%s heading=%s Kp=%.2f source=%s | '
               'models=%s homie_sha256=%s | '

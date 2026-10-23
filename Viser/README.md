@@ -56,6 +56,8 @@ bash Viser/run.sh --mode sim --port 8086
 可在 `config/cart_display.json` 填入实际标签安装坐标启用测量位置。
 详见 [推车说明](../G1_high_policy_deploy/README.md)。
 
+控制模式下每次“启用推车策略”到关闭，自动在 `CWC/Data/<本地时间>_web/` 保存一份分析数据：策略输入/输出、全身电机与 Dex3 状态在每次推理完成后同拍记录（通常 50 Hz），直接复用控制桥接反馈，由后台线程写盘，不启动独立电机采集进程；另存相机标签检测结果，不录制视频。`--pushcart-data off` 关闭数据记录。格式与对齐方法见 [数据记录说明](../Data/README.md)。
+
 | 上半身准备姿态 | 配置文件 | 双臂角度 |
 |---|---|---|
 | 姿态 1 · 原准备姿态（默认） | [`deploy_upper_hold.yaml`](../G1_Upper_Initpose/deploy_upper_hold.yaml) | 原配置 |

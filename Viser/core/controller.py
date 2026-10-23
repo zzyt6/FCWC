@@ -84,6 +84,8 @@ class Controller:
         # Optional stage timer (navigation attaches one). Measurement only;
         # None keeps Viser's control path unchanged.
         self.timer = None
+        # Optional core.pushcart_data.PushcartDataRecorder; update() never blocks.
+        self.data_recorder = None
 
     def _mark(self, stage):
         if self.timer is not None:
@@ -976,6 +978,8 @@ class Controller:
             self.latest = data
         if self.recorder:
             self.recorder.record('telemetry', data)
+        if self.data_recorder is not None:
+            self.data_recorder.update(data, command_finished, state)
         if self.timer is not None:
             self.timer.mark('telemetry')
             if high is not None and high.inferred:
@@ -1034,6 +1038,9 @@ class Controller:
         self.shutdown.set()
         if self.thread:
             self.thread.join(timeout=5)
+        if self.data_recorder is not None:
+            # Finish data streams while their recorder processes are available.
+            self.data_recorder.close()
         self.record_event(type='shutdown', stage=self.stage, reason=self.reason or '程序退出')
         self.backend.close()
         if self.model_sets is not None:

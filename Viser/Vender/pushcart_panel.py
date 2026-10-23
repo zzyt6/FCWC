@@ -214,6 +214,8 @@ class PushcartPanel:
             text += '\n\n上肢增益正在切换，完成后可发送速度。'
         else:
             text += '\n\n上肢：' + upper_mode
+        if getattr(self.control, 'data_recorder', None) is not None:
+            text += '\n\n数据记录：' + self.control.data_recorder.status_text()
         error = getattr(self.control.config, 'pushcart_error', '') or high.get('warmup_error') or process.get('error')
         if error:
             text += '\n\n' + error[-600:]

@@ -3,6 +3,7 @@
 
 CMakeFiles/test_control_core.dir/tests/test_control_core.cpp.o
  ../cpp/control_core.hpp
+ ../cpp/motor_telemetry.hpp
  ../cpp/protocol.hpp
  /home/unitree/CWC/G1Deploy_BalanceHomie/tests/test_control_core.cpp
  generated_config.hpp

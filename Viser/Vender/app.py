@@ -407,11 +407,19 @@ def main():
     parser.add_argument('--heading-kp', type=float, help='Override heading Kp (0..2 per second)')
     parser.add_argument('--heading-mode', choices=('disabled','shadow','active'),
                         help='Pelvis heading feedback; default from config')
+    parser.add_argument('--pushcart-data', choices=('on', 'off'), default='on',
+                        help='control mode: save each push-cart episode (enable -> disable) to CWC/Data/<time>_web')
+    parser.add_argument('--pushcart-data-dir',
+                        help='Parent directory for push-cart episodes; required to record synthetic sim episodes')
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not np.isfinite(args.duration) or args.duration < 0:
         parser.error('Invalid port or duration')
     if args.record_sim and not args.record_dir:
         parser.error('--record-sim requires --record-dir outside the robot logs directory')
+    if args.mode == 'sim' and args.pushcart_data_dir:
+        from core.pushcart_data import DATA_ROOT
+        if DATA_ROOT in (Path(args.pushcart_data_dir).resolve(), *Path(args.pushcart_data_dir).resolve().parents):
+            parser.error('Synthetic push-cart episodes must be outside CWC/Data')
     if args.mode == 'sim' and args.record_dir:
         from core.robot import ROOT
         if ROOT / 'logs' in (Path(args.record_dir).resolve(), *Path(args.record_dir).resolve().parents):
@@ -444,6 +452,14 @@ def main():
         backend = Bridge(config, args.mode, args.interface, output=bridge_log)
         controller = Controller(config, backend, args.mode, recorder=recorder, policy_mode=args.policy_mode,
                                 model_sets=model_sets)
+        if (args.pushcart_data == 'on' and controller.high_policy is not None
+                and (args.mode == 'control' or args.pushcart_data_dir)):
+            from core.pushcart_data import DATA_ROOT, PushcartDataRecorder
+            controller.data_recorder = PushcartDataRecorder(
+                'web', mode=args.mode, interface=args.interface, config=config,
+                root=args.pushcart_data_dir or DATA_ROOT)
+            backend.record_motor = True
+            controller.data_recorder.attach_camera(controller.high_policy.camera_process)
         viewer = Viewer(controller, args.host, args.port)
         controller.start()
         print('READY mode=%s | http://127.0.0.1:%d | 局域网用本机 IP:%d' %

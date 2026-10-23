@@ -17,6 +17,7 @@ constexpr float hand_recovery_kp_min=.5f, hand_recovery_kp_max=2.f;
 constexpr double hand_recovery_timeout_s=3.;
 struct HandFeedback {
   std::array<float,14> q{},dq{};
+  std::array<HandTelemetry,2> motor_telemetry{};
   std::array<uint64_t,2> received_ns{};
   std::array<bool,2> valid{};
   std::array<std::string,2> invalid_reason{};
@@ -91,6 +92,7 @@ class HandFeedbackSources {
       out.valid[side]=sample.valid[side];
       out.invalid_reason[side]=sample.invalid_reason[side];
       out.source[side]=sample.received_ns[side]?source:-1;
+      out.motor_telemetry[side]=sample.motor_telemetry[side];
       for(int j=side*7;j<side*7+7;++j) { out.q[j]=sample.q[j]; out.dq[j]=sample.dq[j]; }
     }
     return out;

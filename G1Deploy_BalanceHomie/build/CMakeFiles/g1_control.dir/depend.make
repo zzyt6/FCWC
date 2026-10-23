@@ -535,6 +535,7 @@ CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o: ../cpp/g1_control.cpp
 CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o: ../cpp/hand_command.hpp
 CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o: ../cpp/hand_core.hpp
 CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o: ../cpp/hand_feedback.hpp
+CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o: ../cpp/motor_telemetry.hpp
 CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o: ../cpp/protocol.hpp
 CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o: generated_config.hpp
 

@@ -27,6 +27,7 @@ class Bridge:
         # ticks, so a slow consumer is not mistaken for an IMU stream outage.
         self.feedback_times = deque(maxlen=256)
         self.armed = False
+        self.record_motor = False
         self.sequence = 0
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -51,7 +52,7 @@ class Bridge:
         self.sequence = 0
         while True:
             try:
-                self.sock.recvfrom(p.STATE.size + 1)
+                self.sock.recvfrom(p.MAX_STATE_SIZE + 1)
             except BlockingIOError:
                 break
         command = [str(DEPLOY / 'build/g1_control'), '--single-waist', '--prepare-full-body',
@@ -59,6 +60,8 @@ class Bridge:
                    '--dex3-pd', ','.join(format(self.config.hand_pd[key], '.9g') for key in ('kp', 'kd'))]
         if self.config.hand_zero is not None:
             command += ['--dex3-zero-compensated', ','.join(format(v, '.9g') for v in self.config.hand_zero.flat)]
+        if self.record_motor:
+            command += ['--motor-telemetry']
         if self.mode == 'sim':
             command += ['--simulate']
         else:
@@ -74,7 +77,7 @@ class Bridge:
     def read(self):
         for _ in range(128):
             try:
-                data, sender = self.sock.recvfrom(p.STATE.size + 1)
+                data, sender = self.sock.recvfrom(p.MAX_STATE_SIZE + 1)
             except BlockingIOError:
                 break
             if sender != self.destination:

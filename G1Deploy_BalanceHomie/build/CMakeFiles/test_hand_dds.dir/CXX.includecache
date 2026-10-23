@@ -26,6 +26,16 @@ string
 hand_core.hpp
 ../cpp/hand_core.hpp
 
+../cpp/motor_telemetry.hpp
+algorithm
+-
+cstdint
+-
+iterator
+-
+limits
+-
+
 ../cpp/protocol.hpp
 array
 -
@@ -35,6 +45,8 @@ cstring
 -
 cmath
 -
+motor_telemetry.hpp
+../cpp/motor_telemetry.hpp
 
 ../vendor/unitree_sdk2/include/unitree/idl/hg/HandCmd_.hpp
 unitree/idl/hg/MotorCmd_.hpp

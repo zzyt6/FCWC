@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 import rclpy
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from lifecycle_msgs.msg import Transition
 from lifecycle_msgs.srv import ChangeState
 from nav2_msgs.action import NavigateToPose
@@ -75,6 +75,9 @@ class NavigationWebBridge(Node):
         self.declare_parameter("locomotion_command_port", 39002)
         self.declare_parameter("locomotion_status_port", 39005)
         self.declare_parameter("initial_pose_requires_policy", True)
+        self.declare_parameter("pushcart_data", False)
+        self.declare_parameter("pushcart_data_port", 39012)
+        self.data_recorder = None
         self.declare_parameter(
             "speed_settings_file", str(Path.cwd() / "config" / "navigation_speed.json")
         )
@@ -312,6 +315,24 @@ class NavigationWebBridge(Node):
         self.create_timer(0.5, self._prepare_reference_timer)
         self.http_server = self._start_http_server()
         self._set_motion(False)
+        self._start_data_recorder()
+
+    def _start_data_recorder(self):
+        if not self.get_parameter('pushcart_data').value:
+            return
+        from .episode_data import RosEpisodeRecorder
+        try:
+            self.data_recorder = RosEpisodeRecorder(int(self.get_parameter('pushcart_data_port').value))
+        except Exception as exc:
+            self.get_logger().error('Push-cart ROS data recorder unavailable: %s' % exc)
+            return
+        qos = QoSProfile(depth=50)
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        self.create_subscription(Odometry, '/Odometry',
+                                 lambda msg: self.data_recorder.odometry('odometry_fastlio.csv', msg), qos)
+        self.create_subscription(Twist, '/cmd_vel', self.data_recorder.cmd_vel, qos)
+        # /Odometry_base is already subscribed above; reuse its callback.
+        self.get_logger().info('PUSHCART DATA ros recorder ready (navigation_web_bridge thread)')
 
     def _set_state(self, phase=None, message=None, error=None):
         with self.lock:
@@ -1086,6 +1107,9 @@ class NavigationWebBridge(Node):
             self.last_cloud_time = sampled
 
     def _odom_callback(self, message):
+        recorder = getattr(self, 'data_recorder', None)
+        if recorder is not None:
+            recorder.odometry('odometry_base.csv', message)
         twist = message.twist.twist
         if (not _valid_navigation_pose(message.pose.pose)
                 or not all(math.isfinite(value) for value in
@@ -2579,6 +2603,8 @@ class NavigationWebBridge(Node):
         self.http_server.server_close()
         self.navigate_client.destroy()
         self.locomotion.close()
+        if self.data_recorder is not None:
+            self.data_recorder.close()
         super().destroy_node()
 
 

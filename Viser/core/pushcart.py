@@ -26,6 +26,9 @@ class CameraProcess:
         self.cpus = None
         self.missing_tag_dir = None
         self.missing_tag_error = ''
+        # Push-cart data episodes record scalar tag results in the camera
+        # process; images are never sent to the data recorder.
+        self.data_control_port = None
         self._recording_process = self._recording_enabled = None
         self.process = None
         self.reader = None
@@ -67,6 +70,8 @@ class CameraProcess:
                         '--tag-size', '0.10', '--robot-urdf', str(WORKSPACE / 'G1_URDF/g1.urdf')]
         if self.missing_tag_dir is not None:
             command += ['--missing-tag-dir', str(self.missing_tag_dir), '--missing-tag-control-stdin']
+        if self.data_control_port:
+            command += ['--data-control-port', str(self.data_control_port)]
         if self.cpus:
             # Children (the robot-state bridge) inherit this affinity. Detection
             # uses one OpenCV thread per pinned core (identical results).

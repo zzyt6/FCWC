@@ -51,6 +51,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import threading
 import time
@@ -653,7 +654,7 @@ class DetectionWorker:
 
     def __init__(self, reader, detector, pose_estimator=None, pose_smoother=None, cart_heading_estimator=None, *, profile=False,
                  pelvis_compensator=None, heading_smoother=None, cart_pose_estimator=None, missing_tag_frames=None,
-                 tag_window=False):
+                 tag_window=False, detection_sink=None):
         self.reader = reader
         self.detector = detector
         # The window tracks cart tags only; without a cart ID set every frame is searched in full.
@@ -672,6 +673,7 @@ class DetectionWorker:
         self.heading_smoother = heading_smoother
         self.cart_pose_estimator = cart_pose_estimator
         self.missing_tag_frames = missing_tag_frames
+        self.detection_sink = detection_sink
         self.profile_samples = deque(maxlen=120) if profile else None
         self.condition = threading.Condition()
         self.stop = threading.Event()
@@ -803,6 +805,8 @@ class DetectionWorker:
                     packet['stage_timings_ms'] = stages
                 if self.missing_tag_frames is not None:
                     self.missing_tag_frames.submit(packet)
+                if self.detection_sink is not None:
+                    self.detection_sink(packet)
                 with self.condition:
                     if stages is not None:
                         self.profile_samples.append(stages)
@@ -939,6 +943,9 @@ def parse_args(argv=None):
     parser.add_argument("--snapshot-dir", type=Path, default=SNAPSHOT_DIR)
     parser.add_argument('--missing-tag-dir', type=Path,
                         help='save raw PNG and frame metadata when no selected cart tag is detected')
+    parser.add_argument('--data-control-port', type=int, default=0,
+                        help='record push-cart tag results (CSV only) controlled by this loopback UDP port; '
+                             '0 disables (see Viser/core/data_episode.py)')
     parser.add_argument('--missing-tag-control-stdin', action='store_true',
                         help='save only frames captured while navigation enables recording through stdin')
     parser.add_argument("--intrinsics", type=Path, default=INTRINSICS_FILE, help="factory 640x480 color intrinsics JSON")
@@ -1173,12 +1180,30 @@ def _run(args, resources):
         missing_frames = MissingTagFrames(args.missing_tag_dir, selected_ids,
                                          control_fd=sys.stdin.fileno() if args.missing_tag_control_stdin else None)
         resources.callback(missing_frames.close)
+    detections = None
+    if args.data_control_port:
+        if __package__:
+            from .episode_detections import EpisodeDetections
+        else:
+            from episode_detections import EpisodeDetections
+        detections = EpisodeDetections(args.data_control_port)
+
+        def terminate(*_):
+            # The owner stops this process with SIGTERM. Unwind normally once
+            # so an open episode flushes its detection CSV; ignore repeats.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, terminate)
+        # The ExitStack runs this after _run has stopped the detector, so the
+        # last results are written before the detection CSV is closed.
+        resources.callback(detections.close)
     reader = CameraReader(open_camera(args.device), args.frames)
     try:
         worker = DetectionWorker(reader, detector, pose_estimator, pose_smoother, cart_heading_estimator,
                                  profile=args.profile, pelvis_compensator=compensator, heading_smoother=heading_smoother,
                                  cart_pose_estimator=cart_pose_estimator, missing_tag_frames=missing_frames,
-                                 tag_window=not args.no_tag_window)
+                                 tag_window=not args.no_tag_window,
+                                 detection_sink=detections.detection if detections is not None else None)
     except Exception:
         reader.close()
         raise

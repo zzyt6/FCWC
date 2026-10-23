@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include "motor_telemetry.hpp"
 
 namespace decoupled {
 constexpr uint32_t kStateMagic = 0x48594253, kCommandMagic = 0x48594243, kVersion = 9;
@@ -56,6 +57,7 @@ static_assert(sizeof(CommandPacket)==248, "Command wire format changed");
 
 struct Feedback {
   StatePacket packet;
+  BodyTelemetry motor_telemetry;
   bool valid=false;
   bool motor_error=false;
   bool remote_valid=false;

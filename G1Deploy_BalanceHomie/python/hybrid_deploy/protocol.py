@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 STATE = struct.Struct('<IIQQQQIIII101fIf58fIf42f7Q43fIiIf')
+MOTOR_TELEMETRY = struct.Struct('<5I29I90f' + 'IiI126f' * 2)
+MOTOR_TELEMETRY_MAGIC, MOTOR_TELEMETRY_VERSION = 0x4d545231, 1
+MAX_STATE_SIZE = STATE.size + MOTOR_TELEMETRY.size
 COMMAND = struct.Struct('<IIQQQQQII29fIiI14fII')
 STATE_MAGIC, COMMAND_MAGIC, VERSION = 0x48594253, 0x48594243, 9
 PROFILE_NAMES = ('balance', 'homie')
@@ -55,12 +58,14 @@ class State:
     hand_recovery_joint: int = -1
     upper_mode: int = 0
     upper_gain_blend: float = 1.
+    # Optional recording data, decoded only for the sample selected by Viser.
+    motor_telemetry: bytes = b''
 
     @classmethod
     def decode(cls, data):
-        if len(data) != STATE.size:
+        if len(data) not in (STATE.size, MAX_STATE_SIZE):
             raise ValueError('Wrong state packet size')
-        v = STATE.unpack(data)
+        v = STATE.unpack_from(data)
         if v[:2] != (STATE_MAGIC, VERSION) or v[6] > FAULT:
             raise ValueError('Wrong state protocol')
         floats = np.asarray(v[10:111], dtype=np.float32)
@@ -83,7 +88,25 @@ class State:
                    floats[61:65], floats[65:68], floats[68:72], floats[72:101],
                    v[111], float(gains[0]), gains[1:30], gains[30:59],
                    v[171], float(hands[0]), hands[1:15], hands[15:29], hands[29:43],
-                   v[215], v[216:219], v[219:221], v[221], sent_q, v[265], v[266], v[267], v[268])
+                   v[215], v[216:219], v[219:221], v[221], sent_q, v[265], v[266], v[267], v[268],
+                   data[STATE.size:])
+
+
+def motor_telemetry(data):
+    """Decode read-only fields off the control thread; absent samples stay absent."""
+    if len(data) != MOTOR_TELEMETRY.size:
+        return {}, ({}, {})
+    v = MOTOR_TELEMETRY.unpack(data)
+    if v[:2] != (MOTOR_TELEMETRY_MAGIC, MOTOR_TELEMETRY_VERSION):
+        return {}, ({}, {})
+    body = (dict(tick=v[3], mode_pr=v[4], mode=v[5:34], ddq=v[34:63],
+                 tau_est=v[63:92], vol=v[92:121], acc=v[121:124]) if v[2] else {})
+    hands = []
+    for offset in (124, 253):
+        h = v[offset:offset + 129]
+        hands.append(dict(source=h[1], press_sensor_count=h[2], ddq=h[3:10], tau_est=h[10:17],
+                          power=h[17:21], pressure=h[21:129]) if h[0] else {})
+    return body, tuple(hands)
 
 
 def command(state, sequence, request, targets, profile=0, hand_pose=0, hand_recover=-1,

@@ -18,6 +18,16 @@ sstream
 string
 -
 
+../cpp/motor_telemetry.hpp
+algorithm
+-
+cstdint
+-
+iterator
+-
+limits
+-
+
 ../cpp/protocol.hpp
 array
 -
@@ -27,6 +37,8 @@ cstring
 -
 cmath
 -
+motor_telemetry.hpp
+../cpp/motor_telemetry.hpp
 
 /home/unitree/CWC/G1Deploy_BalanceHomie/tests/test_control_core.cpp
 control_core.hpp

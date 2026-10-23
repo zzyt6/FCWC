@@ -90,6 +90,7 @@ CMakeFiles/test_hand_dds.dir/cpp/dex3_type_support.cpp.o: ../cpp/dex3_type_suppo
 CMakeFiles/test_hand_dds.dir/tests/test_hand_dds.cpp.o: ../cpp/hand_command.hpp
 CMakeFiles/test_hand_dds.dir/tests/test_hand_dds.cpp.o: ../cpp/hand_core.hpp
 CMakeFiles/test_hand_dds.dir/tests/test_hand_dds.cpp.o: ../cpp/hand_feedback.hpp
+CMakeFiles/test_hand_dds.dir/tests/test_hand_dds.cpp.o: ../cpp/motor_telemetry.hpp
 CMakeFiles/test_hand_dds.dir/tests/test_hand_dds.cpp.o: ../cpp/protocol.hpp
 CMakeFiles/test_hand_dds.dir/tests/test_hand_dds.cpp.o: ../vendor/unitree_sdk2/include/unitree/idl/hg/HandCmd_.hpp
 CMakeFiles/test_hand_dds.dir/tests/test_hand_dds.cpp.o: ../vendor/unitree_sdk2/include/unitree/idl/hg/HandState_.hpp

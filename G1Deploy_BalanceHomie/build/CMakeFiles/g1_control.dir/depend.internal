@@ -536,5 +536,6 @@ CMakeFiles/g1_control.dir/cpp/g1_control.cpp.o
  /home/unitree/CWC/G1Deploy_BalanceHomie/cpp/hand_command.hpp
  /home/unitree/CWC/G1Deploy_BalanceHomie/cpp/hand_core.hpp
  /home/unitree/CWC/G1Deploy_BalanceHomie/cpp/hand_feedback.hpp
+ /home/unitree/CWC/G1Deploy_BalanceHomie/cpp/motor_telemetry.hpp
  /home/unitree/CWC/G1Deploy_BalanceHomie/cpp/protocol.hpp
  generated_config.hpp
