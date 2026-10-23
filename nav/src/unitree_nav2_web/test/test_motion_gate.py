@@ -62,6 +62,8 @@ def gate(monkeypatch):
                 process = subprocess.Popen([
                     str(binary), '--ros-args', '-p', f'udp_port:={receiver.getsockname()[1]}',
                     '-p', 'max_vx:=0.6', '-p', 'motion_enable_timeout:=0.4',
+                    # Production uses 3 s; a short latch keeps this test fast.
+                    '-p', 'reference_fault_timeout:=0.6',
                 ], stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
 
                 class Gate:

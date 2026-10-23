@@ -29,4 +29,12 @@ unset CYCLONEDDS_URI RMW_IMPLEMENTATION PYTHONPATH AMENT_PREFIX_PATH LD_LIBRARY_
 # The C++ bridge's RUNPATH selects the DDS libraries bundled with its SDK;
 # inherited ROS library paths must not override that matching pair.
 export PYTHONDONTWRITEBYTECODE=1
+# CPU partition: the body policy and its 200 Hz C++ bridge (children of this
+# process) own CPUs 6-7. The executor moves the cart camera to CPUs 4-5
+# (G1_CAMERA_CPUS), so detection cannot starve the bridge's 100 ms heartbeat.
+# g1_navigation.launch.py keeps LiDAR/FAST-LIO/Nav2 on CPUs 0-3.
+EXECUTOR_CPUS="${G1_EXECUTOR_CPUS:-6-7}"
+if command -v taskset >/dev/null 2>&1 && [[ -n "$EXECUTOR_CPUS" ]]; then
+  exec taskset -c "$EXECUTOR_CPUS" "$G1_LOCOMOTION_PYTHON" -B "$LOCOMOTION_DIR/g1_locomotion_executor.py" "$@"
+fi
 exec "$G1_LOCOMOTION_PYTHON" -B "$LOCOMOTION_DIR/g1_locomotion_executor.py" "$@"

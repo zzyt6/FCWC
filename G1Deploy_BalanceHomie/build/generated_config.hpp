@@ -2,7 +2,7 @@
 #include <array>
 #include <cstdint>
 namespace decoupled { namespace config {
-constexpr uint64_t token = 8521103625692245300ULL;
+constexpr uint64_t token = 4273115170531665960ULL;
 constexpr double schema = 1.0000000000;
 constexpr double bridge_port = 27001.0000000000;
 constexpr double state_port = 27002.0000000000;
@@ -10,6 +10,7 @@ constexpr double policy_hz = 50.0000000000;
 constexpr double servo_hz = 200.0000000000;
 constexpr double state_timeout_s = 0.1000000000;
 constexpr double command_timeout_s = 0.1000000000;
+constexpr double command_hold_timeout_s = 2.0000000000;
 constexpr double startup_timeout_s = 15.0000000000;
 constexpr double calibration_s = 3.0000000000;
 constexpr double calibration_timeout_s = 10.0000000000;

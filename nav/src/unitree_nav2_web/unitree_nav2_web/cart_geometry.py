@@ -35,6 +35,11 @@ def interpolate_rotation(a, b, fraction):
 
 class PelvisYawHistory:
     """Express a delayed camera heading in the current pelvis frame, for Nav only."""
+    # The executor samples feedback once per 50 Hz tick. A 30 ms window failed
+    # whenever a single tick slipped; at the 0.6 rad/s task limit 60 ms of
+    # bracketing error is below 0.04 rad and keeps the real sample timing.
+    ALIGN_TOLERANCE_S = .06
+
     def __init__(self):
         self.samples = deque(maxlen=128)
         self.session = None
@@ -67,7 +72,8 @@ class PelvisYawHistory:
             if sample[0] >= captured:
                 after = sample
                 break
-        if before and after and max(captured-before[0], after[0]-captured) <= .03:
+        tolerance = self.ALIGN_TOLERANCE_S
+        if before and after and max(captured-before[0], after[0]-captured) <= tolerance:
             fraction = (captured-before[0])/(after[0]-before[0]) if after[0] > before[0] else 0.
             a, b = before[2], after[2]
             if 'q' in a and 'q' in b:
@@ -79,7 +85,7 @@ class PelvisYawHistory:
                 return dict(q=a['q']+fraction*(b['q']-a['q']), quat=quaternion)
         nearest = min((s for s in (before, after) if s is not None),
                       key=lambda s: abs(s[0]-captured), default=None)
-        if nearest and abs(nearest[0]-captured) <= .03 and 'q' in nearest[2]:
+        if nearest and abs(nearest[0]-captured) <= tolerance and 'q' in nearest[2]:
             return nearest[2]
         raise ValueError('等待图像时刻的机身和手臂反馈')
 
@@ -93,15 +99,16 @@ class PelvisYawHistory:
             if sample[0] >= captured:
                 after = sample
                 break
-        # Match the camera's 30 ms state-alignment tolerance; never silently
-        # substitute current feedback for a missing historical observation.
-        if before and after and max(captured-before[0], after[0]-captured) <= .03:
+        # Never silently substitute current feedback for a missing historical
+        # observation; only bridge one slipped 50 Hz feedback tick.
+        tolerance = self.ALIGN_TOLERANCE_S
+        if before and after and max(captured-before[0], after[0]-captured) <= tolerance:
             delta = math.atan2(math.sin(after[1]-before[1]), math.cos(after[1]-before[1]))
             fraction = (captured-before[0])/(after[0]-before[0]) if after[0] > before[0] else 0.
             captured_yaw = before[1]+fraction*delta
         else:
             nearest = min((s for s in (before, after) if s is not None), key=lambda s: abs(s[0]-captured))
-            if abs(nearest[0]-captured) > .03:
+            if abs(nearest[0]-captured) > tolerance:
                 raise ValueError('缺少图像时刻的骨盆航向反馈，等待时间对齐')
             captured_yaw = nearest[1]
         correction = math.atan2(math.sin(captured_yaw-current_yaw), math.cos(captured_yaw-current_yaw))
@@ -152,6 +159,14 @@ class CartPoseHistory:
         # latest sample cannot be filled by waiting for later packets.
         return not self.samples or stamp > self.samples[-1][0]
 
+    def nearest(self, stamp, tolerance):
+        """Closest real sample within tolerance, when interpolation is unavailable."""
+        before, after = self._bracket(stamp)
+        candidates = [s for s in (before, after) if s is not None and abs(s[0]-stamp) <= tolerance]
+        if not candidates:
+            return None
+        return dict(min(candidates, key=lambda s: abs(s[0]-stamp))[1])
+
     def at(self, stamp):
         before, after = self._bracket(stamp)
         if before and after and after[0]-before[0] <= self.max_gap:
@@ -183,7 +198,14 @@ def load_settings(path):
     settings = json.loads(path.read_text())
     if settings.setdefault('pose_source', 'grasp') not in POSE_SOURCES:
         raise ValueError('Invalid cart pose source')
-    decimate = settings.setdefault('camera_quad_decimate', 1.)
+    # Cart heading hold gain during navigation. RPP already closes the loop on
+    # the cart heading through the path; 2026-10-21 the hold (Kp 1) correlated
+    # +0.72 with RPP wz, raised task wz sd 0.054 -> 0.085, and the student
+    # amplified it 2.24x into body yaw swing. Viser manual pushing keeps Kp 1.
+    hold_kp = settings.setdefault('cart_heading_hold_kp', 0.)
+    if type(hold_kp) not in (int, float) or not 0. <= hold_kp <= 2.:
+        raise ValueError('cart_heading_hold_kp must be a number in [0, 2]')
+    decimate = settings.setdefault('camera_quad_decimate', 2.)
     if type(decimate) not in (float, int) or not math.isfinite(decimate) or decimate < 1:
         raise ValueError('camera_quad_decimate must be a finite number >= 1')
     limits = np.asarray(settings['task_limits'], dtype=float)
@@ -300,6 +322,7 @@ class CartGeometry:
         robot = ET.parse(settings['robot_urdf']).getroot()
         self.joints = {j.find('child').get('link'): j for j in robot.findall('joint')}
         self.chains = {}
+        self.kinematic_chains = {}
         for side in ('left', 'right'):
             link, chain = side + '_hand_palm_link', []
             while link in self.joints:
@@ -307,6 +330,18 @@ class CartGeometry:
                 chain.append(joint)
                 link = joint.find('parent').get('link')
             self.chains[side] = chain[::-1]
+            prepared = []
+            for joint in self.chains[side]:
+                name, skew = None, None
+                if joint.get('type') in ('revolute', 'continuous'):
+                    name = joint.get('name')
+                    axis = np.fromstring(joint.find('axis').get('xyz'), sep=' ')
+                    axis /= np.linalg.norm(axis)
+                    x, y, z = axis
+                    skew = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+                prepared.append((origin(joint.find('origin')), name, skew,
+                                 skew @ skew if skew is not None else None))
+            self.kinematic_chains[side] = prepared
         cart = ET.parse((path.parent / self.display['urdf']).resolve()).getroot()
         self.boxes, self.spheres = [], []
         base = cart.find("link[@name='base_link']")
@@ -358,20 +393,18 @@ class CartGeometry:
         body_yaw = math.atan2(body_rotation[1, 0], body_rotation[0, 0])
         leveled = rotation_z(-body_yaw) @ body_rotation
         palms = []
-        for side, chain in self.chains.items():
+        for side, chain in self.kinematic_chains.items():
             transform = np.eye(4)
-            for joint in chain:
-                transform = transform @ origin(joint.find('origin'))
-                if joint.get('type') in ('revolute', 'continuous'):
-                    angle = float(joints[joint.get('name')])
+            # URDF origins and joint axes are constant. Parsing them in every
+            # 50 Hz report competes with the body policy's Python thread.
+            for fixed, name, skew, square in chain:
+                transform = transform @ fixed
+                if name is not None:
+                    angle = float(joints[name])
                     if not math.isfinite(angle):
                         raise ValueError('Invalid arm feedback')
-                    axis = np.fromstring(joint.find('axis').get('xyz'), sep=' ')
-                    axis /= np.linalg.norm(axis)
-                    x, y, z = axis
-                    skew = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
                     motion = np.eye(4)
-                    motion[:3, :3] = np.eye(3)+math.sin(angle)*skew+(1-math.cos(angle))*(skew @ skew)
+                    motion[:3, :3] = np.eye(3)+math.sin(angle)*skew+(1-math.cos(angle))*square
                     transform = transform @ motion
             point = transform @ np.r_[self.display['grasp_point_in_palm_m'][side], 1.]
             palms.append(leveled @ point[:3])

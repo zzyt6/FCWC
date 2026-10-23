@@ -115,6 +115,11 @@ public:
         sensor_clock_.observe(sensor, received);
         const auto sampled = sensor_clock_.hostTime(sensor, received);
         if (!sampled) return;
+        // The offset changes slowly and readers only need one within 0.3 s.
+        // At the 200 Hz IMU rate this stream cost the Python cart filter
+        // ~200 callbacks/s and GIL time; observe() above still sees every IMU.
+        if (last_clock_publish_ && received - *last_clock_publish_ < .04) return;
+        last_clock_publish_ = received;
         // Raw self-filtering precedes FAST-LIO. Its clock reference must be
         // available directly from IMU, without waiting for filtered odometry.
         sensor_msgs::msg::TimeReference clock;
@@ -496,6 +501,7 @@ private:
   unitree_g1_kinematics::SensorClock sensor_clock_;
   unitree_g1_kinematics::JointHistory joint_history_;
   std::optional<double> last_mount_sample_;
+  std::optional<double> last_clock_publish_;
 
   int lowstate_socket_ = -1;
   rclcpp::TimerBase::SharedPtr lowstate_timer_;

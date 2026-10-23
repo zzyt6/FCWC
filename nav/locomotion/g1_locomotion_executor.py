@@ -22,6 +22,7 @@ and bridge faults still stop immediately. After damping, "reset" restarts
 the bridge read-only.
 """
 import argparse
+import os
 from pathlib import Path
 import json
 import signal
@@ -45,6 +46,7 @@ from core.model_sets import ModelSets, MODEL_SET_LABELS  # noqa: E402
 from core.hand_grasp import HAND_LOWER, HAND_UPPER  # noqa: E402
 from unitree_nav2_web.cart_geometry import CartGeometry, POSE_SOURCES, load_settings, save_pose_source, PelvisYawHistory  # noqa: E402
 from unitree_nav2_web.locomotion import locomotion_actions  # noqa: E402
+from unitree_nav2_web.stage_timing import StageTimer  # noqa: E402
 
 # Must match nav/src/unitree_g1_kinematics/include/unitree_g1_kinematics/velocity_packet.hpp
 # Version 3 uses the former padding for the navigation reference epoch.
@@ -63,7 +65,26 @@ MODEL_SETS = {0: 'v81', 1: 'v82'}
 CLIENT = 1
 COMMAND_TIMEOUT_S = 0.25
 EXECUTOR_PERIOD_S = 0.02
+# Periodic TIMING lines in launch.log; 0 disables them.
+TIMING_LOG_PERIOD_S = float(os.environ.get('G1_TIMING_LOG_S', '2'))
 NAV_CART_CONFIG = WORKSPACE / 'nav/config/pushcart_navigation.json'
+
+
+def _cpu_set(text):
+    """Parse a taskset-style list such as '4-5' or '4,5'; empty -> None."""
+    cpus = set()
+    for part in (text or '').split(','):
+        if part.strip():
+            low, _, high = part.partition('-')
+            cpus.update(range(int(low), int(high or low)+1))
+    return cpus or None
+
+
+# The camera detector and its robot-state subscriber run on their own cores,
+# never on the cores of this 50 Hz policy thread and its 200 Hz C++ bridge
+# (whose 100 ms heartbeat watchdog damps the robot if a tick is starved).
+# Detection uses one OpenCV thread per camera core.
+CAMERA_CPUS = _cpu_set(os.environ.get('G1_CAMERA_CPUS', '4-5'))
 CART_ACTIONS = frozenset(('hand_toggle', 'hand_compensation', 'hand_edit', 'hand_load', 'hand_save',
                           'cart_camera_start', 'cart_yaw_zero', 'pushcart_enable', 'pushcart_disable',
                           'cart_detach', 'cart_pose_source'))
@@ -87,10 +108,12 @@ class Executor:
         for high in highs:
             if high is not None:
                 high.limits = self.cart_limits.copy()
+                high.hold.kp = float(self.cart_settings['cart_heading_hold_kp'])
                 if high.camera_process is not None:
                     high.camera_process.publish_cart_pose = True
                     high.camera_process.quad_decimate = self.cart_settings['camera_quad_decimate']
                     high.camera_process.missing_tag_dir = WORKSPACE / 'nav/log/missing_tags'
+                    high.camera_process.cpus = CAMERA_CPUS
                 if self.cart_pose_source != 'grasp':
                     high.set_navigation_pose_source(self.cart_pose_source, clock())
         self.cart_attached = False
@@ -109,6 +132,13 @@ class Executor:
                                '或其他运控执行进程' % command_port) from exc
         self.command_port = command_port
         self.target = np.zeros(3, dtype=np.float32)
+        # Measurement only: per-stage wall times of both 50 Hz loops.
+        self.timer = StageTimer('executor')
+        self.camera_timer = StageTimer('camera_seen_by_control')
+        controller.timer = StageTimer('control')
+        self.last_timing_log = time.monotonic()
+        self.last_camera_frame = None
+        self.camera_status, self.camera_status_since = None, time.monotonic()
         self.enabled = False
         self.last_packet = -float('inf')
         self.last_motion = -float('inf')
@@ -375,11 +405,15 @@ class Executor:
             self.pending_pose_source = None
 
     def step(self):
+        timer = self.timer
+        timer.start()
         now = self.clock()
         self.new_motion = False
         self._receive(now)
+        timer.mark('udp_receive')
         now = self.clock()
         data = self.control.snapshot()
+        timer.mark('snapshot')
         high = data.get('high_policy') or {}
         camera_process = self.control.high_policy.camera_process if self.control.high_policy is not None else None
         if camera_process is not None:
@@ -395,8 +429,11 @@ class Executor:
             self.last_claim = now
         fresh = self.enabled and 0 <= now - self.last_motion <= COMMAND_TIMEOUT_S
         running = data.get('stage') == 'POLICY' and data.get('source') == 'web' and data.get('owner') == CLIENT
+        self._confirm_pose_source(data, now)
+        cart = self._cart_status(data, now)
+        timer.mark('cart_status')
         if self.cart_attached:
-            running = running and high.get('enabled') and not high.get('motion_blocked') and self._cart_status(data, now)['valid']
+            running = running and high.get('enabled') and not high.get('motion_blocked') and cart['valid']
             if not running:
                 self._stop_motion()
         if not fresh:
@@ -407,7 +444,48 @@ class Executor:
             self.control.emit('move', CLIENT, [float(v) for v in self.target],
                               command_source=self.heading_source, command_time=self.last_motion)
             self.motion_active = bool(np.any(self.target))
-        self._report(data, now, fresh)
+        timer.mark('forward_command')
+        self._report(data, now, fresh, cart=cart)
+        timer.finish()
+        self._log_timing(data)
+
+    def _log_camera_status(self, camera):
+        """launch.log line for every camera heading state change; short holds only if >= 0.1 s."""
+        status, now = camera.get('status'), time.monotonic()
+        if status is None or status == self.camera_status:
+            return
+        old, held = self.camera_status, now-self.camera_status_since
+        self.camera_status, self.camera_status_since = status, now
+        if {old, status} == {'tracking', 'holding'}:
+            if old == 'holding' and held >= .1:
+                print(f'CAMERA STATUS held last heading {held:.2f} s, tracking again', flush=True)
+            return
+        age = camera.get('age_s')
+        print(f'CAMERA STATUS {old} -> {status} after {held:.2f} s | heading age '
+              f'{"none" if age is None else f"{age*1000:.0f} ms"} | {camera.get("reason", "")}', flush=True)
+
+    def _log_timing(self, data):
+        camera = ((data.get('high_policy') or {}).get('camera') or {})
+        self._log_camera_status(camera)
+        if camera.get('frame_age_s') is not None:
+            # Camera stages are measured in the camera process (CAMERA TIMING
+            # lines); here: the newest frame as the 50 Hz control loop saw it.
+            self.camera_timer.record('frame_age', camera['frame_age_s']*1000)
+            timing = camera.get('timing') or {}
+            if camera.get('receive_age_s') is not None and self.last_camera_frame != timing:
+                self.last_camera_frame = timing
+                self.camera_timer.record('capture_to_receive',
+                                         (camera['frame_age_s']-camera['receive_age_s'])*1000)
+                for key in ('detection_ms', 'processing_ms'):
+                    if key in timing:
+                        self.camera_timer.record(key[:-3], timing[key])
+        if TIMING_LOG_PERIOD_S <= 0 or time.monotonic()-self.last_timing_log < TIMING_LOG_PERIOD_S:
+            return
+        self.last_timing_log = time.monotonic()
+        for timer in (self.control.timer, self.timer, self.camera_timer):
+            line = timer.report()
+            if line:
+                print(line, flush=True)
 
     def _warnings(self, data, now):
         # Use Viser's read-only checks. Warning rendering must never affect
@@ -424,12 +502,13 @@ class Executor:
             return [dict(level='warning', active=True,
                          message='告警显示暂时不可用（机身控制继续）：' + str(exc)[:200])]
 
-    def _report(self, data, now, fresh):
+    def _report(self, data, now, fresh, *, cart=None):
         # One report per executor tick also carries the latest cart geometry.
         # A second elapsed-time throttle would skip alternate ticks whenever
         # the 50 Hz scheduler wakes a little earlier than the previous tick.
         self.last_status = now
-        self._confirm_pose_source(data, now)
+        if cart is None:
+            self._confirm_pose_source(data, now)
         stage = data.get('stage', 'WAITING')
         dex3 = data.get('dex3') or {}
         owned = data.get('source') == 'web' and data.get('owner') == CLIENT
@@ -438,13 +517,15 @@ class Executor:
         ready = (stage == 'POLICY' and bool(data.get('healthy')) and feedback_fresh and owned
                  and not (data.get('heading') or {}).get('motion_blocked'))
         high = data.get('high_policy') or {}
-        cart = self._cart_status(data, now)
+        if cart is None:
+            cart = self._cart_status(data, now)
         if self.cart_attached:
             ready = ready and bool(high.get('enabled')) and not high.get('motion_blocked') and cart['valid'] and not data.get('upper_pd_transitioning')
         # Keep the UDP status small; full inference outputs remain in the existing recorder.
         high_status = {key: high.get(key) for key in ('enabled', 'motion_blocked', 'reason', 'enable_reason', 'zero_reason',
                        'history_frames', 'history_required', 'warmup_error', 'zero_calibration', 'camera', 'camera_process',
                        'model_release')} if high else {}
+        self.timer.mark('report_build')
         hand_status = {key: dex3.get(key) for key in ('active', 'healthy', 'pose', 'moving', 'pending',
                        'recovering', 'recovery_pending', 'blocking_reason', 'grasp', 'grasp_revision', 'grasp_dirty', 'editor_available', 'editor_message',
                        'compensation_enabled', 'compensation_available', 'file_busy', 'q', 'ever_started')}
@@ -489,6 +570,7 @@ class Executor:
             pushcart_error=getattr(self.control.config, 'pushcart_error', ''),
             simulation=bool(data.get('simulation')),
             sent_monotonic=now)
+        self.timer.mark('report_status')
         try:
             packet = json.dumps(status, ensure_ascii=False,
                                 default=lambda value: value.tolist() if isinstance(value, np.ndarray) else value.item()).encode('utf-8')
@@ -497,6 +579,7 @@ class Executor:
                 self.sock.sendto(packet, ('127.0.0.1', self.geometry_port))
         except OSError:
             pass
+        self.timer.mark('report_send')
 
     def close(self):
         self.sock.close()
@@ -521,7 +604,10 @@ def main():
     parser.add_argument('--geometry-port', type=int, default=39006)
     parser.add_argument('--cart-config', default=str(NAV_CART_CONFIG))
     parser.add_argument('--record', action='store_true',
-                        help='Archive this run in Viser/logs/sessions (shares its 5-session limit)')
+                        help='Archive this run (same as --recording on)')
+    parser.add_argument('--recording', choices=('on', 'off'), default='off',
+                        help='Archive per-tick telemetry in nav/log/sessions (its own 10-session limit, '
+                             'so the Viser reference sessions are never pruned)')
     args = parser.parse_args()
     ports = (args.command_port, args.status_port, args.geometry_port)
     if any(not 1024 <= port <= 65535 for port in ports) or len(set(ports)) != 3:
@@ -536,9 +622,10 @@ def main():
     recorder = controller = executor = backend = model_sets = None
     try:
         model_sets = ModelSets(config, args.mode, args.interface, policy_mode=args.policy_mode)
-        if args.record and args.mode == 'control':
+        if (args.record or args.recording == 'on') and args.mode == 'control':
             from core.recording import SessionRecorder
-            recorder = SessionRecorder(config, dict(vars(args), mode='control'))
+            recorder = SessionRecorder(config, dict(vars(args), mode='control'),
+                                       directory=WORKSPACE / 'nav/log/sessions')
             print('RECORDING ' + str(recorder.path), flush=True)
         from core.backends import Bridge, build_bridge
         build_bridge()

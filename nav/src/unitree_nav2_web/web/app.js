@@ -683,6 +683,7 @@ function drawCart(dpr) {
   const pose = status.cart_pose;
   const reference = status.navigation_reference || {};
   if (!statusFresh() || !pose || reference.mode !== 'cart') return;
+  const fresh = pose.fresh !== false;
   const project = ([x, y]) => worldToScreen(
     pose.x + Math.cos(pose.yaw) * x - Math.sin(pose.yaw) * y,
     pose.y + Math.sin(pose.yaw) * x + Math.cos(pose.yaw) * y);
@@ -696,7 +697,7 @@ function drawCart(dpr) {
     ctx.stroke();
   };
   ctx.save();
-  if (visibility.footprint) {
+  if (visibility.footprint && fresh) {
     ctx.strokeStyle = '#ffb347'; ctx.lineWidth = 1.5 * dpr;
     ctx.setLineDash([6 * dpr, 4 * dpr]);
     polygon(reference.footprint);
@@ -704,7 +705,8 @@ function drawCart(dpr) {
   }
   if (visibility.cart) {
     const model = reference.cart_model || {};
-    const color = reference.ready ? '#63e6be' : '#a6b8b2';
+    const color = fresh && reference.ready ? '#63e6be' : '#a6b8b2';
+    if (!fresh) ctx.setLineDash([5 * dpr, 4 * dpr]);
     ctx.strokeStyle = color; ctx.fillStyle = 'rgba(99, 230, 190, 0.12)';
     ctx.lineWidth = 2 * dpr;
     polygon(model.body, true);
@@ -720,7 +722,9 @@ function drawCart(dpr) {
       ctx.lineTo(...handle[1]); ctx.stroke();
     }
     const degrees = Math.atan2(Math.sin(pose.yaw), Math.cos(pose.yaw)) * 180 / Math.PI;
-    drawArrow(pose, color, 22 * dpr, `小车地图航向 ${degrees.toFixed(1)}°（位置估计）`);
+    drawArrow(pose, color, 22 * dpr, fresh
+      ? `小车地图航向 ${degrees.toFixed(1)}°（位置估计）`
+      : `小车最后位置 · 观测已过期 ${Number(pose.age_s || 0).toFixed(1)} s`);
   }
   ctx.restore();
 }
@@ -786,7 +790,8 @@ function updateCartUi(loco) {
   lines.push(cart.pose_source === 'apriltag' ? '位姿方式：视觉 AprilTag · URDF 相机外参' : '位姿方式：固定抓握（无滑移假设）');
   if (high.history_required) lines.push(`策略观测 ${high.history_frames || 0}/${high.history_required}`);
   lines.push(camera.fresh && Number.isFinite(camera.yaw_rad)
-    ? `小车相对机身航向 ${(camera.yaw_rad * 180 / Math.PI).toFixed(1)}°（实测）` : '等待新鲜的小车航向');
+    ? `小车相对机身航向 ${(camera.yaw_rad * 180 / Math.PI).toFixed(1)}°（实测）` : camera.reason || '等待新鲜的小车航向');
+  if (status.cart_pose?.fresh === false) lines.push('地图灰色虚线小车为最后已知位置，当前观测已过期');
   if (cart.valid && cart.position) lines.push(`小车中心相对机身：${cart.position.slice(0, 2).map(v => v.toFixed(3)).join(', ')} m（${cart.position_source || '抓握几何估计'}）`);
   if (!cart.valid && cart.reason) lines.push(`位姿未就绪：${cart.reason}`);
   if (Number.isFinite(cart.rmse_px)) lines.push(`视觉重投影误差：${cart.rmse_px.toFixed(3)} px`);

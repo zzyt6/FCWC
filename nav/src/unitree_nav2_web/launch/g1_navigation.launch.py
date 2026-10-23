@@ -10,6 +10,22 @@ from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
+# CPU partition. Navigation (LiDAR, FAST-LIO, Nav2, Python filters, web UI) is
+# pinned to CPUs 0-3 at lower priority; run_executor.sh pins the body policy
+# and its 200 Hz C++ bridge to CPUs 6-7, and the executor runs the cart camera
+# on CPUs 4-5. Under Viser alone the camera detects at ~48 Hz; sharing all
+# cores with navigation cut it to ~26 Hz
+# and delayed every observation. Lowering priority/affinity needs no root.
+NAV_CPUS = os.environ.get("G1_NAV_CPUS", "0-3")
+NAV_NICE = os.environ.get("G1_NAV_NICE", "5")
+NAV_PREFIX = f"taskset -c {NAV_CPUS} nice -n {NAV_NICE}"
+# Tiny safety nodes on the navigation cores, without lowered priority.
+GATE_PREFIX = f"taskset -c {NAV_CPUS}"
+
+
+def nav_node(prefix=NAV_PREFIX, **kwargs):
+    return Node(prefix=prefix, **kwargs)
+
 
 def generate_launch_description():
     share = get_package_share_directory("unitree_nav2_web")
@@ -18,11 +34,9 @@ def generate_launch_description():
     cart_config = os.path.join(root, "config", "pushcart_navigation.json")
     with open(cart_config) as stream:
         cart_limits = json.load(stream)["task_limits"]
-    bt_xml = os.path.join(
-        get_package_share_directory("nav2_bt_navigator"),
-        "behavior_trees",
-        "navigate_w_replanning_and_recovery.xml",
-    )
+    # Foxy's stock replanning tree with server_timeout="1000" on every action
+    # node; the 10 ms default aborts goals whenever the planner is busy.
+    bt_xml = os.path.join(share, "behavior_trees", "walk_replanning.xml")
     footprint = "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
 
     map_yaml = LaunchConfiguration("map_yaml")
@@ -45,56 +59,68 @@ def generate_launch_description():
         " else '/utlidar/cloud_livox_mid360'"])
     imu_topic = PythonExpression([
         "'/livox/imu' if ", *direct_enabled, " else '/utlidar/imu_livox_mid360'"])
-    scan_time = ParameterValue(PythonExpression(["0.02 if ", *direct_enabled, " else 0.10"]), value_type=float)
+    # Direct MID-360 rate (10/20/50 Hz). 20 Hz keeps a 50 ms frame period for
+    # obstacles while FAST-LIO, the cloud filter and both scan converters do
+    # 60 % less per-frame work than at 50 Hz; Nav2 follows at 20 Hz anyway.
+    lidar_hz = LaunchConfiguration("direct_livox_hz")
+    scan_time = ParameterValue(PythonExpression(
+        ["1.0 / float('", lidar_hz, "') if ", *direct_enabled, " else 0.10"]), value_type=float)
 
     nav_nodes = [
-        Node(
+        nav_node(
             package="nav2_map_server",
             executable="map_server",
             name="map_server",
             output="screen",
             parameters=[nav2_params, {"yaml_filename": map_yaml}],
         ),
-        Node(
+        # The goal path (BT -> planner -> 20 Hz controller) keeps normal
+        # priority on the navigation cores; only heavy point-cloud, LIO and UI
+        # work is lowered. A starved planner cannot acknowledge the BT in time.
+        nav_node(
+            prefix=GATE_PREFIX,
             package="nav2_controller",
             executable="controller_server",
             name="controller_server",
             output="both",
             parameters=[nav2_params, {
-                "CartPush.min_vel_x": cart_limits[0][0], "CartPush.max_vel_x": cart_limits[0][1],
-                "CartPush.min_vel_y": cart_limits[1][0], "CartPush.max_vel_y": cart_limits[1][1],
+                # Pure pursuit only drives forward and turns: vx max and |wz|.
+                "CartPush.max_vel_x": cart_limits[0][1],
                 "CartPush.max_vel_theta": max(abs(v) for v in cart_limits[2]),
             }],
         ),
-        Node(
+        nav_node(
+            prefix=GATE_PREFIX,
             package="nav2_planner",
             executable="planner_server",
             name="planner_server",
             output="screen",
             parameters=[nav2_params],
         ),
-        Node(
+        nav_node(
             package="nav2_recoveries",
             executable="recoveries_server",
             name="recoveries_server",
             output="screen",
             parameters=[nav2_params],
         ),
-        Node(
+        nav_node(
+            prefix=GATE_PREFIX,
             package="nav2_bt_navigator",
             executable="bt_navigator",
             name="bt_navigator",
-            output="screen",
+            # Keep BT failures (send_goal timeouts, XML errors) in launch.log.
+            output="both",
             parameters=[nav2_params, {"default_bt_xml_filename": bt_xml}],
         ),
-        Node(
+        nav_node(
             package="nav2_waypoint_follower",
             executable="waypoint_follower",
             name="waypoint_follower",
             output="screen",
             parameters=[nav2_params],
         ),
-        Node(
+        nav_node(
             package="nav2_lifecycle_manager",
             executable="lifecycle_manager",
             name="lifecycle_manager_localization",
@@ -111,7 +137,7 @@ def generate_launch_description():
                 }
             ],
         ),
-        Node(
+        nav_node(
             package="nav2_lifecycle_manager",
             executable="lifecycle_manager",
             name="lifecycle_manager_navigation",
@@ -139,12 +165,19 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("http_port", default_value="8080"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
-            DeclareLaunchArgument("direct_livox", default_value="false",
-                                  description="Trial: directly acquire MID-360 at 50 Hz; restore Unitree lidar on exit"),
+            DeclareLaunchArgument("direct_livox", default_value="true",
+                                  description="Directly acquire MID-360 at direct_livox_hz; "
+                                              "restore Unitree lidar on exit. false = vendor 10 Hz"),
+            DeclareLaunchArgument("direct_livox_hz", default_value="20", choices=["10", "20", "50"],
+                                  description="Direct MID-360 frame rate (20 Hz: ~10000 points per frame)"),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(os.path.join(share, "launch", "livox_source.launch.py")),
                 condition=IfCondition(direct_livox),
-                launch_arguments={"lidar_interface": network_interface}.items()),
+                # FAST-LIO's 1-in-3 point decimation happens in the adapter, before the
+                # cart self-filter: 2026-10-21 that filter saturated cart_navigation
+                # (11-21 Hz tick, cart poses 0.2-0.4 s old; web "观测已过期").
+                launch_arguments={"lidar_interface": network_interface, "frequency": lidar_hz,
+                                  "point_stride": "3"}.items()),
             DeclareLaunchArgument(
                 "speed_settings_file",
                 default_value=os.path.join(root, "config", "navigation_speed.json"),
@@ -161,6 +194,7 @@ def generate_launch_description():
             # Unitree low-level bridge, so Viser must not run at the same time.
             DeclareLaunchArgument("start_locomotion", default_value="true"),
             DeclareLaunchArgument("locomotion_mode", default_value="control"),
+            DeclareLaunchArgument("locomotion_record", default_value="on", choices=["on", "off"]),
             DeclareLaunchArgument("locomotion_policy", default_value="auto"),
             DeclareLaunchArgument("heading_source", default_value="NAVIGATION"),
             # "config" keeps run_mode from nav/locomotion/motion_config.json;
@@ -168,7 +202,8 @@ def generate_launch_description():
             DeclareLaunchArgument("heading_mode", default_value="config"),
             DeclareLaunchArgument("locomotion_command_port", default_value="39002"),
             DeclareLaunchArgument("locomotion_status_port", default_value="39005"),
-            Node(
+            nav_node(
+                prefix=GATE_PREFIX,
                 package="unitree_g1_kinematics",
                 executable="g1_lowstate_udp_bridge",
                 name="g1_lowstate_udp_bridge",
@@ -189,6 +224,9 @@ def generate_launch_description():
                     "--command-port", command_port,
                     "--status-port", status_port,
                     "--cart-config", cart_config,
+                    # Per-tick task/student/camera telemetry, comparable with
+                    # Viser push sessions; stored under nav/log/sessions.
+                    "--recording", LaunchConfiguration("locomotion_record"),
                 ],
                 name="g1_locomotion_executor",
                 # Keep model-loading/bridge tracebacks after the terminal closes.
@@ -196,7 +234,7 @@ def generate_launch_description():
                 # The executor needs SIGINT for its own one-second damping stop.
                 sigterm_timeout="12",
             ),
-            Node(
+            nav_node(
                 package="unitree_g1_kinematics",
                 executable="g1_base_kinematics_node",
                 name="g1_base_kinematics",
@@ -213,11 +251,13 @@ def generate_launch_description():
                     }
                 ],
             ),
-            Node(
+            nav_node(
+                prefix=GATE_PREFIX,
                 package="unitree_g1_kinematics",
                 executable="g1_cmd_vel_udp_node",
                 name="g1_cmd_vel_udp",
-                output="screen",
+                # Gate open/close causes belong in launch.log.
+                output="both",
                 parameters=[
                     {
                         "cmd_vel_topic": "/cmd_vel",
@@ -231,37 +271,53 @@ def generate_launch_description():
                         "cart_max_vyaw": max(abs(v) for v in cart_limits[2]),
                         "command_timeout": 0.25,
                         # The web bridge renews motion authorization every
-                        # 0.5 s.  Losing its lease closes the UDP gate even if
-                        # Nav2 is still publishing commands.
-                        "motion_enable_timeout": 1.50,
+                        # 0.5 s. A stalled/closed web page must not stop the
+                        # body; it only revokes navigation velocity after 3 s.
+                        "motion_enable_timeout": 3.0,
+                        # Reference loss pauses velocity immediately and only
+                        # revokes the gate when it persists for 3 s.
+                        "reference_fresh_timeout": 0.5,
+                        "reference_fault_timeout": 3.0,
                     }
                 ],
             ),
-            Node(
+            nav_node(
+                # Every LiDAR frame passes this node before FAST-LIO, and every
+                # cart odometry after it. At nice 5 during a 2026-10-20 push its
+                # 50 Hz tick ran at 11-21 Hz and poses reached the controller
+                # ~0.35 s after measurement (35 ms with the cart detached).
+                prefix=GATE_PREFIX,
                 package="unitree_nav2_web",
                 executable="cart_navigation",
                 name="cart_navigation",
                 output="both",
                 parameters=[{"config_file": cart_config, "raw_cloud_topic": raw_lidar_topic}],
             ),
-            Node(
+            nav_node(
+                # Localization source for odometry, cart TF and AMCL: normal
+                # priority so it keeps up with every LiDAR frame.
+                prefix=GATE_PREFIX,
                 package="fast_lio",
                 executable="fastlio_mapping",
                 name="laser_mapping",
                 output="screen",
                 parameters=[fastlio_config, {"common.lid_topic": "/navigation/lidar",
                                              "common.imu_topic": imu_topic,
+                                             # The direct adapter already keeps 1 point in 3.
+                                             "point_filter_num": ParameterValue(PythonExpression(
+                                                 ["1 if ", *direct_enabled, " else 3"]), value_type=int),
                                              "preprocess.scan_rate": ParameterValue(PythonExpression(
-                                                 ["50 if ", *direct_enabled, " else 10"]), value_type=int)}],
+                                                 ["int(float('", lidar_hz, "')) if ", *direct_enabled, " else 10"]),
+                                                 value_type=int)}],
             ),
-            Node(
+            nav_node(
                 package="unitree_nav2_core",
                 executable="cloud_frame_transformer",
                 name="cloud_frame_transformer",
                 output="screen",
                 parameters=[{"target_frame": "base_nav"}],
             ),
-            Node(
+            nav_node(
                 package="unitree_nav2_core",
                 executable="cloud_obstacle_filter",
                 name="cloud_obstacle_filter",
@@ -281,7 +337,7 @@ def generate_launch_description():
                     }
                 ],
             ),
-            Node(
+            nav_node(
                 package="pointcloud_to_laserscan",
                 executable="pointcloud_to_laserscan_node",
                 name="pointcloud_to_laserscan",
@@ -305,7 +361,7 @@ def generate_launch_description():
                     }
                 ],
             ),
-            Node(
+            nav_node(
                 package="pointcloud_to_laserscan",
                 executable="pointcloud_to_laserscan_node",
                 name="pointcloud_to_localization_scan",
@@ -335,7 +391,7 @@ def generate_launch_description():
                 ],
             ),
             *nav_nodes,
-            Node(
+            nav_node(
                 package="rosbridge_server",
                 executable="rosbridge_websocket",
                 name="rosbridge_websocket",
@@ -348,7 +404,7 @@ def generate_launch_description():
                     }
                 ],
             ),
-            Node(
+            nav_node(
                 package="unitree_nav2_web",
                 executable="nav_web_bridge",
                 name="navigation_web_bridge",

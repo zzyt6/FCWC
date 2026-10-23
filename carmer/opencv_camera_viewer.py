@@ -79,6 +79,8 @@ class CameraReader:
         self.fps = 0.0
         self.frame_timestamp = None
         self.timestamp_basis = "v4l2_monotonic"
+        # Wall time of each cap.read() (USB wait + YUYV->BGR conversion), ms.
+        self.read_ms = deque(maxlen=FPS * 2)
         self.thread = threading.Thread(target=self._capture, daemon=True)
         self.thread.start()
 
@@ -87,7 +89,9 @@ class CameraReader:
             import cv2
 
             while not self.stop.is_set():
+                read_started = time.perf_counter()
                 ok, frame = self.cap.read()
+                read_ms = (time.perf_counter() - read_started) * 1000
                 now = time.monotonic()
                 if not ok or frame is None:
                     raise RuntimeError("Camera read failed; check USB connection and camera ownership.")
@@ -106,6 +110,7 @@ class CameraReader:
                     self.frame = frame
                     self.frame_timestamp = captured
                     self.count += 1
+                    self.read_ms.append(read_ms)
                     self.recent.append(now)
                     if len(self.recent) > 1:
                         self.fps = (len(self.recent) - 1) / (self.recent[-1] - self.recent[0])

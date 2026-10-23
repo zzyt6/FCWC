@@ -205,6 +205,23 @@ const server = http.createServer(async (req,res)=>{
   assert.ok((await cartPixel())[3]>0,'Cart body must be visible at its model position');
   state.cart_pose.yaw=Math.PI/2;await refresh();
   assert.equal((await cartPixel())[3],0,'Cart body must rotate with the measured map heading');
+  state.cart_pose={x:4,y:4,yaw:0,fresh:false,age_s:.8};
+  state.navigation_reference.ready=false;
+  state.locomotion.cart.valid=false;
+  state.locomotion.high_policy.camera={fresh:false,reason:'相机未识别到小车标签，请检查 ID 0/1 是否完整入镜'};
+  await refresh();
+  assert.ok((await cartPixel())[3]>0,'Expired observations must retain the last cart drawing');
+  assert.match(await page.$eval('#cartStatus',e=>e.textContent),/灰色虚线小车为最后已知位置/);
+  assert.match(await page.$eval('#cartStatus',e=>e.textContent),/完整入镜/);
+  const labels=await page.evaluate(()=>{
+    const labels=[],original=ctx.fillText;
+    ctx.fillText=function(text,...args){labels.push(text);return original.call(this,text,...args);};
+    try{drawCart(1);}finally{ctx.fillText=original;}
+    return labels;
+  });
+  assert.ok(labels.some(label=>label.includes('最后位置')&&label.includes('过期')));
+  state.locomotion.cart.valid=true;
+  state.locomotion.high_policy.camera={fresh:true,yaw_rad:.1};
   state.navigation_reference=savedReference;delete state.cart_pose;await refresh();
   await page.evaluate(()=>{visibility.footprint=true;});
   for(const layer of ['grid','map','global','local','scan','globalPath','localPath','robot','cart','footprint','radar']) {

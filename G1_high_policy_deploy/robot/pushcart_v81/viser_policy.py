@@ -3,6 +3,7 @@
 Viser owns Balance/Homie selection, executed history, gains and all motor I/O.
 This module loads the student and its paired Homie estimator/actor; no DDS or LCM.
 """
+from collections import deque
 import hashlib
 import json
 import math
@@ -46,6 +47,43 @@ class CartHeadingHold:
         self.err = error
         self.corr = max(-self.max_corr, min(self.max_corr, self.kp * error))
         return (vx, vy, max(-0.6, min(0.6, wz + self.corr)))
+
+
+class PelvisYawHistory:
+    """Pelvis IMU yaw by state receive time, to pair with a camera capture.
+
+    The camera measures cart yaw relative to the pelvis at its capture time,
+    40-60 ms before control and up to 0.3 s during a held frame. The pelvis
+    sways with every step (2026-10-21: up to ~2 rad/s), so adding the CURRENT
+    IMU yaw turned that sway into a false cart heading error of 0.05-0.24 rad
+    and saturated the heading correction. The cart itself turns slowly, so
+    the cart yaw at capture time is used as the cart yaw now.
+    """
+    def __init__(self, seconds=1.):
+        self.samples = deque(maxlen=max(2, int(seconds*50)+1))
+
+    def add(self, time_s, yaw):
+        if self.samples and time_s <= self.samples[-1][0]:
+            return
+        if self.samples:  # Unwrap so interpolation never crosses +-pi the long way.
+            yaw = self.samples[-1][1] + math.atan2(math.sin(yaw-self.samples[-1][1]),
+                                                   math.cos(yaw-self.samples[-1][1]))
+        self.samples.append((time_s, yaw))
+
+    def at(self, time_s):
+        """Yaw at time_s, clamped to the stored span; None without samples."""
+        if not self.samples or not math.isfinite(time_s):
+            return None
+        if time_s <= self.samples[0][0]:
+            yaw = self.samples[0][1]
+        elif time_s >= self.samples[-1][0]:
+            yaw = self.samples[-1][1]
+        else:
+            for (t0, y0), (t1, y1) in zip(self.samples, list(self.samples)[1:]):
+                if t0 <= time_s <= t1:
+                    yaw = y0 + (time_s-t0)/(t1-t0)*(y1-y0)
+                    break
+        return math.atan2(math.sin(yaw), math.cos(yaw))
 
 
 class StudentModel:
@@ -126,6 +164,7 @@ class ViserPushPolicy:
             velocity_frame='pelvis body frame, x/y/z', velocity_scale=cfg['obs_scales']['lin_vel'])
         self.core = V81Controller(cfg, self.model)
         self.hold = CartHeadingHold()
+        self.pelvis_yaw = PelvisYawHistory()
         self.camera = camera if camera is not None else CarmerYaw(
             cam['udp_port'], cam['timeout_s'], cam['yaw_offset_rad'], cam['tag_ids'])
         self.camera.allowed_ids = frozenset(cam['tag_ids'])
@@ -155,7 +194,8 @@ class ViserPushPolicy:
         self.metadata['telemetry'] = dict(
             raw_task_command='clipped cart vx/vy/wz before cart heading feedback and motion gating',
             task_command='cart vx/vy/wz after cart heading feedback, entering the task-reference filter; zero when motion is blocked',
-            heading_hold='ref/err in rad, corr in rad/s; imu_yaw_rad + camera.yaw_rad = cart_yaw_rad; '
+            heading_hold='ref/err in rad, corr in rad/s; imu_yaw_at_camera_rad (pelvis IMU yaw interpolated at '
+                         'the camera capture time; imu_yaw_rad is the current one) + camera.yaw_rad = cart_yaw_rad; '
                          'dt_s is actual monotonic control interval; reset on zero/stop',
             task_reference='filtered cart reference after this tick update; inference_inputs.previous_task_reference is before update',
             homie_command='high-level robot vx/vy/wz candidate before Viser zero interception and command filtering',
@@ -204,6 +244,7 @@ class ViserPushPolicy:
         self.cancel_zero_calibration('控制状态改变，标定已取消；保留原零位')
         self.enabled = False
         self.motion_blocked = blocked
+        self.camera_timeout = False
         self.reason = reason
         self.output = None
         self.inferred = False
@@ -232,6 +273,9 @@ class ViserPushPolicy:
         self.output = None
         self.upper_target_selected = False
         self.camera.poll(now)
+        if self.camera_timeout and self.motion_blocked:
+            self.reason = ('相机航向已恢复；推车仍暂停，请归零后重新启用' if self.camera.fresh(now)
+                           else self.camera.snapshot(now)['reason'] + '；推车已暂停，站立策略继续')
 
     def history_ready(self, now):
         return (not self.warm_error and self.history_frames >= self.core.lh and self.camera.fresh(now)
@@ -407,7 +451,8 @@ class ViserPushPolicy:
 
     def command(self, state, task, previous_action, now, *, moving, dt, previous_state=None):
         if not self.camera.fresh(now):
-            self.reset('carmer 航向超时；已退出高层，请归零后重新启用', blocked=True)
+            self.reset(self.camera.snapshot(now)['reason'] + '；推车已暂停，站立策略继续', blocked=True)
+            self.camera_timeout = True
             return np.zeros(3), True
         self._predict(state, task, previous_action, now, moving=moving, dt=dt, previous_state=previous_state)
         return self.output.cmd_homie.copy() if moving else np.zeros(3), False
@@ -439,9 +484,14 @@ class ViserPushPolicy:
         # Same normalized SDK wxyz yaw as Viser heading.imu_yaw_rad. Camera yaw
         # is calibrated and held between frames; command() checks its timeout.
         imu_yaw = math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
-        command = np.asarray(self.hold(command, imu_yaw, self.camera.yaw, dt))
-        self.heading_hold = dict(ref=self.hold.ref, err=self.hold.err, corr=self.hold.corr,
-                                 dt_s=dt, imu_yaw_rad=imu_yaw, cart_yaw_rad=imu_yaw + self.camera.yaw)
+        self.pelvis_yaw.add(state.received_ns*1e-9, imu_yaw)
+        # Cart yaw = pelvis yaw + relative yaw, both at the camera capture time.
+        captured_yaw = self.pelvis_yaw.at(self.camera.stamp)
+        hold_yaw = imu_yaw if captured_yaw is None else captured_yaw
+        command = np.asarray(self.hold(command, hold_yaw, self.camera.yaw, dt))
+        self.heading_hold = dict(ref=self.hold.ref, err=self.hold.err, corr=self.hold.corr, kp=self.hold.kp,
+                                 dt_s=dt, imu_yaw_rad=imu_yaw, imu_yaw_at_camera_rad=hold_yaw,
+                                 cart_yaw_rad=hold_yaw + self.camera.yaw)
         inputs = dict(input_state_tick=(state.session, state.sequence),
                       input_state_received_ns=state.received_ns,
                       camera_captured_monotonic=self.camera.stamp, camera_yaw_rad=self.camera.yaw,

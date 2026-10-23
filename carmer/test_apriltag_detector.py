@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from carmer.apriltag_detector import (
-    AdaptivePoseSmoother, DetectionWorker, TagPoseEstimator, annotate, detect_tags,
+    AdaptivePoseSmoother, DetectionWorker, TagPoseEstimator, TagWindow, annotate, detect_tags,
     load_intrinsics, make_detector, rotation_to_rpy, save_result,
 )
 from carmer.cart_heading import CartHeadingEstimator, R_CAMERA_TO_TORSO
@@ -57,6 +57,73 @@ class AprilTagDetectionTest(unittest.TestCase):
         other_dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_16h5)
         image[160:320, 240:400] = cv2.aruco.generateImageMarker(other_dictionary, 7, 160)
         self.assertEqual(detect_tags(self.detector, image), [])
+
+    def cart_frame(self, positions, seed=0):
+        """Textured background so the full-image search has real candidates to reject."""
+        image = np.random.default_rng(seed).integers(60, 200, (480, 640)).astype(np.uint8)
+        image = cv2.GaussianBlur(image, (0, 0), 3)
+        for tag_id, (x, y) in positions.items():
+            image[y - 8:y + 112, x - 8:x + 112] = 255
+            image[y:y + 104, x:x + 104] = self.marker(tag_id, 104)
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    def test_tag_window_matches_full_search(self):
+        window = TagWindow({0, 1})
+        moves = ({0: (60, 200), 1: (300, 180)}, {0: (66, 204), 1: (305, 176)}, {0: (71, 199), 1: (311, 183)})
+        for step, positions in enumerate(moves):
+            frame = self.cart_frame(positions, step)
+            full = detect_tags(self.detector, frame)
+            region = window.region(frame.shape)
+            self.assertEqual(region is None, step == 0)
+            tags = detect_tags(self.detector, frame, region=region)
+            self.assertTrue(window.covers(tags))
+            window.update(tags)
+            self.assertEqual([tag['id'] for tag in tags], [0, 1])
+            if region is not None:
+                self.assertTrue(all(value % TagWindow.ALIGN == 0 or value in (480, 640) for value in region))
+                self.assertLess((region[2] - region[0]) * (region[3] - region[1]), 640 * 480 * .6)
+            for windowed, reference in zip(tags, full):
+                np.testing.assert_allclose(windowed['corners_px'], reference['corners_px'], atol=1e-4)
+
+    def test_tag_window_falls_back_to_full_frame_without_losing_tags(self):
+        class Reader:
+            def __init__(self, frames):
+                self.frames = frames
+
+            def latest(self, previous, *, with_timestamp=False):
+                if previous < len(self.frames):
+                    return previous + 1, self.frames[previous], 60., previous / 60.
+                return None
+
+            def close(self):
+                pass
+
+        # Tag 1 jumps outside the window, then tag 0 disappears altogether.
+        frames = [self.cart_frame({0: (60, 200), 1: (300, 180)}), self.cart_frame({0: (60, 200), 1: (300, 180)}),
+                  self.cart_frame({0: (60, 200), 1: (500, 340)}), self.cart_frame({1: (500, 340)})]
+        class Recorder:  # Sees every processed packet; latest() may skip ahead.
+            def __init__(self):
+                self.seen = []
+
+            def submit(self, packet):
+                self.seen.append(([tag['id'] for tag in packet['tags']], packet['detection_search']))
+
+        recorder = Recorder()
+        estimator = CartHeadingEstimator(cart_tag_ids=[0, 1])
+        # Navigation runs the camera with --profile: a fallback frame must keep the
+        # same stage keys, or the periodic profile report raises and stops the camera.
+        worker = DetectionWorker(Reader(frames), self.detector, cart_heading_estimator=estimator,
+                                 missing_tag_frames=recorder, tag_window=True, profile=True)
+        worker.thread.join(timeout=5.)
+        worker.close()
+        seen = recorder.seen
+        self.assertEqual(len({tuple(sample) for sample in worker.profile_samples}), 1)
+        self.assertIn('read_wait=', worker.profile_report())
+        self.assertEqual(seen, [([0, 1], 'full'), ([0, 1], 'window'), ([0, 1], 'window_fallback'),
+                                ([1], 'window_fallback')])
+        self.assertEqual(worker.search_counts, dict(full=1, window=1, window_fallback=2))
+        # Without a cart ID set there is nothing to track: every frame is searched in full.
+        self.assertIsNone(DetectionWorker(Reader([]), self.detector, tag_window=True).tag_window)
 
     def test_annotation_and_saved_results_keep_raw_frame(self):
         gray = np.full((480, 640), 255, np.uint8)

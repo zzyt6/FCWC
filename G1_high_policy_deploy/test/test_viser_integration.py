@@ -70,6 +70,34 @@ class CameraTests(unittest.TestCase):
         result.pop('pelvis_compensation')
         self.assertFalse(heading_packet(result)['valid'])
 
+    def test_camera_reports_tag_loss_late_frames_and_stream_timeout_separately(self):
+        self.camera.accept(json.dumps(heading_packet(camera_result(10.))), 10.)
+        missing = camera_result(10.29, valid=False)
+        missing['raw_fused_cart_heading']['reason'] = 'no_tags_detected'
+        self.camera.accept(json.dumps(heading_packet(missing)), 10.29)
+        status = self.camera.snapshot(10.30)
+        self.assertFalse(status['fresh'])
+        self.assertEqual(status['status'], 'no_heading')
+        self.assertIn('完整入镜', status['reason'])
+        late = camera_result(10.4)
+        late.update(processing_ms=320., capture_fps=60., detect_fps=5.)
+        self.assertFalse(self.camera.accept(json.dumps(heading_packet(late)), 10.8))
+        status = self.camera.snapshot(10.81)
+        self.assertEqual(status['status'], 'late_frame')
+        self.assertFalse(status['fresh'])
+        self.assertEqual(status['timing']['processing_ms'], 320.)
+        self.assertAlmostEqual(self.camera.stamp, 9.96)
+        self.assertEqual(self.camera.snapshot(11.2)['status'], 'frame_timeout')
+        self.camera.accept(json.dumps(heading_packet(camera_result(11.3))), 11.3)
+        self.assertEqual(self.camera.snapshot(11.3)['status'], 'tracking')
+
+    def test_attitude_failure_keeps_its_reason_in_camera_packet(self):
+        result = camera_result(10.)
+        result['pelvis_compensation'] = dict(valid=False, reason='state_alignment_timeout')
+        packet = heading_packet(result)
+        self.assertFalse(packet['valid'])
+        self.assertEqual(packet['reason'], 'state_alignment_timeout')
+
     def test_policy_receives_current_compensated_yaw_without_display_filter_lag(self):
         result = camera_result(10., -.3)
         # The display still points the other way while its low-pass catches up.
@@ -279,9 +307,12 @@ class IntegrationTests(unittest.TestCase):
             np.testing.assert_allclose(high['inference_inputs']['upper_torque_pd_estimate'], .2)
             self.assertAlmostEqual(high['torque_sample_age_ms'], 5.)
             np.testing.assert_allclose(high['raw_task_command'], [.3, 0., 0.], atol=1e-7)
-            np.testing.assert_allclose(high['task_command'], [.3, 0., -.05], atol=1e-7)
-            self.assertAlmostEqual(high['heading_hold']['err'], -.05)
-            self.assertAlmostEqual(high['heading_hold']['corr'], -.05)
+            # The pelvis turned to 0.05 only at this tick, after the 40 ms old
+            # camera frame: pelvis motion newer than the frame is not cart drift.
+            self.assertAlmostEqual(high['heading_hold']['imu_yaw_at_camera_rad'], 0.)
+            np.testing.assert_allclose(high['task_command'], [.3, 0., 0.], atol=1e-7)
+            self.assertAlmostEqual(high['heading_hold']['err'], 0.)
+            self.assertAlmostEqual(high['heading_hold']['corr'], 0.)
             np.testing.assert_allclose(high['homie_command'], moving['input_velocity'])
             np.testing.assert_allclose(high['homie_command'], moving['filtered_velocity'])
             np.testing.assert_allclose(high['homie_command'], moving['velocity'])
@@ -779,11 +810,15 @@ class IntegrationTests(unittest.TestCase):
             high = data['high_policy']
             hold = high['heading_hold']
             self.assertAlmostEqual(hold['imu_yaw_rad'], data['heading']['imu_yaw_rad'])
-            self.assertAlmostEqual(hold['cart_yaw_rad'], yaw + high['camera']['yaw_rad'])
-            self.assertAlmostEqual(hold['err'], -yaw)
-            self.assertAlmostEqual(hold['corr'], -yaw)
+            # Cart yaw pairs the camera yaw with the pelvis yaw at its capture
+            # time (40 ms latency here), not the newer current pelvis yaw.
+            captured = hold['imu_yaw_at_camera_rad']
+            self.assertTrue(yaw - .0041 <= captured <= yaw + 1e-9, (yaw, captured))
+            self.assertAlmostEqual(hold['cart_yaw_rad'], captured + high['camera']['yaw_rad'])
+            self.assertAlmostEqual(hold['err'], -captured)
+            self.assertAlmostEqual(hold['corr'], -captured)
             np.testing.assert_allclose(high['raw_task_command'], [.3, 0., 0.], atol=1e-7)
-            np.testing.assert_allclose(high['task_command'], [.3, 0., -yaw], atol=1e-7)
+            np.testing.assert_allclose(high['task_command'], [.3, 0., -captured], atol=1e-7)
             old_ref = high['inference_inputs']['previous_task_reference']
             np.testing.assert_allclose(high['task_reference'],
                                        old_ref + self.high.core.ref_alpha * (high['task_command'] - old_ref))
@@ -824,7 +859,9 @@ class IntegrationTests(unittest.TestCase):
             self.bridge.state.quaternion = np.array([np.cos(yaw/2), 0., 0., np.sin(yaw/2)])
             data = self.event('move', [.3, 0., 0.])
             self.assertTrue(data['high_policy']['camera']['fresh'])
-            self.assertAlmostEqual(data['high_policy']['heading_hold']['corr'], -yaw)
+            # The held frame keeps its capture time: the pelvis turning after it
+            # (gait sway) is not cart drift and must not create a correction.
+            self.assertAlmostEqual(data['high_policy']['heading_hold']['corr'], 0.)
         for _ in range(20):
             data = self.tick()
         self.assertTrue(data['high_policy']['motion_blocked'])
@@ -895,6 +932,10 @@ class IntegrationTests(unittest.TestCase):
         data = self.move(40)
         np.testing.assert_array_equal(data['velocity'], 0)
         self.assertTrue(self.high.motion_blocked)
+        self.assertIn('航向已恢复', data['high_policy']['reason'])
+        self.assertNotIn('超时', data['high_policy']['reason'])
+        self.assertEqual(data['stage'], 'POLICY')
+        self.assertIn('航向已恢复', data['reason'])
         self.event('zero')
         self.enable()
         self.assertFalse(self.high.motion_blocked)

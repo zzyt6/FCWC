@@ -1,4 +1,5 @@
 #include "unitree_nav2_core/navigation_speed.hpp"
+#include "unitree_nav2_core/navigation_profile.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,55 +11,17 @@
 
 #include "nav2_util/node_utils.hpp"
 #include "nav2_core/exceptions.hpp"
-#include "dwb_core/exceptions.hpp"
 #include "nav_2d_utils/tf_help.hpp"
 #include "pluginlib/class_list_macros.hpp"
 
 namespace unitree_nav2_core
 {
-namespace
-{
-void declareProfile(const nav2_util::LifecycleNode::SharedPtr & node, const std::string & ns)
-{
-  nav2_util::declare_parameter_if_not_declared(
-    node, ns + ".navigation_speed_mode", rclcpp::ParameterValue(std::string("auto")));
-  nav2_util::declare_parameter_if_not_declared(
-    node, ns + ".navigation_speed", rclcpp::ParameterValue(0.35));
-}
-
-rcl_interfaces::msg::SetParametersResult validateProfile(
-  const std::vector<rclcpp::Parameter> & parameters, const std::string & ns)
-{
-  rcl_interfaces::msg::SetParametersResult result;
-  result.successful = true;
-  for (const auto & parameter : parameters) {
-    if (parameter.get_name() == ns + ".navigation_speed") {
-      if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE ||
-        !std::isfinite(parameter.as_double()) || parameter.as_double() < 0.20 ||
-        parameter.as_double() > 0.60)
-      {
-        result.successful = false;
-        result.reason = "Navigation speed must be between 0.20 and 0.60 m/s";
-      }
-    } else if (parameter.get_name() == ns + ".navigation_speed_mode") {
-      if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_STRING ||
-        (parameter.as_string() != "auto" && parameter.as_string() != "fixed"))
-      {
-        result.successful = false;
-        result.reason = "Navigation speed mode must be auto or fixed";
-      }
-    }
-  }
-  return result;
-}
-}  // namespace
-
 void SpeedLimitedGenerator::initialize(
   const nav2_util::LifecycleNode::SharedPtr & node, const std::string & plugin_name)
 {
   StandardTrajectoryGenerator::initialize(node, plugin_name);
   node_ = node;
-  declareProfile(node, plugin_name);
+  declareNavigationProfile(node, plugin_name);
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".approach_distance", rclcpp::ParameterValue(0.6));
   nav2_util::declare_parameter_if_not_declared(
@@ -74,12 +37,12 @@ void SpeedLimitedGenerator::initialize(
   {
     throw std::invalid_argument("Invalid goal approach distance, speed or tolerance");
   }
-  auto initial = validateProfile(node->get_parameters({
+  auto initial = validateNavigationProfile(node->get_parameters({
     plugin_name + ".navigation_speed", plugin_name + ".navigation_speed_mode"}), plugin_name);
   if (!initial.successful) {throw std::invalid_argument(initial.reason);}
   parameter_callback_ = node->add_on_set_parameters_callback(
     [plugin_name](const std::vector<rclcpp::Parameter> & parameters) {
-      return validateProfile(parameters, plugin_name);
+      return validateNavigationProfile(parameters, plugin_name);
     });
 }
 
@@ -248,51 +211,7 @@ nav_2d_msgs::msg::Twist2D SpeedLimitedGenerator::nextTwist()
   return candidates_.at(index_++);
 }
 
-void CommandChangeCritic::onInit()
-{
-  lateral_limit_ = nh_->get_parameter(dwb_plugin_name_ + ".max_vel_y").as_double();
-  angular_limit_ = nh_->get_parameter(dwb_plugin_name_ + ".max_vel_theta").as_double();
-  if (lateral_limit_ <= 0. || angular_limit_ <= 0.) {
-    throw std::invalid_argument("CommandChange requires positive lateral and angular limits");
-  }
-}
-
-bool CommandChangeCritic::prepare(const geometry_msgs::msg::Pose2D &,
-  const nav_2d_msgs::msg::Twist2D &, const geometry_msgs::msg::Pose2D &,
-  const nav_2d_msgs::msg::Path2D &)
-{
-  active_ = std::chrono::duration<double>(
-    std::chrono::steady_clock::now() - selected_at_).count() <= 0.3;
-  return true;
-}
-
-double CommandChangeCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory)
-{
-  if (!active_) {return 0.;}
-  const double lateral = (trajectory.velocity.y - previous_.y) / lateral_limit_;
-  const double angular = (trajectory.velocity.theta - previous_.theta) / angular_limit_;
-  return lateral*lateral + angular*angular;
-}
-
-void CommandChangeCritic::debrief(const nav_2d_msgs::msg::Twist2D & command)
-{
-  const auto now = std::chrono::steady_clock::now();
-  const double dt = std::chrono::duration<double>(now - selected_at_).count();
-  // Score against recent command history, not just the immediately preceding
-  // 20 ms tick: alternating corrections can otherwise walk through zero in
-  // several individually cheap steps. This changes scoring only, never the
-  // selected and collision-checked command sent to the policy.
-  if (dt > 0.3) {
-    previous_ = command;
-  } else {
-    const double alpha = 1. - std::exp(-std::max(0., dt) / 0.3);
-    previous_.y += alpha * (command.y - previous_.y);
-    previous_.theta += alpha * (command.theta - previous_.theta);
-  }
-  selected_at_ = now;
-}
-
-void CruiseSpeedCritic::onInit() {declareProfile(nh_, dwb_plugin_name_);}
+void CruiseSpeedCritic::onInit() {declareNavigationProfile(nh_, dwb_plugin_name_);}
 
 bool CruiseSpeedCritic::prepare(
   const geometry_msgs::msg::Pose2D & pose, const nav_2d_msgs::msg::Twist2D &,
@@ -315,138 +234,8 @@ double CruiseSpeedCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & tr
          std::hypot(trajectory.velocity.x, trajectory.velocity.y) / speed_);
 }
 
-void NavigationSpeedLimitCritic::onInit()
-{
-  declareProfile(nh_, dwb_plugin_name_);
-  for (const auto & item : std::vector<std::pair<std::string, double>>{
-      {"approach_distance", 0.8}, {"approach_speed", 0.1}, {"xy_goal_tolerance", 0.15}})
-  {
-    nav2_util::declare_parameter_if_not_declared(
-      nh_, dwb_plugin_name_ + "." + item.first, rclcpp::ParameterValue(item.second));
-  }
-  approach_distance_ = nh_->get_parameter(dwb_plugin_name_ + ".approach_distance").as_double();
-  approach_speed_ = nh_->get_parameter(dwb_plugin_name_ + ".approach_speed").as_double();
-  goal_tolerance_ = nh_->get_parameter(dwb_plugin_name_ + ".xy_goal_tolerance").as_double();
-  if (!std::isfinite(approach_distance_) || !std::isfinite(approach_speed_) ||
-    !std::isfinite(goal_tolerance_) || goal_tolerance_ <= 0. ||
-    approach_distance_ <= goal_tolerance_ || approach_speed_ <= 0.05 || approach_speed_ > 0.2)
-  {
-    throw std::invalid_argument("Invalid goal approach distance, speed or tolerance");
-  }
-  const auto initial = validateProfile(nh_->get_parameters({
-    dwb_plugin_name_ + ".navigation_speed", dwb_plugin_name_ + ".navigation_speed_mode"}),
-    dwb_plugin_name_);
-  if (!initial.successful) {throw std::invalid_argument(initial.reason);}
-  parameter_callback_ = nh_->add_on_set_parameters_callback(
-    [ns = dwb_plugin_name_](const std::vector<rclcpp::Parameter> & parameters) {
-      return validateProfile(parameters, ns);
-    });
-}
-
-bool NavigationSpeedLimitCritic::prepare(
-  const geometry_msgs::msg::Pose2D & pose, const nav_2d_msgs::msg::Twist2D &,
-  const geometry_msgs::msg::Pose2D & goal, const nav_2d_msgs::msg::Path2D &)
-{
-  const double requested = nh_->get_parameter(dwb_plugin_name_ + ".navigation_speed").as_double();
-  const double distance = std::hypot(goal.x-pose.x, goal.y-pose.y);
-  const double fraction = std::clamp(
-    (distance-goal_tolerance_) / (approach_distance_-goal_tolerance_), 0., 1.);
-  speed_limit_ = approach_speed_ + fraction*(requested-approach_speed_);
-  return true;
-}
-
-double NavigationSpeedLimitCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory)
-{
-  // Foxy's stock iterator can emit both exact zero and +/-2.8e-17 for the
-  // same axis. OscillationCritic treats the latter as a direction reversal.
-  // Reject those numerical duplicates; retain the stock exact-zero sample
-  // and its full braking rollout without rewriting the selected velocity.
-  for (const double axis : {trajectory.velocity.x, trajectory.velocity.y,
-      trajectory.velocity.theta})
-  {
-    if (axis != 0. && std::abs(axis) < 1e-7) {
-      throw dwb_core::IllegalTrajectoryException(name_, "Numerical zero velocity sample");
-    }
-  }
-  if (std::hypot(trajectory.velocity.x, trajectory.velocity.y) > speed_limit_ + 1e-9) {
-    throw dwb_core::IllegalTrajectoryException(name_, "Requested navigation speed limit");
-  }
-  return 0.;
-}
-
-void CartLookaheadCritic::onInit()
-{
-  const auto prefix = dwb_plugin_name_ + "." + name_ + ".";
-  for (const auto & item : std::vector<std::pair<std::string, double>>{
-      {"lookahead_base", 0.4}, {"lookahead_gain", 0.6}, {"lookahead_max", 1.0}, {"heading_weight", 0.4}})
-  {
-    nav2_util::declare_parameter_if_not_declared(nh_, prefix + item.first, rclcpp::ParameterValue(item.second));
-  }
-  base_ = nh_->get_parameter(prefix + "lookahead_base").as_double();
-  gain_ = nh_->get_parameter(prefix + "lookahead_gain").as_double();
-  maximum_ = nh_->get_parameter(prefix + "lookahead_max").as_double();
-  heading_weight_ = nh_->get_parameter(prefix + "heading_weight").as_double();
-  if (!(base_ > 0 && gain_ >= 0 && maximum_ >= base_ && heading_weight_ >= 0)) {
-    throw std::runtime_error("Invalid cart lookahead parameters");
-  }
-}
-
-bool CartLookaheadCritic::prepare(
-  const geometry_msgs::msg::Pose2D & pose, const nav_2d_msgs::msg::Twist2D & velocity,
-  const geometry_msgs::msg::Pose2D & goal, const nav_2d_msgs::msg::Path2D & plan)
-{
-  if (plan.poses.empty()) {return false;}
-  size_t nearest = 0;
-  double along_segment = 0.0;
-  double best = std::numeric_limits<double>::infinity();
-  // Project onto the polyline instead of snapping to its nearest vertex.
-  // Otherwise the lookahead jumps by one waypoint spacing at every midpoint.
-  for (size_t i = 0; i+1 < plan.poses.size(); ++i) {
-    const auto & a = plan.poses[i];
-    const auto & b = plan.poses[i+1];
-    const double dx = b.x-a.x, dy = b.y-a.y;
-    const double length_squared = dx*dx+dy*dy;
-    if (length_squared <= 1e-12) {continue;}
-    const double fraction = std::clamp(
-      ((pose.x-a.x)*dx+(pose.y-a.y)*dy)/length_squared, 0.0, 1.0);
-    const double distance = std::hypot(a.x+fraction*dx-pose.x, a.y+fraction*dy-pose.y);
-    if (distance < best) {
-      best = distance;
-      nearest = i;
-      along_segment = fraction*std::sqrt(length_squared);
-    }
-  }
-  double remaining = along_segment+
-    std::min(maximum_, base_+gain_*std::hypot(velocity.x, velocity.y));
-  target_ = plan.poses.back();
-  for (size_t i = nearest; i+1 < plan.poses.size(); ++i) {
-    const auto & a = plan.poses[i];
-    const auto & b = plan.poses[i+1];
-    const double length = std::hypot(b.x-a.x, b.y-a.y);
-    if (length > 1e-6 && length >= remaining) {
-      target_.x = a.x+(b.x-a.x)*remaining/length;
-      target_.y = a.y+(b.y-a.y)*remaining/length;
-      target_.theta = std::atan2(b.y-a.y, b.x-a.x);
-      return true;
-    }
-    remaining -= length;
-  }
-  target_.theta = goal.theta;
-  return true;
-}
-
-double CartLookaheadCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory)
-{
-  if (trajectory.poses.empty()) {return 0.;}
-  const auto & end = trajectory.poses.back();
-  const double angle = std::atan2(std::sin(end.theta-target_.theta), std::cos(end.theta-target_.theta));
-  return std::hypot(end.x-target_.x, end.y-target_.y)+heading_weight_*std::abs(angle);
-}
 }  // namespace unitree_nav2_core
 
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::SpeedLimitedGenerator, dwb_core::TrajectoryGenerator)
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::CruiseSpeedCritic, dwb_core::TrajectoryCritic)
-PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::NavigationSpeedLimitCritic, dwb_core::TrajectoryCritic)
 PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::ApproachDWBLocalPlanner, nav2_core::Controller)
-PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::CartLookaheadCritic, dwb_core::TrajectoryCritic)
-PLUGINLIB_EXPORT_CLASS(unitree_nav2_core::CommandChangeCritic, dwb_core::TrajectoryCritic)

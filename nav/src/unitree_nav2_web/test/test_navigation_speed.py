@@ -45,8 +45,7 @@ def test_profile_changes_only_after_ack_and_survives_restart(tmp_path):
     assert settings.snapshot()["mode"] == "auto"
     assert not path.exists()
     applied = {p.name: p.value for p in client.requests[-1].parameters}
-    assert len(applied) == 5
-    assert applied["CartPush.max_speed_xy"].double_value == .6
+    assert len(applied) == 4
     assert applied["CartPush.navigation_speed"].double_value == .6
     client.complete()
     assert settings.snapshot()["mode"] == "fixed"

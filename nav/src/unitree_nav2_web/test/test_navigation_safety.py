@@ -31,6 +31,7 @@ from unitree_nav2_web.locomotion import (
 from unitree_nav2_web.nav_web_bridge import (
     LOCOMOTION_READY_GRACE_S,
     REFERENCE_READY_GRACE_S,
+    TRANSIENT_PAUSE_LIMIT_S,
     NavigationWebBridge,
 )
 
@@ -190,7 +191,7 @@ class _Harness:
         self.faults.append(reason)
 
 
-def test_cart_overlay_uses_matched_tf_instead_of_stale_amcl_and_live_geometry():
+def test_cart_overlay_uses_matched_tf_and_labels_last_position_on_observation_loss(monkeypatch):
     import math
     from geometry_msgs.msg import TransformStamped
     from rclpy.time import Time
@@ -198,6 +199,7 @@ def test_cart_overlay_uses_matched_tf_instead_of_stale_amcl_and_live_geometry():
 
     buffer = Buffer()
     now = [100.15]
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0])
     bridge = SimpleNamespace(
         # This cached AMCL pose deliberately disagrees with current TF.
         current_pose=dict(x=-99., y=99., yaw=2.), tf_buffer=buffer,
@@ -224,8 +226,22 @@ def test_cart_overlay_uses_matched_tf_instead_of_stale_amcl_and_live_geometry():
     assert pose['y'] == pytest.approx(expected.transform.translation.y)
     assert pose['yaw'] == pytest.approx(1.)  # map .7 + pelvis .4 + cart -.1
     assert pose['position_source'] == 'grasp'
+    assert pose['fresh']
     now[0] = 100.7
-    assert NavigationWebBridge._cart_map_pose(bridge, cart) is None  # Stale TF cannot draw a live cart.
+    stale = NavigationWebBridge._cart_map_pose(bridge, cart)
+    assert not stale['fresh'] and stale['age_s'] == pytest.approx(.6)
+    assert (stale['x'], stale['y'], stale['yaw']) == (pose['x'], pose['y'], pose['yaw'])
+    lost = NavigationWebBridge._cart_map_pose(bridge, dict(cart, valid=False, reason='标签未入镜'))
+    assert not lost['fresh'] and lost['reason'] == '标签未入镜'
+    now[0] = 100.8
+    buffer.set_transform(transform('base_nav', 'cart_nav', 100.8, 1., -.1, -.1), 'test')
+    buffer.set_transform(transform('odom', 'base_nav', 100.8, 1.2, 2., .4), 'test')
+    assert NavigationWebBridge._cart_map_pose(bridge, cart)['fresh']
+    assert NavigationWebBridge._cart_map_pose(bridge, dict(cart, attached=False)) is None
+    assert NavigationWebBridge._cart_map_pose(bridge, dict(cart, valid=False)) is None
+    assert NavigationWebBridge._cart_map_pose(bridge, cart)['fresh']
+    bridge.selected_map = 'different map'
+    assert NavigationWebBridge._cart_map_pose(bridge, dict(cart, valid=False)) is None
 
 
 def test_locomotion_actions_follow_viser_lifecycle():
@@ -395,6 +411,34 @@ def test_invalid_localization_closes_gate_without_damping(invalid):
     assert harness.locomotion.requests == []
     assert harness.last_pose_time == original_time
     assert harness.pose_sequence == 0
+
+
+@pytest.mark.parametrize("rate,fault", [(2.3, False), (3.5, True)])
+def test_pelvis_gait_sway_is_not_an_amcl_rate_fault(rate, fault):
+    """base_nav sways with each step (2026-10-21: up to 2.32 rad/s between scans)."""
+    harness = _Harness()
+    faults = []
+    harness._handle_localization_fault = lambda reason: faults.append(reason)
+    harness.pose_sequence = harness.navigation_pose_sequence_start = 0
+    harness.last_localization_sample = harness.initial_pose_request = None
+    harness.bad_localization_updates = 0
+    harness.pose_history = []
+    harness._map_match_for_pose = lambda *args: {"good": True}
+    harness.localized = True
+    harness.localization_refinement_active = False
+    wall, monotonic = time.time(), time.monotonic()
+    harness.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(
+        nanoseconds=int((wall+time.monotonic()-monotonic)*1e9)))
+    now = harness.get_clock().now().nanoseconds*1e-9
+    for index in range(5):
+        message = PoseWithCovarianceStamped()
+        stamp = now - .5 + .1*index
+        message.header.stamp.sec, message.header.stamp.nanosec = int(stamp), int(stamp % 1*1e9)
+        yaw = rate*.05*(-1)**index  # left/right sway: rate*0.1 rad per 0.1 s, below the 0.6 rad jump
+        message.pose.pose.orientation.w, message.pose.pose.orientation.z = math.cos(yaw/2), math.sin(yaw/2)
+        message.pose.covariance[0] = message.pose.covariance[7] = message.pose.covariance[35] = .01
+        NavigationWebBridge._localization_callback(harness, message)
+    assert bool(faults) == fault, faults
 
 
 @pytest.mark.parametrize("invalid", ["position", "quaternion", "linear", "angular"])
@@ -713,10 +757,31 @@ def test_nav2_parameters_keep_acceleration_bounds_and_allow_web_speed_range():
     assert follow["max_vel_x"] == 0.60 and follow["max_vel_y"] <= 0.20
     assert follow["max_speed_xy"] == 0.60
     assert follow["max_vel_theta"] <= 0.50
-    assert controller["goal_checker"]["xy_goal_tolerance"] == follow["xy_goal_tolerance"] == 0.15
-    assert controller["goal_checker"]["yaw_goal_tolerance"] == pytest.approx(0.17453292519943295)
+    # Operator choice 2026-10-23: stop within 0.25 m / 20 deg (one Foxy goal checker).
+    assert controller["goal_checker"]["xy_goal_tolerance"] == follow["xy_goal_tolerance"] == 0.25
+    assert controller["goal_checker"]["yaw_goal_tolerance"] == pytest.approx(math.radians(20.))
     assert follow["primary_controller"] == "unitree_nav2_core::ApproachDWBLocalPlanner"
     assert follow["approach_distance"] == 0.6 and follow["approach_speed"] == 0.1
+    cart = controller["CartPush"]
+    # The cart tracks the global path with pure pursuit; DWB is walking-only.
+    assert cart["plugin"] == "unitree_nav2_core::CartPurePursuitController"
+    assert not any(key.endswith((".scale", "_samples")) for key in cart)
+    assert cart["xy_goal_tolerance"] == controller["goal_checker"]["xy_goal_tolerance"]
+    assert 0 < cart["goal_dist_tol"] <= cart["xy_goal_tolerance"]
+    assert cart["approach_distance"] == 0.8 and cart["approach_speed"] == 0.1
+    assert cart["closed_loop"] is False
+    assert cart["max_linear_accel"] <= 0.3 and cart["max_angular_accel"] <= 0.6
+    assert cart["rotate_to_heading_angular_vel"] <= cart["max_vel_theta"]
+    inflation = params["local_costmap"]["local_costmap"]["ros__parameters"]["inflation_layer"]
+    assert cart["inflation_cost_scaling_factor"] == inflation["cost_scaling_factor"]
+    # Path conditioning at the local-map resolution, and a replan hysteresis
+    # well below the 0.25 m tracking/deviation scale of the cart.
+    local = params["local_costmap"]["local_costmap"]["ros__parameters"]
+    assert cart["path_resolution"] == local["resolution"]
+    assert 0 < cart["path_smoothing_distance"] <= 0.15
+    assert 0 < cart["path_keep_tolerance"] <= 0.08
+    assert cart["path_compare_start"] >= cart["min_lookahead_dist"]
+    assert 0 < cart["min_rotate_vel"] <= cart["rotate_to_heading_angular_vel"]
     planner = params["planner_server"]["ros__parameters"]
     assert planner["planner_plugins"] == ["GridBased"]
 
@@ -906,9 +971,35 @@ def test_lease_ack_during_brief_feedback_gap_does_not_cancel_running_task():
     h._motion_callback(SimpleNamespace(data=True))
     assert h.motion_enabled and h.navigation_active
     h._status_timer()
+    # Still in POLICY: a not-ready gap only pauses velocity downstream and
+    # keeps renewing authorization, so navigation resumes when ready.
     h.locomotion_not_ready_since -= LOCOMOTION_READY_GRACE_S + .01
     h._status_timer()
+    assert h.motion_enabled and h.navigation_active
+    assert h.motion_enable_pub.messages[-1].data is True
+    h.locomotion_not_ready_since -= TRANSIENT_PAUSE_LIMIT_S
+    h._status_timer()
     assert not h.motion_enabled and not h.navigation_active
+
+
+def test_lease_ack_during_one_stale_feedback_tick_does_not_cancel_running_task():
+    """healthy=false from one slow control tick is transient, not a stop."""
+    locomotion = _Locomotion(ready=False)
+    locomotion.value["healthy"] = False
+    h = _Harness(locomotion)
+    h._motion_callback(SimpleNamespace(data=True))
+    assert h.motion_enabled and h.navigation_active and not h.goal_handle.cancel_count
+    h._status_timer()
+    h.locomotion_not_ready_since -= TRANSIENT_PAUSE_LIMIT_S
+    h._status_timer()
+    assert not h.motion_enabled and not h.navigation_active
+
+
+@pytest.mark.parametrize("stage", ["DAMPED", "FAULT"])
+def test_lease_ack_is_rejected_at_once_when_policy_stopped(stage):
+    h = _Harness(_Locomotion(ready=False, stage=stage))
+    h._motion_callback(SimpleNamespace(data=True))
+    assert not h.motion_enabled and h.motion_enable_pub.messages[-1].data is False
 
 
 def test_downstream_reference_fault_is_acknowledged_even_without_a_goal():

@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -7,6 +8,7 @@
 
 #include <Eigen/Core>
 #include <pcl/common/point_tests.h>
+#include <pcl/common/transforms.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/sample_consensus/method_types.h>
@@ -15,11 +17,15 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <tf2_eigen/tf2_eigen.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 class CloudObstacleFilter : public rclcpp::Node
 {
 public:
-  CloudObstacleFilter() : Node("cloud_obstacle_filter")
+  CloudObstacleFilter()
+  : Node("cloud_obstacle_filter"), buffer_(get_clock()), listener_(buffer_)
   {
     declare_parameter<std::string>("input_topic", "/cloud_nav");
     declare_parameter<std::string>("output_topic", "/cloud_obstacles");
@@ -28,15 +34,25 @@ public:
     declare_parameter<double>("max_obstacle_height", 1.80);
     declare_parameter<double>("self_filter_radius", 0.60);
     declare_parameter<double>("max_range", 4.0);
+    // A 50 Hz MID-360 frame (~4000 points) covers only part of the
+    // non-repetitive pattern; one frame leaves most scan bins empty and too
+    // few ground points for RANSAC. Merge the frames acquired in this window,
+    // each placed in the odometry frame at its own acquisition time. Output
+    // keeps the newest frame's stamp and rate. 10 Hz input = one frame.
+    declare_parameter<double>("accumulation_window", 0.1);
+    declare_parameter<std::string>("odom_frame", "odom");
     ground_distance_threshold_ = get_parameter("ground_distance_threshold").as_double();
     min_obstacle_height_ = get_parameter("min_obstacle_height").as_double();
     max_obstacle_height_ = get_parameter("max_obstacle_height").as_double();
     self_filter_radius_ = get_parameter("self_filter_radius").as_double();
     max_range_ = get_parameter("max_range").as_double();
+    accumulation_window_ = get_parameter("accumulation_window").as_double();
+    odom_frame_ = get_parameter("odom_frame").as_string();
     if (self_filter_radius_ < 0.0 || max_range_ <= self_filter_radius_ ||
-        min_obstacle_height_ >= max_obstacle_height_)
+        min_obstacle_height_ >= max_obstacle_height_ || !(accumulation_window_ >= 0.0) ||
+        accumulation_window_ > 0.3)
     {
-      throw std::invalid_argument("Invalid obstacle filter range or height bounds");
+      throw std::invalid_argument("Invalid obstacle filter range, height or window bounds");
     }
 
     publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -47,6 +63,42 @@ public:
   }
 
 private:
+  struct Frame
+  {
+    rclcpp::Time stamp;
+    pcl::PointCloud<pcl::PointXYZI>::Ptr odom_points;
+  };
+
+  // Returns the newest frame plus earlier frames in the window, all expressed
+  // in the newest frame's coordinates at its acquisition time. Without a
+  // valid odometry transform, fall back to the single current frame.
+  pcl::PointCloud<pcl::PointXYZI>::Ptr accumulate(
+    const pcl::PointCloud<pcl::PointXYZI>::Ptr & current,
+    const std::string & frame_id, const rclcpp::Time & stamp)
+  {
+    if (accumulation_window_ <= 0.0) return current;
+    Eigen::Isometry3d odom_from_frame;
+    try {
+      odom_from_frame = tf2::transformToEigen(
+        buffer_.lookupTransform(odom_frame_, frame_id, stamp));
+    } catch (const tf2::TransformException &) {
+      frames_.clear();
+      return current;
+    }
+    if (frame_id != frame_id_) frames_.clear();
+    frame_id_ = frame_id;
+    pcl::PointCloud<pcl::PointXYZI>::Ptr in_odom(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::transformPointCloud(*current, *in_odom, odom_from_frame.matrix().cast<float>());
+    frames_.push_back({stamp, in_odom});
+    while (!frames_.empty() && (stamp-frames_.front().stamp).seconds() > accumulation_window_ + 1e-3)
+      frames_.pop_front();
+    if (frames_.size() == 1) return current;
+    pcl::PointCloud<pcl::PointXYZI> merged;
+    for (const auto & frame : frames_) merged += *frame.odom_points;
+    pcl::PointCloud<pcl::PointXYZI>::Ptr output(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::transformPointCloud(merged, *output, odom_from_frame.inverse().matrix().cast<float>());
+    return output;
+  }
   bool estimateGround(
     const pcl::PointCloud<pcl::PointXYZI>::ConstPtr &cloud,
     Eigen::Vector4f &plane)
@@ -99,6 +151,7 @@ private:
     pcl::PointCloud<pcl::PointXYZI>::Ptr input(
       new pcl::PointCloud<pcl::PointXYZI>());
     pcl::fromROSMsg(*message, *input);
+    input = accumulate(input, message->header.frame_id, stamp);
 
     Eigen::Vector4f plane;
     if (estimateGround(input, plane))
@@ -153,6 +206,12 @@ private:
   double max_obstacle_height_ = 1.80;
   double self_filter_radius_ = 0.60;
   double max_range_ = 4.0;
+  double accumulation_window_ = 0.1;
+  std::string odom_frame_ = "odom";
+  std::string frame_id_;
+  std::deque<Frame> frames_;
+  tf2_ros::Buffer buffer_;
+  tf2_ros::TransformListener listener_;
   bool have_plane_ = false;
   int64_t last_stamp_ = 0;
   Eigen::Vector4f last_plane_ = Eigen::Vector4f::Zero();

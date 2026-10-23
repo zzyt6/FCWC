@@ -14,6 +14,8 @@ R2, L2, B, L1 = 1 << 4, 1 << 5, 1 << 9, 1 << 1
 STAGE_NAMES = ('WAITING', 'RAMPING', 'HOLDING', 'POLICY', 'DAMPED', 'FAULT')
 # State flag independent of health; preparation keeps its targets and gains.
 PREPARATION_OVERDUE = 1 << 3
+# Policy command late: the bridge holds the last leg targets with Balance PD.
+POLICY_HOLD = 1 << 4
 
 
 @dataclass

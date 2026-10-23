@@ -278,7 +278,9 @@ def test_raw_filter_receives_clock_and_delayed_pose_without_lio(
                 assert statuses[-1]['removed_points'] == point_groups*repeats, statuses[-1]
                 assert not statuses[-1]['observations']['localization_without_cart_filter'], statuses[-1]
                 assert all(process.poll() is None for process in processes), diagnostic
-                expired = [s for s in statuses if (s['observations']['filtered_age_s'] or 0.) > .5]
+                # Readiness follows the receive gap of new filtered clouds, not
+                # their acquisition age (which also includes the scan duration).
+                expired = [s for s in statuses if (s['observations']['filtered_gap_s'] or 0.) > .52]
                 assert expired and all(not s['gantry_filter']['ready'] for s in expired), diagnostic
                 assert statuses[-1]['observations']['filtered_age_s'] < .5, statuses[-1]
                 assert statuses[-1]['gantry_filter']['ready'], statuses[-1]

@@ -2,6 +2,7 @@
   "schema": "pushcart_navigation_v1",
   "pose_source": "grasp",
   "camera_quad_decimate": 2.0,
+  "cart_heading_hold_kp": 0.0,
   "task_limits": [
     [
       -0.2,

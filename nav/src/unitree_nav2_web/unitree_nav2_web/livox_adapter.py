@@ -15,8 +15,13 @@ OUTPUT_DTYPE = np.dtype([
 ])
 
 
-def adapt_cloud(message):
+def adapt_cloud(message, stride=1):
     """Keep sensor time/coordinates; convert absolute ns to relative ns.
+
+    stride > 1 keeps every stride-th point in acquisition order plus the final
+    one (the scan end FAST-LIO synchronizes IMU against). Navigation moves
+    FAST-LIO's point_filter_num here, so the cart self-filter, Python
+    (de)serialization and FAST-LIO preprocessing handle 1/stride of the points.
 
     The bundled Livox driver writes PointXyzlt.offset_time (absolute integer
     nanoseconds) into its FLOAT64 timestamp field, not seconds. At Unix epoch
@@ -54,25 +59,33 @@ def adapt_cloud(message):
     # expected by FAST-LIO's IMU synchronization (before its internal sort).
     if (np.diff(offsets) < 0).any():
         output = output[np.argsort(offsets, kind='stable')]
+    if stride > 1 and output.size:
+        keep = np.arange(0, output.size, stride)
+        if keep[-1] != output.size-1:
+            keep = np.append(keep, output.size-1)
+        output = output[keep]
     return PointCloud2(
-        header=copy.deepcopy(message.header), height=1, width=points.size,
+        header=copy.deepcopy(message.header), height=1, width=output.size,
         fields=[PointField(name=name, offset=OUTPUT_DTYPE.fields[name][1],
                            datatype=PointField.UINT16 if name == 'ring' else PointField.FLOAT32,
                            count=1) for name in OUTPUT_DTYPE.names],
-        is_bigendian=False, point_step=22, row_step=points.size * 22,
+        is_bigendian=False, point_step=22, row_step=output.size * 22,
         data=array('B', output.tobytes()), is_dense=message.is_dense)
 
 
 class LivoxAdapter(Node):
     def __init__(self):
         super().__init__('livox_adapter')
+        self.stride = int(self.declare_parameter('point_stride', 1).value)
+        if self.stride < 1:
+            raise ValueError('point_stride must be >= 1')
         self.publisher = self.create_publisher(
             PointCloud2, '/navigation/livox_points', qos_profile_sensor_data)
         self.create_subscription(PointCloud2, '/livox/lidar', self.cloud, qos_profile_sensor_data)
 
     def cloud(self, message):
         try:
-            self.publisher.publish(adapt_cloud(message))
+            self.publisher.publish(adapt_cloud(message, self.stride))
         except (ValueError, TypeError, KeyError) as exc:
             self.get_logger().error(str(exc), throttle_duration_sec=2.0)
 

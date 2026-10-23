@@ -88,14 +88,20 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 50.0
+    # 20 Hz matches the LiDAR. Walking commands pass the executor's 0.4 s
+    # filter and cart commands the cart student's trained reference filter
+    # (ref_alpha 0.05 at 50 Hz, tau ~0.39 s), so a faster outer loop changed
+    # nothing at the body but cost navigation CPU that the cart camera and
+    # FAST-LIO need. The 50 Hz policies and the 200 Hz bridge hold the latest
+    # command between updates.
+    controller_frequency: 20.0
     odom_topic: /Odometry_navigation
     min_x_velocity_threshold: 0.01
     min_y_velocity_threshold: 0.01
     min_theta_velocity_threshold: 0.01
     progress_checker_plugin: "progress_checker"
     goal_checker_plugin: "goal_checker"
-    # Load stock DWB before the ordinary-navigation adapter's dependencies.
+    # Walking keeps DWB (FollowPath); the cart pushes with pure pursuit.
     controller_plugins: ["CartPush", "FollowPath"]
     progress_checker:
       plugin: "nav2_controller::PoseProgressChecker"
@@ -104,8 +110,11 @@ controller_server:
       movement_time_allowance: 15.0
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.15
-      yaw_goal_tolerance: 0.17453292519943295  # 10 degrees
+      # 2026-10-23 operator choice: 0.25 m / 20 deg. The ~0.8 s push chain made
+      # the final 0.15 m / 10 deg correction slow. Foxy has one goal checker,
+      # so walking (FollowPath) uses the same tolerance.
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.3490658503988659  # 20 degrees
       stateful: true
     FollowPath:
       plugin: "nav2_rotation_shim_controller::RotationShimController"
@@ -145,7 +154,7 @@ controller_server:
       decel_lim_x: -0.30
       decel_lim_y: -0.20
       decel_lim_theta: -0.40
-      # Bound work per 20 ms cycle; preserve all axes and collision resolution.
+      # Bound work per 50 ms cycle; preserve all axes and collision resolution.
       vx_samples: 9
       vy_samples: 7
       vtheta_samples: 11
@@ -153,7 +162,7 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.50
-      xy_goal_tolerance: 0.15  # Keep RotateToGoal aligned with the goal checker.
+      xy_goal_tolerance: 0.25  # Keep RotateToGoal aligned with the goal checker.
       trans_stopped_velocity: 0.05
       short_circuit_trajectory_evaluation: true
       stateful: true
@@ -171,91 +180,96 @@ controller_server:
       RotateToGoal.slowing_factor: 5.0
       RotateToGoal.lookahead_time: -1.0
 
-    # Cart-frame velocities enter the existing high-level push policy. The
-    # launch file reads the actual axis limits from pushcart_navigation.json.
+    # The cart only has to follow the global path, so it uses Foxy's official
+    # Regulated Pure Pursuit (vx + wz, no reversing or strafing) instead of a
+    # sampling controller. Cart-frame commands enter the existing push policy;
+    # the launch file reads max_vel_x / max_vel_theta from
+    # config/pushcart_navigation.json. The adapter adds the web speed, the
+    # final approach cap, open-loop ramping and a full-footprint arc check.
     CartPush:
-      plugin: "dwb_core::DWBLocalPlanner"
-      debug_trajectory_details: true
-      publish_evaluation: false
-      publish_trajectories: false
-      publish_cost_grid_pc: false
-      # Use Nav2's sampler and rollout directly, without projecting velocity
-      # samples onto a speed circle. UI speed constraints are checked below.
-      trajectory_generator_name: "dwb_plugins::StandardTrajectoryGenerator"
+      plugin: "unitree_nav2_core::CartPurePursuitController"
+      # Web speed (0.20-0.60 m/s). Pure pursuit always aims at this speed, so
+      # "auto" and "fixed" behave the same here; desired_linear_vel is unused.
       navigation_speed_mode: "auto"
       navigation_speed: 0.35
+      # Linear cap from 0.80 m: navigation_speed -> 0.10 m/s at xy_goal_tolerance.
       approach_distance: 0.80
       approach_speed: 0.10
-      min_vel_x: -0.20
+      xy_goal_tolerance: 0.25  # Keep aligned with goal_checker.
       max_vel_x: 0.60
-      min_vel_y: -0.30
-      max_vel_y: 0.30
+      # Larger yaw rates are scaled down together with vx, keeping the arc.
       max_vel_theta: 0.40
-      min_speed_xy: 0.0
-      max_speed_xy: 0.35  # Updated atomically with the selected navigation speed.
-      min_speed_theta: 0.0
-      acc_lim_x: 0.30
-      acc_lim_y: 0.20
-      acc_lim_theta: 0.40
-      decel_lim_x: -0.30
-      decel_lim_y: -0.20
-      decel_lim_theta: -0.40
-      vx_samples: 9
-      vy_samples: 7
-      vtheta_samples: 11
-      sim_time: 1.0
-      # Also resolve braking travel for a zero target velocity.
-      discretize_by_time: true
-      time_granularity: 0.05
-      # Keep Foxy's local target near the cart. A target across a distant
-      # corner can make GoalDist/GoalAlign reward stopping or cutting across
-      # the bend instead of following the current leg of the global path.
-      shorten_transformed_plan: true
-      # With the 1 s rollout and 0.30 m/s cruise cap, even the default 1 m
-      # target can cross a right-angle corner too early. Long-turn tests use
-      # 0.8 m; keep this independent of the 3 m obstacle-observation radius.
-      prune_distance: 0.8
-      linear_granularity: 0.04
-      angular_granularity: 0.025
+      # Ramp from the last command; the executor filters every command (0.4 s)
+      # and the measured cart velocity lags and is noisy.
+      closed_loop: false
+      # NavFn path conditioning before pursuit: resample every 2.5 cm, smooth
+      # twice with a +/-0.10 m moving average (removes one-cell zigzags; a 90
+      # deg corner is rounded by ~5 cm), resample again, headings = tangent.
+      path_resolution: 0.025
+      path_smoothing_distance: 0.10
+      # The BT replans at 1 Hz. A new plan to the same goal is ignored while,
+      # from 0.7 m to 3.7 m along it (never nearer than the shortest carrot), it stays within 5 cm of the current one;
+      # a real route change (new obstacle, cart pushed off the path) exceeds it.
+      path_keep_tolerance: 0.05
+      path_compare_start: 0.70
+      path_compare_length: 3.0
+      # Carrot = commanded speed x 2.5 s, within 0.7-1.1 m (0.75 m at 0.30
+      # m/s). 2026-10-20 23:04 on the robot the cart followed RPP wz with
+      # ~0.8 s lag (cart student + body + casters; fitted 0.4 s response +
+      # 0.4 s dead time) on a cart pose ~0.35 s old, and weaved +/-0.45 rad,
+      # +/-0.25 m with an 8 s period on the former 1.5 s / 0.5-0.9 m carrot.
+      # On that plant cart_rpp_regression reverses the turn 0-1 times instead
+      # of 3-5 with this carrot; corners stay at ~0.15-0.17 m max offset.
+      use_velocity_scaled_lookahead_dist: true
+      lookahead_time: 2.5
+      lookahead_dist: 0.90
+      min_lookahead_dist: 0.70
+      max_lookahead_dist: 1.10
+      # Command ramps, applied by the adapter in every mode: wz never changes
+      # faster than 0.6 rad/s^2 (pursuit, in-place turns and the switch
+      # between them), and vx does not drop to zero at once when RPP switches
+      # to an in-place turn. The executor's 0.4 s filter does not rate-limit
+      # wz itself. 0.4 rad/s^2 (former cart DWB) lagged the pursuit loop: a
+      # cart starting 25 cm off the path was still 8 cm off after 1 m.
+      max_linear_accel: 0.30
+      max_linear_decel: 0.30
+      max_angular_accel: 0.60
+      # Rotate in place when the carrot is more than 45 deg off the cart
+      # heading (start of a goal, sharp corners) instead of swinging the cart.
+      use_rotate_to_heading: true
+      rotate_to_heading_min_angle: 0.785
+      rotate_to_heading_angular_vel: 0.30
+      # Turn to the goal heading inside this radius; must not exceed
+      # xy_goal_tolerance or the cart would rotate outside the goal radius.
+      # That final turn brakes as sqrt(2 x 0.6 x remaining angle), >= 0.10.
+      goal_dist_tol: 0.25
+      min_rotate_vel: 0.10
+      # Slow down on tight path curvature (radius < 0.9 m) ...
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.90
+      regulated_linear_scaling_min_speed: 0.10
+      # ... and close to obstacles (cart-center cost, same 4.0 decay as the
+      # inflation layer below).
+      use_cost_regulated_linear_velocity_scaling: true
+      cost_scaling_dist: 0.60
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 4.0
+      # The adapter owns the final approach (approach_distance above).
+      use_approach_linear_velocity_scaling: false
+      min_approach_linear_velocity: 0.10
+      # Stop (controller failure, BT waits and replans) if the combined cart
+      # footprint would hit a lethal cell along the next 1.5 s of the arc.
+      # 0.35 m at 0.35 m/s covers the 0.30 m/s^2 ramp plus the 0.4 s filter.
+      max_allowed_time_to_collision: 1.5
       transform_tolerance: 0.30
-      xy_goal_tolerance: 0.15
-      trans_stopped_velocity: 0.05
-      short_circuit_trajectory_evaluation: true
-      stateful: true
-      # All scores are nonnegative. With short-circuiting, inexpensive critics
-      # can reject candidates already worse than the best before the full
-      # footprint sweep. Every candidate that can win still gets that sweep.
-      # Official Foxy path/goal critics, with a stronger cart-center PathDist.
-      # Keep the cart's holonomic limits and footprint; the TurtleBot example's
-      # vy=0 does not apply.
-      # navigation2/0.4.7: nav2_bringup/bringup/params/nav2_params.yaml
-      critics: ["NavigationSpeedLimit", "RotateToGoal", "Oscillation", "Twirling", "GoalAlign", "PathAlign", "PathDist", "GoalDist", "CruiseSpeed", "ObstacleFootprint"]
-      NavigationSpeedLimit.class: "unitree_nav2_core::NavigationSpeedLimitCritic"
-      NavigationSpeedLimit.scale: 1.0
-      # This cost is NOT multiplied by resolution/2 like the path critics.
-      # Keep it weak so needed turns do not lose to sideways translation.
-      Twirling.scale: 0.5
-      ObstacleFootprint.scale: 1.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
-      PathAlign.scale: 32.0
-      # This is the heading probe, not the cart half-length. PathAlign turns
-      # off inside this distance to the goal; use the official default.
-      PathAlign.forward_point_distance: 0.325
-      GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.325
-      PathDist.scale: 64.0
-      GoalDist.scale: 24.0
-      CruiseSpeed.class: "unitree_nav2_core::CruiseSpeedCritic"
-      CruiseSpeed.scale: 18.0
 
 local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: false
-      # Collision checking reads this internal map, independently of display.
-      update_frequency: 50.0
+      # Collision checking reads this internal map, independently of display;
+      # updated once per LiDAR frame and controller cycle.
+      update_frequency: 20.0
       publish_frequency: 8.0
       global_frame: odom
       robot_base_frame: nav_control

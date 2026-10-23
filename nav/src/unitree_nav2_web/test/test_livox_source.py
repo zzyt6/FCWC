@@ -81,6 +81,20 @@ def test_overlapping_packet_times_are_sorted_with_their_points():
     np.testing.assert_allclose(result['time'], data['timestamp'][order] - data['timestamp'][0])
 
 
+@pytest.mark.parametrize('size', [1, 2, 3, 4000, 4001])
+def test_navigation_stride_keeps_every_third_point_and_the_scan_end(size):
+    """FAST-LIO's 1-in-3 decimation moved upstream of the cart self-filter."""
+    msg, data = livox_cloud(size)
+    full = np.frombuffer(adapt_cloud(msg).data, dtype=OUTPUT_DTYPE)
+    result = deserialize_message(serialize_message(adapt_cloud(msg, 3)), PointCloud2)
+    kept = np.frombuffer(result.data, dtype=OUTPUT_DTYPE)
+    expected = sorted(set(range(0, size, 3)) | {size-1})
+    np.testing.assert_array_equal(kept, full[expected])
+    assert kept['time'][-1] == full['time'][-1]  # IMU sync still sees the scan end.
+    assert result.width == len(expected) and result.row_step == len(expected)*22
+    assert adapt_cloud(msg, 1) == adapt_cloud(msg)
+
+
 def test_organized_cloud_row_padding_is_not_a_point():
     msg, data = livox_cloud(4000)
     split = 2000*26

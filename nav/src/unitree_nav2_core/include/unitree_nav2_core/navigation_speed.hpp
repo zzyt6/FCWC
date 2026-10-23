@@ -79,56 +79,5 @@ private:
   double weight_{0.0};
 };
 
-// Keep UI speed/arrival constraints with the unmodified official trajectory
-// generator. Legal samples receive zero cost; this never steers toward a side.
-class NavigationSpeedLimitCritic : public dwb_core::TrajectoryCritic
-{
-public:
-  void onInit() override;
-  bool prepare(const geometry_msgs::msg::Pose2D & pose,
-    const nav_2d_msgs::msg::Twist2D &, const geometry_msgs::msg::Pose2D & goal,
-    const nav_2d_msgs::msg::Path2D &) override;
-  double scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory) override;
-private:
-  double approach_distance_{0.8}, approach_speed_{0.1}, goal_tolerance_{0.15};
-  double speed_limit_{0.35};
-  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_;
-};
-
-// Prefer continuity of selected commands, without modifying a checked command
-// afterwards or forbidding a reversal needed to avoid an obstacle.
-class CommandChangeCritic : public dwb_core::TrajectoryCritic
-{
-public:
-  void onInit() override;
-  bool prepare(const geometry_msgs::msg::Pose2D &,
-    const nav_2d_msgs::msg::Twist2D &, const geometry_msgs::msg::Pose2D &,
-    const nav_2d_msgs::msg::Path2D &) override;
-  double scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory) override;
-  void debrief(const nav_2d_msgs::msg::Twist2D & command) override;
-  // DWB calls reset on each periodic replan. Fresh command history belongs to
-  // the moving cart, not that path; prepare expires it after a control pause.
-private:
-  nav_2d_msgs::msg::Twist2D previous_;
-  std::chrono::steady_clock::time_point selected_at_{};
-  double lateral_limit_{0.15}, angular_limit_{0.3};
-  bool active_{false};
-};
-
-// A holonomic cart follows the path tangent while translating toward a
-// speed-dependent lookahead point. This only scores collision-checked samples.
-class CartLookaheadCritic : public dwb_core::TrajectoryCritic
-{
-public:
-  void onInit() override;
-  bool prepare(const geometry_msgs::msg::Pose2D & pose,
-    const nav_2d_msgs::msg::Twist2D & velocity, const geometry_msgs::msg::Pose2D & goal,
-    const nav_2d_msgs::msg::Path2D & plan) override;
-  double scoreTrajectory(const dwb_msgs::msg::Trajectory2D & trajectory) override;
-private:
-  geometry_msgs::msg::Pose2D target_;
-  double base_{0.4}, gain_{0.6}, maximum_{1.0}, heading_weight_{0.4};
-};
-
 }  // namespace unitree_nav2_core
 #endif

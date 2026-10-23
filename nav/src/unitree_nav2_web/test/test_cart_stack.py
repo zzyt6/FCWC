@@ -1,4 +1,4 @@
-"""Load the actual Foxy DWB plugins and dynamic footprint on an isolated ROS graph."""
+"""Load the actual Foxy controllers and dynamic footprint on an isolated ROS graph."""
 import os
 import math
 import copy
@@ -284,7 +284,7 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 executor = SingleThreadedExecutor(context=context)
                 executor.add_node(node)
                 broadcaster = TransformBroadcaster(node)
-                # The real global plan is in map and DWB predicts in odom.
+                # The real global plan is in map and the controller works in odom.
                 # A substantial map rotation exposes swapped axes/signs and
                 # accidental comparisons between these two coordinate frames.
                 map_broadcaster = StaticTransformBroadcaster(node)
@@ -305,8 +305,9 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 grids, commands, footprints = [], [], []
                 recorded_poses, local_plans, transformed_plans = [], [], []
                 state_errors = []
-                node.create_subscription(NavigationPath, '/local_plan', local_plans.append, 10)
-                node.create_subscription(NavigationPath, '/transformed_global_plan', transformed_plans.append, 10)
+                # RPP's commanded (collision-checked) arc, and its plan in the cart frame.
+                node.create_subscription(NavigationPath, '/lookahead_collision_arc', local_plans.append, 10)
+                node.create_subscription(NavigationPath, '/received_global_plan', transformed_plans.append, 10)
                 node.create_subscription(OccupancyGrid, '/local_costmap/costmap', grids.append, qos)
                 node.create_subscription(Twist, '/cmd_vel',
                     lambda msg: commands.append((time.monotonic(), msg)), 10)
@@ -329,8 +330,7 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 # and verify the server's parameters after configuration.
                 settings = yaml.safe_load(params.read_text())
                 controller = settings['controller_server']['ros__parameters']['CartPush']
-                controller.update(navigation_speed_mode='auto',
-                                  max_speed_xy=speed_limit, navigation_speed=speed_limit)
+                controller.update(navigation_speed_mode='auto', navigation_speed=speed_limit)
                 params = Path(directory) / 'params.yaml'
                 params.write_text(yaml.safe_dump(settings))
                 process = subprocess.Popen([
@@ -434,8 +434,8 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                                 2*math.atan2(odom.pose.pose.orientation.z, odom.pose.pose.orientation.w)])
                             state_errors.append((float(np.linalg.norm(estimated[:2]-measured[:2])),
                                 float(estimated[2]-measured[2])))
-                            # DWB receives the matched cart pose and measured
-                            # velocity, including real estimator dynamics.
+                            # The controller receives the matched cart pose and
+                            # measured velocity, including real estimator dynamics.
                             transform.header = odom.header
                             transform.transform.translation.x = odom.pose.pose.position.x
                             transform.transform.translation.y = odom.pose.pose.position.y
@@ -489,14 +489,13 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 parameters = node.create_client(GetParameters, '/controller_server/get_parameters')
                 until(parameters.service_is_ready)
                 actual = parameters.call_async(GetParameters.Request(names=[
-                    'CartPush.navigation_speed', 'CartPush.max_speed_xy', 'CartPush.navigation_speed_mode']))
+                    'CartPush.navigation_speed', 'CartPush.navigation_speed_mode']))
                 until(actual.done)
                 values = actual.result().values
                 record_property('configured_speed_m_s', values[0].double_value)
-                record_property('configured_mode', values[2].string_value)
+                record_property('configured_mode', values[1].string_value)
                 assert values[0].double_value == speed_limit
-                assert values[1].double_value == speed_limit
-                assert values[2].string_value == 'auto'
+                assert values[1].string_value == 'auto'
 
                 def goal(target, curve=False, start=None):
                     start = cart[:2].copy() if start is None else start
@@ -530,23 +529,10 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 result = goal(target, curve=scenario == 'curve', start=path_start)
                 until(result.done, 18.)
                 assert result.result().status == 4, diagnostic()
-                assert transformed_plans
-                first_plan = transformed_plans[0]
-                # Foxy's moving local target must stay within prune_distance;
-                # an endpoint beyond a distant bend can reverse goal scoring.
-                # Arrival still uses the true final goal, checked below.
-                assert first_plan.header.frame_id == 'odom'
-                first_points = np.array([[p.pose.position.x, p.pose.position.y]
-                                         for p in first_plan.poses])
-                initial_cart = recorded_poses[0][:2]
-                assert np.max(np.linalg.norm(first_points-initial_cart, axis=1)) <= controller['prune_distance']+.03
-                if scenario == 'straight':
-                    np.testing.assert_allclose(first_points[-1], target, atol=.025)
-                else:
-                    assert np.linalg.norm(first_points[-1]-target) > .10
-                if scenario != 'curve':
-                    assert np.max(np.abs((first_points-path_start) @ lateral)) < .025
-                assert np.linalg.norm(cart[:2]-target) <= .18
+                # RPP pursues a carrot on the plan expressed in the cart frame.
+                assert transformed_plans and transformed_plans[0].header.frame_id == 'nav_control'
+                goal_checker = settings['controller_server']['ros__parameters']['goal_checker']
+                assert np.linalg.norm(cart[:2]-target) <= goal_checker['xy_goal_tolerance']+.03
                 robot = cart[:2]-.8*np.array([math.cos(cart[2]), math.sin(cart[2])])
                 assert np.linalg.norm(robot-target) > .65  # Arrival is at the CART center.
                 assert any(msg.linear.x > .05 for _, msg in commands)
@@ -570,15 +556,17 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                     record_property('max_cross_track_m', max(cross_errors))
                     record_property('final_cross_track_m', cross_errors[-1])
                     record_property('final_heading_error_rad', yaw_errors[-1])
-                    assert max(cross_errors) < (.27 if displaced else .10 if misaligned else .08)
-                    assert max(yaw_errors) < (.47 if misaligned else .3 if displaced else .15)
-                    # The configured completion tolerance is 10 degrees.
-                    # DWB legitimately completes before reaching 0.10 rad;
-                    # retain the stricter heading bound over the entire route.
-                    assert cross_errors[-1] < .04 and yaw_errors[-1] <= math.radians(10.)
+                    # The 2.5 s carrot (vs 1.5 s) converges more gently: 10.5 cm on a misaligned start.
+                    assert max(cross_errors) < (.27 if displaced else .12 if misaligned else .08)
+                    # Pure pursuit has no lateral axis: a displaced cart must
+                    # turn toward its carrot (atan(0.25 / 0.5 m) ~ 0.46 rad).
+                    assert max(yaw_errors) < (.47 if misaligned or displaced else .15)
+                    # Completion is at the configured goal tolerance (20 deg).
+                    assert cross_errors[-1] < .04 and yaw_errors[-1] <= goal_checker['yaw_goal_tolerance']
                     # Recovery must happen along the route, before goal rotation
                     # can hide a controller that drove the entire path sideways.
-                    settled = [p for p in recorded_poses if (p[:2]-path_start) @ heading > 1.]
+                    # The 2.5 s carrot (~0.75 m) needs ~1.4 m of the 2 m route to recover.
+                    settled = [p for p in recorded_poses if (p[:2]-path_start) @ heading > 1.4]
                     if displaced or misaligned:
                         assert settled and max(abs((p[:2]-path_start) @ lateral) for p in settled) < .06
                         assert max(abs(p[2]-yaw) for p in settled) < .15
@@ -599,10 +587,8 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                         for s in worst_plan.poses])
                     if scenario != 'velocity_noise':
                         assert predicted_cross < (.27 if displaced else .15 if misaligned else .08)
-                assert 'Created controller : CartPush of type dwb_core::DWBLocalPlanner' in diagnostic()
-                assert 'Using critic "PathAlign" (dwb_critics::PathAlignCritic)' in diagnostic()
-                assert 'Using critic "CommandChange"' not in diagnostic()
-                assert 'Using critic "CartLookahead"' not in diagnostic()
+                assert ('Created controller : CartPush of type '
+                        'unitree_nav2_core::CartPurePursuitController') in diagnostic()
                 moving, obstacle = False, True
                 velocity.fill(0.)
                 commands.clear()
@@ -610,7 +596,7 @@ def test_cart_controller_tracks_cart_center_and_rejects_obstacle_at_robot_rear(m
                 result = goal(cart[:2]+.5*heading)
                 until(result.done)
                 assert result.result().status == 6, diagnostic()
-                assert 'ObstacleFootprint' in diagnostic() and 'No valid trajectories' in diagnostic()
+                assert 'CartPush footprint collision ahead' in diagnostic()
             finally:
                 if process is not None:
                     process.terminate()

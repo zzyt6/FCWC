@@ -184,7 +184,7 @@ def main(args=None):
     parser.add_argument('--host-ip', default='192.168.123.164')
     parser.add_argument('--lidar-ip', default='192.168.123.120')
     parser.add_argument('--sdk-dir', default=os.environ.get('UNITREE_SDK2_PYTHON', str(Path.home() / 'unitree_sdk2_python')))
-    parser.add_argument('--frequency', type=float, default=50.0, choices=(10.0, 20.0, 50.0))
+    parser.add_argument('--frequency', type=float, default=20.0, choices=(10.0, 20.0, 50.0))
     parser.add_argument('--duration', type=float, default=0.0, help='Stop and restore after this many seconds; 0 runs until stopped')
     parser.add_argument('--state-file', default=str(Path.home() / '.cache/cwc_navigation/livox_source.json'))
     parser.add_argument('--restore', action='store_true')

@@ -5,7 +5,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'robot'))
-from pushcart_v81.viser_policy import CartHeadingHold
+from pushcart_v81.viser_policy import CartHeadingHold, PelvisYawHistory
 
 
 class CartHeadingHoldTests(unittest.TestCase):
@@ -67,6 +67,40 @@ class CartHeadingHoldTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 CartHeadingHold()((.3, 0., 0.), imu, cam, dt)
 
+
+
+class PelvisYawHistoryTests(unittest.TestCase):
+    def test_interpolates_clamps_and_unwraps(self):
+        history = PelvisYawHistory()
+        self.assertIsNone(history.at(1.))
+        for index in range(10):
+            history.add(1. + .02*index, .1*index)
+        self.assertAlmostEqual(history.at(1.03), .15)
+        self.assertAlmostEqual(history.at(.5), 0.)   # Older than the span: oldest sample.
+        self.assertAlmostEqual(history.at(9.), .9)   # Newer: latest sample.
+        wrap = PelvisYawHistory()
+        wrap.add(0., math.pi - .02)
+        wrap.add(.02, -math.pi + .02)
+        self.assertAlmostEqual(abs(wrap.at(.01)), math.pi)
+
+    def test_gait_sway_with_camera_delay_is_not_a_heading_error(self):
+        """Fixed cart, swaying pelvis, camera 60 ms old: no correction when paired at capture."""
+        cart = .3
+        history, paired, current = PelvisYawHistory(), CartHeadingHold(), CartHeadingHold()
+        worst_paired = worst_current = 0.
+        for tick in range(200):
+            now = tick*.02
+            pelvis = .15*math.sin(2*math.pi*1.7*now)
+            history.add(now, pelvis)
+            captured = max(0., now-.06)
+            relative = cart - .15*math.sin(2*math.pi*1.7*captured)
+            out_paired = paired((.3, 0., 0.), history.at(captured), relative, .02)
+            out_current = current((.3, 0., 0.), pelvis, relative, .02)
+            if tick > 10:
+                worst_paired = max(worst_paired, abs(out_paired[2]))
+                worst_current = max(worst_current, abs(out_current[2]))
+        self.assertLess(worst_paired, 1e-9)
+        self.assertGreater(worst_current, .09)  # The former pairing: ~0.1 rad/s of false turning.
 
 if __name__ == '__main__':
     unittest.main()

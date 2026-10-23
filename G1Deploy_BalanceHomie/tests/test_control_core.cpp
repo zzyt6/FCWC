@@ -216,7 +216,9 @@ int main() {
         x.f.packet.q[j]=out.q[j];
       }
     }
-    x.advance(.2); auto stopped=x.core.step(x.f,x.now);
+    x.advance(.2); auto held=x.core.step(x.f,x.now);
+    assert(x.core.stage==Stage::Policy && x.core.policy_hold() && held.kp[0]>0);
+    x.advance(config::command_hold_timeout_s); auto stopped=x.core.step(x.f,x.now);
     assert(x.core.stage==Stage::Fault && stopped.kp[0]==0 && stopped.kd[0]==config::damping_kd); }
   { Fixture x; x.holding();auto c=x.packet(Request::Policy);c.profile=99;
     assert(!x.core.command(c,x.f,x.now));assert(x.core.stage==Stage::Fault); }
@@ -419,11 +421,11 @@ int main() {
     x.advance(); x.f.packet.buttons=0; held=x.core.step(x.f,x.now);
     assert(held.q==moving.q); // Old segment cannot resume on release.
   }
-  // Interpolation cannot delay explicit stop, L2, heartbeat or health faults.
+  // Interpolation cannot delay explicit stop, L2, a lost heartbeat or health faults.
   for(int stop=0;stop<4;++stop) {
     Fixture x; x.pushing(); x.advance();
     assert(x.core.command(x.upper(.06f),x.f,x.now)); x.core.step(x.f,x.now);
-    x.advance(stop==2?config::command_timeout_s+.005:.005);
+    x.advance(stop==2?config::command_hold_timeout_s+.005:.005);
     if(stop==0) x.send(Request::Stop);
     if(stop==1) x.f.packet.buttons=kL2;
     if(stop==3) x.f.motor_error=true;
@@ -450,5 +452,43 @@ int main() {
   }
   { Fixture x; x.pushing(); auto c=x.upper(0); c.upper_target_active=2;
     assert(!x.core.command(c,x.f,x.now)); assert(x.core.stage==Stage::Fault); }
+  // A late policy tick holds the last leg targets with Balance gains instead
+  // of damping, records the hold, and resumes on the next command.
+  { Fixture x; x.holding(); x.send(Request::Policy); x.core.step(x.f,x.now);
+    auto c=x.packet(Request::Policy); c.profile=1; c.q[3]+=.1f;
+    for(int tick=0;tick<200;++tick) {          // settle into Homie
+      x.advance(); c=x.packet(Request::Policy); c.profile=1; c.q[3]+=.1f;
+      assert(x.core.command(c,x.f,x.now)); auto out=x.core.step(x.f,x.now);
+      for(int j=0;j<29;++j) x.f.packet.q[j]=out.q[j];
+    }
+    auto last=x.core.step(x.f,x.now);
+    assert(last.profile==1 && !x.core.policy_hold());
+    // 120 ms without a command, but fresh healthy feedback: hold, not damp.
+    for(int tick=0;tick<24;++tick) { x.advance(); last=x.core.step(x.f,x.now); }
+    assert(x.core.stage==Stage::Policy && x.core.policy_hold());
+    assert(x.core.policy_hold_count()==1 && x.core.policy_hold_gap_ns()>uint64_t(config::command_timeout_s*1e9));
+    for(int tick=0;tick<200;++tick) { x.advance(); last=x.core.step(x.f,x.now); }  // +1 s
+    assert(x.core.stage==Stage::Policy && x.core.policy_hold());
+    assert(last.profile==0 && last.gain_blend==1);   // standing Balance gains
+    assert(last.kp==config::balance_kp_sdk29 && last.kd==config::balance_kd_sdk29);
+    for(int i=0;i<12;++i) assert(std::abs(last.q[i]-(config::default_q_sdk29[i]+(i==3?.1f:0.f)))<1e-4);
+    // The next command resumes the policy and records the hold duration.
+    x.advance(); c=x.packet(Request::Policy); c.profile=1; c.q[3]+=.1f;
+    assert(x.core.command(c,x.f,x.now)); last=x.core.step(x.f,x.now);
+    assert(!x.core.policy_hold() && x.core.stage==Stage::Policy && last.profile==1);
+    assert(x.core.last_policy_hold_ns()>uint64_t(1e9));
+    // Hard faults are never masked by a hold.
+    for(int trigger=0;trigger<5;++trigger) {
+      Fixture y; y.holding(); y.send(Request::Policy); y.core.step(y.f,y.now);
+      y.advance(.15); y.core.step(y.f,y.now); assert(y.core.policy_hold());
+      if(trigger==0) y.f.packet.buttons=kL2;
+      if(trigger==1) y.f.motor_error=true;
+      if(trigger==2) y.f.packet.rpy[1]=1.;
+      if(trigger==3) y.f.motor_temperature[3]={int16_t(config::max_temperature_c+5),40};
+      if(trigger==4) y.f.packet.received_ns-=200000000;
+      auto out=y.core.step(y.f,y.now);
+      assert(y.core.stage==(trigger==0?Stage::Damped:Stage::Fault) && out.kp[0]==0);
+    }
+  }
   std::cout<<"Control-core preparation, position warnings, local effort limits and push-cart upper PD passed\n";
 }

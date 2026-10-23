@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 CONFIG = WORKSPACE / 'G1_high_policy_deploy/robot/config/viser_v81.json'
@@ -18,7 +19,11 @@ class CameraProcess:
         self.port, self.mode, self.interface = port, mode, interface
         self.tag_ids = tuple(tag_ids)
         self.publish_cart_pose = False  # Navigation opts in before starting the shared camera.
-        self.quad_decimate = 1.
+        self.quad_decimate = 2.
+        # Optional CPU set for the camera and its feedback subprocess. Navigation
+        # keeps it off the cores of the 50 Hz policy and 200 Hz bridge; Viser
+        # leaves it None (unchanged scheduling).
+        self.cpus = None
         self.missing_tag_dir = None
         self.missing_tag_error = ''
         self._recording_process = self._recording_enabled = None
@@ -56,11 +61,17 @@ class CameraProcess:
                    '--no-display', '--heading-udp-port', str(self.port), '--network-interface', self.interface,
                    '--cart-tag-ids', *map(str, self.tag_ids)]
         if self.publish_cart_pose:
-            command += ['--publish-cart-pose', '--pelvis-attitude-source', 'imu',
+            # --profile only adds per-stage wall times (CAMERA TIMING lines).
+            command += ['--publish-cart-pose', '--pelvis-attitude-source', 'imu', '--profile',
                         '--quad-decimate', f'{self.quad_decimate:g}',
                         '--tag-size', '0.10', '--robot-urdf', str(WORKSPACE / 'G1_URDF/g1.urdf')]
         if self.missing_tag_dir is not None:
             command += ['--missing-tag-dir', str(self.missing_tag_dir), '--missing-tag-control-stdin']
+        if self.cpus:
+            # Children (the robot-state bridge) inherit this affinity. Detection
+            # uses one OpenCV thread per pinned core (identical results).
+            command += ['--opencv-threads', str(len(self.cpus))]
+            command = ['taskset', '-c', ','.join(map(str, sorted(self.cpus)))] + command
         process = subprocess.Popen(
             command,
             # Explicit CLI IDs also override any broader standalone camera config.
@@ -96,12 +107,32 @@ class CameraProcess:
         self._recording_process, self._recording_enabled = process, enabled
 
     def _read(self, process):
+        last_camera_report = last_profile_report = -float('inf')
         with process.stdout:
             for line in process.stdout:
                 with self.lock:
                     self.lines.append(line.strip()[:400])
                 if line.startswith('MISSING_TAG '):
                     print(line.rstrip(), flush=True)
+                elif line.startswith('Capture ') and time.monotonic()-last_camera_report >= 1.:
+                    # Keep the camera's throttled timing/tag-loss reports in
+                    # the launch log, including frames without usable heading.
+                    print('CAMERA ' + line.rstrip(), flush=True)
+                    last_camera_report = time.monotonic()
+                elif line.startswith('Profile detect') and time.monotonic()-last_profile_report >= 1.:
+                    # Navigation runs the camera with --profile: per-stage wall times.
+                    print('CAMERA TIMING ' + line.rstrip(), flush=True)
+                    last_profile_report = time.monotonic()
+                elif line.startswith('Profile capture') and time.monotonic()-last_profile_report < .1:
+                    print('CAMERA TIMING ' + line.rstrip(), flush=True)
+                elif line.startswith(('ERROR', 'Traceback')) or 'Error' in line:
+                    # A camera exit otherwise only shows as growing frame age.
+                    print('CAMERA ' + line.rstrip(), flush=True)
+        try:
+            code = process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            code = None
+        print(f'CAMERA process exited code={code}', flush=True)
 
     def snapshot(self):
         code = self.process.poll() if self.process is not None else None

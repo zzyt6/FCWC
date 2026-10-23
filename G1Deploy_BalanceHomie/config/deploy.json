@@ -6,6 +6,7 @@
   "servo_hz": 200,
   "state_timeout_s": 0.1,
   "command_timeout_s": 0.1,
+  "command_hold_timeout_s": 2.0,
   "startup_timeout_s": 15.0,
   "calibration_s": 3.0,
   "calibration_timeout_s": 10.0,

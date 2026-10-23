@@ -141,6 +141,7 @@ class ControlCore {
     }
     if(stage==Stage::Policy) {
       if(request!=Request::Policy) { stop("invalid policy transition",true); return false; }
+      if(policy_hold_) end_policy_hold(now);
       auto next_profile=static_cast<Profile>(c.profile);
       if(next_profile!=profile_) {
         // Capture the last emitted targets and gains, including interrupted transitions.
@@ -218,7 +219,14 @@ class ControlCore {
         stop("feedback unhealthy: "+detail);
       }
       else if(f.packet.buttons&kL2) stop("remote L2",false);
-      else if(!command_ns_ || (now-command_ns_)*1e-9>config::command_timeout_s) stop("policy heartbeat timeout");
+      else if(!command_ns_) stop("policy heartbeat timeout");
+      else if(stage==Stage::Policy) {
+        const double gap=(now-command_ns_)*1e-9;
+        if(gap>config::command_hold_timeout_s) stop("policy heartbeat lost: no command for "+
+                                                   std::to_string(gap)+" s while holding");
+        else if(gap>config::command_timeout_s && !policy_hold_) begin_policy_hold(now);
+      }
+      else if((now-command_ns_)*1e-9>config::command_timeout_s) stop("policy heartbeat timeout");
       // Preparation taking too long is a warning, never a reason to remove
       // position support. Keep the target and gains until measured arrival.
     }
@@ -325,6 +333,38 @@ class ControlCore {
     return result;
   }
  private:
+  // A late Python policy tick must not remove support. Hold the last emitted
+  // leg targets with the Balance standing gains (normal profile transition),
+  // stop any upper-body motion at its emitted pose, and wait for the next
+  // command. Health/tilt/temperature/L2/explicit stop are checked first and
+  // still damp immediately; a gap beyond command_hold_timeout_s still damps.
+  void begin_policy_hold(uint64_t now) {
+    policy_hold_=true; policy_hold_start_=now; ++policy_hold_count_;
+    policy_hold_gap_ns_=now-command_ns_;
+    for(int i=0;i<config::controlled_dofs;++i) goal_[i]=output_q_[i];
+    if(profile_!=Profile::Balance) {
+      transition_q_=output_q_; start_kp_=active_kp_; start_kd_=active_kd_;
+      profile_=Profile::Balance; profile_start_=now;
+    }
+    hold_upper_target();
+    reason="policy hold: command late, holding last targets with Balance gains";
+  }
+  void end_policy_hold(uint64_t now) {
+    policy_hold_=false;
+    last_policy_hold_ns_=now-policy_hold_start_;
+    reason="policy running";
+  }
+ public:
+  bool policy_hold() const { return policy_hold_; }
+  // Telemetry for the bridge log: number of holds, the command age when the
+  // current hold began and the duration of the most recently completed one.
+  uint64_t policy_hold_count() const { return policy_hold_count_; }
+  uint64_t policy_hold_gap_ns() const { return policy_hold_gap_ns_; }
+  uint64_t last_policy_hold_ns() const { return last_policy_hold_ns_; }
+  uint64_t command_age_ns(uint64_t now) const { return command_ns_ && now>=command_ns_ ? now-command_ns_ : 0; }
+ private:
+  bool policy_hold_=false;
+  uint64_t policy_hold_start_=0,policy_hold_count_=0,policy_hold_gap_ns_=0,last_policy_hold_ns_=0;
   void hold_upper_target() {
     upper_target_active_=false;
     for(int i=0;i<29;++i) if(is_pushcart_upper_joint(i)) goal_[i]=output_q_[i];

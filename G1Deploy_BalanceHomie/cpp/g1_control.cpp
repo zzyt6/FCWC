@@ -384,6 +384,8 @@ int main(int argc,char** argv) {
     std::array<int,2> previous_hand_source{{-1,-1}};
     uint64_t last_calibration_log=0;
     bool previous_preparation_warning=false;
+    bool previous_policy_hold=false;
+    uint64_t last_hold_log=0;
     bool previous_health=true;
     Stage previous=Stage::Waiting;
     std::cout<<"BRIDGE mode="<<(opt.simulate?"SIMULATION":opt.control?"CONTROL_ARMED":"OBSERVE_ONLY")
@@ -501,7 +503,8 @@ int main(int argc,char** argv) {
       bool healthy=core.healthy(feedback,now);
       const bool preparation_warning=core.preparation_overdue(now);
       packet.flags=(healthy?1U:0U) | (opt.control?2U:0U) | (opt.simulate?4U:0U) |
-                   (preparation_warning?kPreparationOverdue:0U);
+                   (preparation_warning?kPreparationOverdue:0U) |
+                   (core.policy_hold()?kPolicyHold:0U);
       for(int i=0;i<29;++i) packet.applied_q[i]=output.publish?output.q[i]:feedback.packet.q[i];
       packet.profile=output.profile; packet.gain_blend=output.gain_blend;
       packet.upper_mode=output.upper_mode; packet.upper_gain_blend=output.upper_gain_blend;
@@ -524,6 +527,22 @@ int main(int argc,char** argv) {
         last_calibration_log=now;
       }
       previous_preparation_warning=preparation_warning;
+      // Every policy heartbeat hold is recorded: when it began, how late the
+      // Python command was, and how long the body stood on held targets.
+      if(core.policy_hold()!=previous_policy_hold) {
+        if(core.policy_hold())
+          std::cout<<"POLICY HOLD started count="<<core.policy_hold_count()
+                   <<" command_age_ms="<<core.policy_hold_gap_ns()*1e-6
+                   <<" hold_timeout_s="<<config::command_hold_timeout_s<<std::endl;
+        else if(core.stage==Stage::Policy)
+          std::cout<<"POLICY HOLD recovered count="<<core.policy_hold_count()
+                   <<" held_ms="<<core.last_policy_hold_ns()*1e-6<<std::endl;
+        previous_policy_hold=core.policy_hold();
+        last_hold_log=now;
+      } else if(core.policy_hold() && (now-last_hold_log)*1e-9>=.5) {
+        std::cout<<"POLICY HOLD continuing command_age_ms="<<core.command_age_ns(now)*1e-6<<std::endl;
+        last_hold_log=now;
+      }
       if(core.stage!=previous) {
         std::cout<<"STAGE "<<static_cast<int>(core.stage)<<" "<<core.reason<<std::endl; previous=core.stage;
       }

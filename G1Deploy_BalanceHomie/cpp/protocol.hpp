@@ -9,6 +9,9 @@ constexpr uint32_t kStateMagic = 0x48594253, kCommandMagic = 0x48594243, kVersio
 constexpr uint32_t kR2 = 1U << 4, kL2 = 1U << 5, kB = 1U << 9;
 // State flags: healthy=1, control armed=2, simulation=4, preparation overdue=8.
 constexpr uint32_t kPreparationOverdue = 1U << 3;
+// The policy command is late; the bridge holds the last leg targets with
+// Balance gains instead of damping (see ControlCore::begin_policy_hold).
+constexpr uint32_t kPolicyHold = 1U << 4;
 enum class Stage : uint32_t { Waiting=0, Ramping=1, Holding=2, Policy=3, Damped=4, Fault=5 };
 enum class Request : uint32_t { Wait=0, Prepare=1, Hold=2, Policy=3, Stop=4 };
 enum class Profile : uint32_t { Balance=0, Homie=1 };

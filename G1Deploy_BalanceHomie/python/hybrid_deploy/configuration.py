@@ -41,6 +41,11 @@ def load_config(root):
             raise ValueError('Invalid setting: '+key)
     if not 0 <= cfg['profile_transition_s'] <= 5:
         raise ValueError('profile_transition_s must be between 0 and 5 seconds (0: direct handoff)')
+    # A late policy command first holds the last leg targets with Balance PD;
+    # only a sustained gap removes support.
+    cfg.setdefault('command_hold_timeout_s', 2.0)
+    if not cfg['command_timeout_s'] < cfg['command_hold_timeout_s'] <= 10:
+        raise ValueError('command_hold_timeout_s must exceed command_timeout_s and be at most 10 s')
     if not 0 <= cfg['policy_target_speed_rad_s'] <= 20:
         raise ValueError('Invalid policy target speed (0: direct policy targets)')
     if not .02 <= cfg['command_filter_tau_s'] <= 2:

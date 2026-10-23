@@ -21,6 +21,9 @@ STAGES = dict(WAITING='等待接管', ACQUIRING='正在接管底层', ZERO='已�
               PREPARING='移到准备姿态', HOLDING='准备完成', POLICY='Balance / Homie 策略运行',
               DAMPED='阻尼停止（可重新接管网页）', FAULT='故障停止（可重新连接检查）', OBSERVE='只读同步')
 HAND_POSES = {1: 'open', 2: 'grasp', 3: 'open_compensated', 4: 'grasp_compensated'}
+# The policy runs at 50 Hz (20 ms). A tick starting more than 60 ms after the
+# previous one is logged; at 100 ms the C++ bridge enters its policy hold.
+TICK_LATE_S = .06
 
 
 class Controller:
@@ -76,6 +79,15 @@ class Controller:
         self.buttons = None
         self.policy_steps = 0
         self.ticks, self.results = deque(), deque()
+        self.tick_stats = dict(late=0, max_interval_ms=0., max_step_ms=0.)
+        self.bridge_hold = False
+        # Optional stage timer (navigation attaches one). Measurement only;
+        # None keeps Viser's control path unchanged.
+        self.timer = None
+
+    def _mark(self, stage):
+        if self.timer is not None:
+            self.timer.mark(stage)
 
     def record_event(self, **event):
         if self.recorder:
@@ -603,6 +615,7 @@ class Controller:
     def step(self):
         if self.high_policy is not None:
             self.high_policy.begin_tick(self.clock())
+        self._mark('camera_poll')
         self._poll_hand_file(self.backend.state)
         if self.stop_requested.is_set():
             self.damp(self.reason or '停止请求')
@@ -634,6 +647,7 @@ class Controller:
             self._events(state)
             return
         state = self.backend.read()
+        self._mark('state_read')
         now = self.clock()
         if state is None or state.sequence == 0:
             if now - self.backend.started > self.cfg['startup_timeout_s']:
@@ -754,6 +768,7 @@ class Controller:
         if entered_policy or self.zeroing or self.mode == 'observe':
             raw_command.fill(0)
         command_source = self.web.command_source if self.web.source == 'web' else 'MANUAL'
+        self._mark('events_command')
         high = self.high_policy
         high_sampled = None
         upper_transitioning = False
@@ -802,6 +817,7 @@ class Controller:
             high_sampled = self.clock()
             high.warm(state, self.observations.models['homie'].previous_action, now_motion,
                       previous_state=getattr(self.backend, 'previous_state', None))
+        self._mark('pushcart_high')
         velocity, heading = self.heading.update(
             state.quaternion, input_velocity, dt,
             active=self.mode != 'observe' and state.stage == p.POLICY and bool(state.flags & 1)
@@ -813,6 +829,13 @@ class Controller:
             command_source=command_source,
             smooth_zero=self.zeroing)
         timing_reason = '航向反馈正在重新对齐；速度归零，站立策略继续'
+        bridge_hold = bool(state.flags & p.POLICY_HOLD)
+        if bridge_hold != self.bridge_hold:
+            # The bridge held the legs because this thread's command was late.
+            # The late tick already blocks motion through the heading timing gap.
+            self.record_event(type='bridge_policy_hold', active=bridge_hold)
+            print('CONTROL bridge policy hold %s' % ('observed' if bridge_hold else 'cleared'), flush=True)
+            self.bridge_hold = bridge_hold
         if heading['motion_blocked']:
             self.web.zero()
             self.commands.value.fill(0)
@@ -834,15 +857,18 @@ class Controller:
         obs = actions = None
         inference_time = None
         inference_ms = latency_ms = None
+        self._mark('heading_select')
         if state.flags & 1:
             sampled = high_sampled if high_sampled is not None else self.clock()
             obs = self.observations.push(state, filtered_velocity, self.cfg['height_m'], self.cfg['torso_rpy_command'])
+            self._mark('observation')
             started = self.clock()
             # Keep the loaded pushcart estimator through a camera/grasp stop;
             # returning to ordinary walking explicitly restores original HIM.
             actions = self.policy(obs, filtered_velocity, state,
                                   pushcart=high is not None and (high.enabled or high.motion_blocked))
             finished = self.clock()
+            self._mark('balance_homie_onnx')
             inference_time = finished
             inference_ms = (finished - started) * 1000
             if high is not None and high.inferred:
@@ -866,6 +892,7 @@ class Controller:
             q = high.upper_target(q, stopping=high_stopping)
         if self.request == p.PREPARE:
             q = self.prepare_q.copy()
+        self._mark('compose_targets')
         if self.stop_requested.is_set():
             self.damp(self.reason or '停止请求')
             return
@@ -877,6 +904,7 @@ class Controller:
         self.backend.send(self.request, q, p.PROFILE_NAMES.index(self.policy.selected), self.hand_pose,
                           **send_options)
         command_finished = self.clock()
+        self._mark('bridge_send')
         if self.request == p.RUN and actions is not None and self.mode != 'observe':
             self.observations.record_action(executed_actions, self.policy.selected)
             if high is not None:
@@ -934,7 +962,11 @@ class Controller:
                                 state_age_ms=age * 1000,
                                 state_to_command_ms=(command_finished - state.received_ns * 1e-9) * 1000
                                     if self.backend.armed and self.mode != 'observe' else None,
-                                bridge_servo_hz=self.cfg['servo_hz']),
+                                bridge_servo_hz=self.cfg['servo_hz'],
+                                late_ticks=self.tick_stats['late'],
+                                max_tick_interval_ms=self.tick_stats['max_interval_ms'],
+                                max_step_ms=self.tick_stats['max_step_ms'],
+                                bridge_policy_hold=bool(state.flags & p.POLICY_HOLD)),
                     recording_error=self.recorder.error if self.recorder else '',
                     recording_dropped=self.recorder.dropped if self.recorder else 0)
         if high is not None:
@@ -944,6 +976,11 @@ class Controller:
             self.latest = data
         if self.recorder:
             self.recorder.record('telemetry', data)
+        if self.timer is not None:
+            self.timer.mark('telemetry')
+            if high is not None and high.inferred:
+                self.timer.value('pushcart_student_onnx', high.model.inference_ms)
+            self.timer.value('state_age_at_send', (command_finished - state.received_ns*1e-9) * 1000)
 
     def start(self):
         self.backend.start()
@@ -952,14 +989,45 @@ class Controller:
 
     def _run(self):
         deadline = self.clock()
+        previous_start = None
         while not self.shutdown.is_set():
+            started = time.monotonic()
+            timer = self.timer
+            if timer is not None:
+                timer.start()
             try:
                 self.step()
             except Exception as exc:
                 self.record_event(type='exception', error=repr(exc))
                 self.damp(str(exc), fault=True)
+            finished = time.monotonic()
+            if timer is not None:
+                if previous_start is not None:
+                    timer.value('tick_interval', (started - previous_start) * 1000)
+                timer.finish()
+            self._record_tick(started, finished, previous_start)
+            previous_start = started
             deadline = max(deadline + 1/self.cfg['policy_hz'], self.clock())
             self.shutdown.wait(max(0., deadline - self.clock()))
+
+    def _record_tick(self, started, finished, previous_start):
+        """The C++ bridge holds/damps when ticks stop; log every late one."""
+        interval = None if previous_start is None else started - previous_start
+        duration = finished - started
+        stats = self.tick_stats
+        stats['max_interval_ms'] = max(stats['max_interval_ms'], (interval or 0.) * 1000)
+        stats['max_step_ms'] = max(stats['max_step_ms'], duration * 1000)
+        late = interval is not None and interval > TICK_LATE_S
+        if late or duration > TICK_LATE_S:
+            stats['late'] += 1
+            event = dict(type='control_tick_late', interval_ms=None if interval is None else interval*1000,
+                         step_ms=duration*1000, stage=self.stage, count=stats['late'])
+            self.record_event(**event)
+            # Headless navigation has no recorder; keep it in launch.log.
+            print('CONTROL TICK late interval_ms=%s step_ms=%.1f stage=%s count=%d bridge_hold=%s'
+                  % ('-' if interval is None else '%.1f' % (interval*1000), duration*1000, self.stage,
+                     stats['late'], bool(self.backend.state is not None and self.backend.state.flags & p.POLICY_HOLD)),
+                  flush=True)
 
     def close(self):
         self.stop_requested.set()

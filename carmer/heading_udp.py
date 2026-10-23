@@ -29,13 +29,17 @@ def heading_packet(result):
                 position = origin + rotation @ np.asarray(pose['tvec_m'])
                 if position.shape == (3,) and np.isfinite(position).all():
                     positions.append(dict(id=int(tag['id']), position_m=position.tolist()))
+    reason = ('ok' if valid else compensation.get('reason', 'compensation_unavailable')
+              if compensation.get('valid') is not True else heading.get('reason', 'no_valid_heading'))
+    timing = {key: float(result[key]) for key in ('processing_ms', 'detection_ms', 'capture_fps', 'detect_fps')
+              if isinstance(result.get(key), (int, float)) and math.isfinite(result[key])}
     return dict(schema='carmer_cart_yaw_v1', captured_monotonic=stamp,
                 frame_number=int(result['frame_number']), valid=bool(valid),
                 reference_frame='pelvis_level', yaw_rad=float(yaw) if valid else None,
                 tag_ids=heading.get('tag_ids', []),
                 tags_in_pelvis=positions,
                 cart_pose_urdf=result.get('cart_pose_urdf'),
-                reason='ok' if valid else heading.get('reason', 'compensation_unavailable'))
+                reason=reason, timing=timing)
 
 
 class HeadingPublisher:

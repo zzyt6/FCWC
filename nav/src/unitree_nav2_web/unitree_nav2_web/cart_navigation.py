@@ -28,6 +28,29 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from .cart_geometry import CartGeometry, CartPoseHistory, GantryGeometry, load_settings, quaternion_matrix, rotation_z
 from .sample_timing import sample_time as acquisition_time
+from .stage_timing import StageTimer
+
+# Readiness = the stream keeps delivering new samples (receive gap) whose
+# acquisition is not excessively old. Measuring the gap from acquisition time
+# double-counts the scan duration, FAST-LIO processing and the 10 Hz period
+# (0.1-0.48 s in normal operation) and toggled readiness on every jitter.
+STREAM_GAP_S = .5
+MAX_ACQUISITION_AGE_S = 1.
+# Nearest-sample fallback when exact interpolation of the 50 Hz cart geometry
+# is unavailable. The grasped cart's pose relative to the pelvis changes slowly.
+CART_PAIRING_FALLBACK_S = .1
+# Forward localization scans to AMCL at ~10 Hz (obstacle scans follow the LiDAR rate).
+LOCALIZATION_SCAN_PERIOD_S = .095
+
+
+def stamp_age_ms(node, message):
+    """ROS-clock age of a host-aligned measurement stamp, for TIMING lines."""
+    stamp = message.header.stamp.sec*1000000000+message.header.stamp.nanosec
+    return (node.get_clock().now().nanoseconds-stamp)*1e-6
+
+
+def live(now, received):
+    return 0 <= now-received <= STREAM_GAP_S
 
 
 class PosePending(ValueError):
@@ -89,6 +112,9 @@ class CartNavigation(Node):
         self.odometry_error = ''
         self.received = self.last_base = self.last_filtered = self.last_scan = -math.inf
         self.last_raw = self.last_localization_scan = -math.inf
+        # Local receive times of the newest accepted samples (readiness).
+        self.base_received = self.filtered_received = self.scan_received = -math.inf
+        self.gantry_received = -math.inf
         self.localizing_without_cart = False
         self.previous = None
         self.odom_clock_stamped = None
@@ -152,6 +178,14 @@ class CartNavigation(Node):
             self.create_subscription(LaserScan, '/'+topic+'_unmasked',
                                      lambda msg, name=topic: self._scan(msg, name), sensor)
         self.timer = self.create_timer(.02, self._tick)
+        # Measurement only: callback wall times, logged as TIMING lines.
+        self.stage_timer = StageTimer('cart_navigation')
+        self.create_timer(2., self._log_timing)
+
+    def _log_timing(self):
+        line = self.stage_timer.report()
+        if line:
+            self.get_logger().info(line)
 
     def _fresh(self):
         now = time.monotonic()
@@ -195,10 +229,14 @@ class CartNavigation(Node):
 
     def _gantry_ready(self):
         now = time.monotonic()
-        return bool(not self.gantry.enabled or (now-self.last_gantry_filtered <= .5
-                                               and now-self.last_scan <= .5))
+        return bool(not self.gantry.enabled or (live(now, self.gantry_received)
+                                               and live(now, self.scan_received)))
 
     def _tick(self):
+        with self.stage_timer.measure('tick'):
+            self._tick_body()
+
+    def _tick_body(self):
         now = time.monotonic()
         for _ in range(64):
             try:
@@ -218,12 +256,15 @@ class CartNavigation(Node):
                     self.previous = None
                     self.velocity.fill(0)
                     self.last_filtered = self.last_scan = -math.inf
+                    self.filtered_received = self.scan_received = -math.inf
                 self.state, self.cart, self.received, self.epoch = state, cart, stamp, epoch
                 self.cart_history.add(cart)
             except (ValueError, TypeError, KeyError):
                 continue
-        self._publish_pending_clouds()
-        self._publish_pending_odometry()
+        with self.stage_timer.measure('tick_pending_clouds'):
+            self._publish_pending_clouds()
+        with self.stage_timer.measure('tick_pending_odometry'):
+            self._publish_pending_odometry()
         now = time.monotonic()
         attached = bool(self.cart.get('attached'))
         fresh = self._fresh()
@@ -231,9 +272,9 @@ class CartNavigation(Node):
                                         or now-self.last_gantry_clear > .2):
             self._expire_gantry_clear()
         footprint = self.geometry.footprint(self.cart, attached) if fresh else None
-        ready = fresh and now-self.last_base <= .5 and self.odom_epoch == self.epoch
+        ready = fresh and live(now, self.base_received) and self.odom_epoch == self.epoch
         if attached:
-            ready = ready and now-self.last_filtered <= .5 and now-self.last_scan <= .5
+            ready = ready and live(now, self.filtered_received) and live(now, self.scan_received)
         if not fresh:
             reason = ((self.cart.get('reason') or '小车航向或运控反馈已过期') if attached else '等待运控反馈')
         elif not ready:
@@ -247,26 +288,41 @@ class CartNavigation(Node):
                 publisher.publish(message)
         self.epoch_pub.publish(UInt32(data=self.epoch))
         self.ready_pub.publish(Bool(data=bool(ready)))
-        self.status_pub.publish(String(data=json.dumps(dict(
-            ready=bool(ready), epoch=self.epoch, mode='cart' if attached else 'walk',
-            reason=reason, footprint=footprint, cart=self.cart, cart_model=self.geometry.top_view,
-            odometry=self.navigation_odometry,
-            removed_points=self.removed_points,
-            gantry_filter=dict(enabled=self.gantry.enabled, frame=self.gantry.frame,
-                               ready=self._gantry_ready(), removed_points=self.gantry_removed_points,
-                               reason=self.gantry_error,
-                               boxes=[dict(min_m=low.tolist(), max_m=high.tolist())
-                                      for low, high in self.gantry.boxes]),
-            observations=dict(
-                raw_age_s=round(now-self.last_raw, 3) if math.isfinite(self.last_raw) else None,
-                filtered_age_s=round(now-self.last_filtered, 3) if math.isfinite(self.last_filtered) else None,
-                obstacle_scan_age_s=round(now-self.last_scan, 3) if math.isfinite(self.last_scan) else None,
-                localization_scan_age_s=round(now-self.last_localization_scan, 3)
-                if math.isfinite(self.last_localization_scan) else None,
-                localization_without_cart_filter=self.localizing_without_cart),
-            sent_monotonic=now), ensure_ascii=False)))
+        def age(stamp):
+            return round(now-stamp, 3) if math.isfinite(stamp) else None
+        try:
+            status = json.dumps(dict(
+                ready=bool(ready), epoch=self.epoch, mode='cart' if attached else 'walk',
+                reason=reason, footprint=footprint, cart=self.cart, cart_model=self.geometry.top_view,
+                odometry=self.navigation_odometry,
+                removed_points=self.removed_points,
+                gantry_filter=dict(enabled=self.gantry.enabled, frame=self.gantry.frame,
+                                   ready=self._gantry_ready(), removed_points=self.gantry_removed_points,
+                                   reason=self.gantry_error,
+                                   boxes=[dict(min_m=low.tolist(), max_m=high.tolist())
+                                          for low, high in self.gantry.boxes]),
+                observations=dict(
+                    raw_age_s=age(self.last_raw),
+                    filtered_age_s=age(self.last_filtered),
+                    obstacle_scan_age_s=age(self.last_scan),
+                    localization_scan_age_s=age(self.last_localization_scan),
+                    base_gap_s=age(self.base_received),
+                    filtered_gap_s=age(self.filtered_received),
+                    obstacle_scan_gap_s=age(self.scan_received),
+                    localization_without_cart_filter=self.localizing_without_cart),
+                sent_monotonic=now), ensure_ascii=False,
+                default=lambda value: value.tolist() if isinstance(value, np.ndarray) else value.item())
+        except (TypeError, ValueError, AttributeError) as exc:
+            # A diagnostic field must never take down the filter and odometry
+            # chain. The safety signals (ready/epoch) were already published.
+            status = json.dumps(dict(ready=False, epoch=self.epoch, mode='cart' if attached else 'walk',
+                                     reason='导航参考状态序列化失败：' + str(exc)[:120],
+                                     sent_monotonic=now), ensure_ascii=False)
+        self.status_pub.publish(String(data=status))
 
     def _receive_odom(self, message):
+        # /Odometry_base keeps the host-aligned scan-END time: FAST-LIO + base kinematics.
+        self.stage_timer.record('latency_odom_in', stamp_age_ms(self, message))
         self.pending_odometry.append((time.monotonic(), self.epoch, message))
         self._publish_pending_odometry()
 
@@ -274,29 +330,43 @@ class CartNavigation(Node):
         while self.pending_odometry:
             received, epoch, message = self.pending_odometry[0]
             now = time.monotonic()
-            if epoch != self.epoch or now-received > .3:
+            if epoch != self.epoch or now-received > STREAM_GAP_S:
                 self.pending_odometry.popleft()
                 continue
             cart = self.cart
             if cart.get('attached'):
                 stamp = message.header.stamp.sec+message.header.stamp.nanosec*1e-9
                 sample_monotonic = now + stamp-self.get_clock().now().nanoseconds*1e-9
-                if not 0 <= now-sample_monotonic <= .5:
+                if not 0 <= now-sample_monotonic <= MAX_ACQUISITION_AGE_S:
                     self.odometry_error = '导航里程计测量时刻已过期'
                     self.pending_odometry.popleft()
                     continue
                 cart = self.cart_history.at(sample_monotonic)
-                if cart is None:
+                if cart is None and self.cart_history.can_wait(sample_monotonic) and now-received < .2:
+                    # Camera/arm geometry commonly trails LiDAR odometry.
                     self.odometry_error = '等待里程计测量时刻的小车位姿'
-                    if not self.cart_history.can_wait(sample_monotonic):
-                        self.pending_odometry.popleft()
-                        continue
                     break
+                if cart is None:
+                    # The hand-held cart moves slowly relative to the pelvis.
+                    # Use the nearest real geometry sample rather than stalling
+                    # the whole navigation odometry on one missing pairing.
+                    cart = self.cart_history.nearest(sample_monotonic, CART_PAIRING_FALLBACK_S)
+                if cart is None:
+                    self.odometry_error = '缺少里程计测量时刻附近的小车位姿'
+                    self.pending_odometry.popleft()
+                    continue
             self.pending_odometry.popleft()
+            # Including the wait for cart geometry at the scan time (pairing).
+            self.stage_timer.record('latency_odom_out', stamp_age_ms(self, message))
+            self.stage_timer.record('pairing_wait', (now-received)*1000)
             self._odom(message, cart)
 
     def _odom(self, message, cart=None):
-        sampled = acquisition_time(self, message, .5)
+        with self.stage_timer.measure('odometry'):
+            self._odom_body(message, cart)
+
+    def _odom_body(self, message, cart=None):
+        sampled = acquisition_time(self, message, MAX_ACQUISITION_AGE_S)
         if sampled is None:
             self.odometry_error = '导航里程计测量时刻已过期或无效'
             return
@@ -319,7 +389,7 @@ class CartNavigation(Node):
             pose = np.array([position[0], position[1], heading])
             # The base and relative geometry now describe the same acquisition
             # time. Differentiate in the world frame, then rotate the filtered
-            # velocity into the current cart frame for DWB.
+            # velocity into the current cart frame for the controller.
             stamped = bool(message.header.stamp.sec or message.header.stamp.nanosec)
             sample_time = (message.header.stamp.sec+message.header.stamp.nanosec*1e-9
                            if stamped else now)
@@ -382,6 +452,7 @@ class CartNavigation(Node):
                 transform.transform.rotation.z = math.sin(angle/2)
                 self.broadcaster.sendTransform(transform)
             self.last_base, self.odom_epoch = sampled, self.epoch
+            self.base_received = time.monotonic()
             self.odometry_error = ''
         except (ValueError, KeyError, TypeError):
             return
@@ -390,12 +461,17 @@ class CartNavigation(Node):
         received = time.monotonic()
         if self.lidar_clock is not None and 0 <= received-self.lidar_clock[1] <= .3:
             sampled = message.header.stamp.sec+message.header.stamp.nanosec*1e-9+self.lidar_clock[0]
-            if not -.03 <= received-sampled <= .5:
+            # Latency from the frame START (header) to arrival: frame span + driver + adapter.
+            self.stage_timer.record('latency_raw_cloud', (received-sampled)*1000)
+            if not -.03 <= received-sampled <= MAX_ACQUISITION_AGE_S:
+                # Diagnose only. Dropping raw returns here would also starve
+                # FAST-LIO; filtering below decides what it can still use.
                 self.filter_error = '雷达采样时刻已过期或超前'
-                return
-            self.last_raw = sampled
+            else:
+                self.last_raw = sampled
         self.pending_clouds.append((received, self.epoch, message))
-        self._publish_pending_clouds()
+        with self.stage_timer.measure('cloud_callback'):
+            self._publish_pending_clouds()
 
     def _publish_pending_clouds(self):
         while self.pending_clouds:
@@ -412,9 +488,15 @@ class CartNavigation(Node):
             wait = time.monotonic()-received < .2 and len(self.pending_clouds) < 16
             if not self._filter_cloud(message, wait=wait):
                 break
+            # Queue time of this frame (cart geometry wait plus filtering).
+            self.stage_timer.record('cloud_wait', (time.monotonic()-received)*1000)
             self.pending_clouds.popleft()
 
     def _filter_cloud(self, message, wait=False):
+        with self.stage_timer.measure('cloud_filter'):
+            return self._filter_cloud_body(message, wait)
+
+    def _filter_cloud_body(self, message, wait=False):
         attached, fresh = self.cart.get('attached'), self._fresh()
         points = records = groups = None
         if wait and attached and fresh:
@@ -440,7 +522,7 @@ class CartNavigation(Node):
                     return False
                 if self.gantry.enabled:
                     self.gantry_error = '后方区域清空暂不可用：' + str(exc)
-                    self.last_gantry_filtered = -math.inf
+                    self.last_gantry_filtered = self.gantry_received = -math.inf
                     self._expire_gantry_clear()
                 if attached:
                     self.filter_error = '车体点云过滤等待有效坐标：' + str(exc)
@@ -450,8 +532,12 @@ class CartNavigation(Node):
                 cart_points = np.empty_like(points)
                 for indices, stamp in groups:
                     cart = self.cart_history.at(stamp)
-                    if cart is None:
+                    if cart is None and wait and self.cart_history.can_wait(stamp):
                         raise PosePending('等待雷达采样时刻的小车位姿')
+                    if cart is None:
+                        cart = self.cart_history.nearest(stamp, CART_PAIRING_FALLBACK_S)
+                    if cart is None:
+                        raise ValueError('缺少雷达采样时刻附近的小车位姿')
                     leveled = points[indices] @ np.asarray(cart['body_rotation']).T
                     rotation = np.asarray(cart['rotation']) if 'rotation' in cart else rotation_z(cart['yaw'])
                     cart_points[indices] = (leveled-cart['position']) @ rotation
@@ -463,17 +549,22 @@ class CartNavigation(Node):
                 self.filter_error = '车体点云过滤等待有效坐标：' + str(exc)
         if points is not None:
             keep = np.ones(len(points), dtype=bool)
+            newest = max((stamp for _, stamp in groups), default=-math.inf)
             if self.gantry.enabled:
                 keep &= ~self.gantry.self_mask(points)
                 self.gantry_removed_points = int((~keep).sum())
-                self.last_gantry_filtered, self.gantry_error = min((stamp for _, stamp in groups), default=-math.inf), ''
+                self.last_gantry_filtered, self.gantry_error = newest, ''
+                self.gantry_received = time.monotonic()
             if cart_keep is not None:
                 self.removed_points = int((keep & ~cart_keep).sum())
                 keep &= cart_keep
             message = filtered_cloud(message, records, keep)
         if not attached or cart_keep is not None:
             if attached:
-                self.last_filtered, self.filter_error = min((stamp for _, stamp in groups), default=-math.inf), ''
+                self.last_filtered, self.filter_error = newest, ''
+                self.filtered_received = time.monotonic()
+                # Scan END to FAST-LIO input, including any wait for cart geometry.
+                self.stage_timer.record('latency_filtered_cloud', (self.filtered_received-newest)*1000)
             self.localizing_without_cart = False
             self.cloud_pub.publish(message)
         else:
@@ -510,7 +601,7 @@ class CartNavigation(Node):
             self._prepared_cloud = cached
         _, xyz, records, offsets, relative_groups = cached
         start = message.header.stamp.sec+message.header.stamp.nanosec*1e-9+clock[0]
-        if len(offsets) and (now-start-offsets.min() > .5 or start+offsets.max()-now > .03):
+        if len(offsets) and (now-start-offsets.min() > MAX_ACQUISITION_AGE_S or start+offsets.max()-now > .03):
             raise ValueError('雷达采样时刻已过期或超前')
         return xyz, records, [(indices, start+offset) for indices, offset in relative_groups]
 
@@ -519,9 +610,14 @@ class CartNavigation(Node):
         mounts, points = [], np.empty_like(xyz)
         for _, stamp in groups:
             mount = self.mount_history.at(stamp)
+            if mount is None and self.mount_history.can_wait(stamp):
+                raise PosePending('等待雷达采样时刻的安装位姿')
             if mount is None:
-                error = PosePending if self.mount_history.can_wait(stamp) else ValueError
-                raise error('等待雷达采样时刻的安装位姿')
+                # Waist joints move slowly; a short feedback hole must not
+                # discard the whole scan from filtering and avoidance.
+                mount = self.mount_history.nearest(stamp, CART_PAIRING_FALLBACK_S)
+            if mount is None:
+                raise ValueError('缺少雷达采样时刻附近的安装位姿')
             mounts.append(mount)
         # Check the entire scan's history before doing point transforms. A
         # pending tail must not repeatedly transform all earlier points.
@@ -553,21 +649,31 @@ class CartNavigation(Node):
         self.cloud_pub.publish(message)
 
     def _scan(self, message, topic):
-        sampled = acquisition_time(self, message, .5, stream=topic)
+        with self.stage_timer.measure(topic + '_mask'):
+            self._scan_body(message, topic)
+
+    def _scan_body(self, message, topic):
+        sampled = acquisition_time(self, message, MAX_ACQUISITION_AGE_S, stream=topic)
         if sampled is None:
             self.scan_error = '扫描测量时刻已过期、重复或无效'
             return
         localization = topic == 'scan_localization'
+        if localization and sampled-self.last_localization_scan < LOCALIZATION_SCAN_PERIOD_S:
+            # AMCL (5000 particles x 360 beams) cannot keep up with 50 Hz
+            # direct-Livox scans; it fell 0.3-0.7 s behind and starved the
+            # navigation cores. Each forwarded scan already merges 100 ms.
+            return
         if self.cart.get('attached'):
             cart = None
-            if self._fresh() and not self.localizing_without_cart:
-                now = time.monotonic()
-                age = (self.get_clock().now().nanoseconds
-                       - Time.from_msg(message.header.stamp).nanoseconds)*1e-9
-                if 0. <= age <= .5:
-                    cart = self.cart_history.at(now-age)
+            # An obstacle scan from an unfiltered raw frame may still contain
+            # cart-body returns; localization scans keep all real returns.
+            if self._fresh() and (localization or not self.localizing_without_cart):
+                # Each scan masks the cart with the geometry at its own
+                # acquisition time; nearest real sample if not interpolable.
+                cart = (self.cart_history.at(sampled)
+                        or self.cart_history.nearest(sampled, CART_PAIRING_FALLBACK_S))
             if cart is None:
-                self.scan_error = '等待扫描测量时刻的小车位姿'
+                self.scan_error = '缺少扫描测量时刻附近的小车位姿'
                 if not localization:
                     return
             else:
@@ -587,6 +693,7 @@ class CartNavigation(Node):
             self.last_localization_scan = sampled
         else:
             self.last_scan = sampled
+            self.scan_received = time.monotonic()
         if not localization and self.gantry.enabled and self._gantry_ready() and self._fresh():
             # This is an explicit ignore region, not a physical free-space
             # measurement. Stock Nav2 uses it for clearing only. The origin

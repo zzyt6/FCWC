@@ -35,7 +35,18 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
     add_definitions(-DMP_PROC_NUM=1)
   endif()
 else()
-  add_definitions(-DMP_PROC_NUM=1)
+  # ARM (Jetson Orin): the upstream file only enabled OpenMP on x86, leaving
+  # the per-point nearest-neighbour search single-threaded. At 50 Hz LiDAR a
+  # single core could not finish each frame within 20 ms.
+  include(ProcessorCount)
+  ProcessorCount(N)
+  if(N GREATER 4)
+    add_definitions(-DMP_EN)
+    add_definitions(-DMP_PROC_NUM=2)
+    message("core for MP: 2")
+  else()
+    add_definitions(-DMP_PROC_NUM=1)
+  endif()
 endif()
 
 find_package(OpenMP QUIET)

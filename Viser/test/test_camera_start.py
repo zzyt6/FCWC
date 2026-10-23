@@ -18,6 +18,8 @@ class CameraStartTests(unittest.TestCase):
                 camera.publish_cart_pose = publish
                 camera.quad_decimate = 1.5
                 camera.missing_tag_dir = Path('/tmp/navigation-missing-tags') if publish else None
+                # Navigation pins the camera away from the policy/bridge cores.
+                camera.cpus = {4, 5} if publish else None
                 process = Mock()
                 process.poll.return_value = None
                 try:
@@ -27,6 +29,11 @@ class CameraStartTests(unittest.TestCase):
                         camera.start()
                         launch.assert_called_once()
                         command = launch.call_args.args[0]
+                        self.assertEqual(command[:3] == ['taskset', '-c', '4,5'], publish)
+                        # One OpenCV detection thread per pinned core; Viser keeps the default.
+                        self.assertEqual('--opencv-threads' in command, publish)
+                        if publish:
+                            self.assertEqual(command[command.index('--opencv-threads')+1], '2')
                         self.assertEqual('--publish-cart-pose' in command, publish)
                         self.assertEqual(command[command.index('--cart-tag-ids')+1:][:2], ['0', '1'])
                         if publish:

@@ -38,8 +38,14 @@ from .sample_timing import sample_time
 FOOTPRINT = "[[-0.30, -0.25], [-0.30, 0.25], [0.32, 0.25], [0.32, -0.25]]"
 # The motion gate refuses to open unless our own locomotion executor reports
 # a running policy within this age.  It is also re-checked every status tick.
+# Leaving POLICY (damping, fault, L2) or losing the executor closes quickly.
 LOCOMOTION_READY_GRACE_S = 0.6
-REFERENCE_READY_GRACE_S = 0.6
+# Brief readiness gaps (sensor jitter, camera hold, heading re-alignment)
+# only pause velocity: g1_cmd_vel_udp sends zero at once and the executor
+# keeps the standing policy. Navigation resumes when readiness returns.
+# Only a sustained gap cancels the task and closes the gate.
+TRANSIENT_PAUSE_LIMIT_S = 3.0
+REFERENCE_READY_GRACE_S = TRANSIENT_PAUSE_LIMIT_S
 AMCL_REFRESH_AFTER_S = 0.5
 
 
@@ -167,6 +173,11 @@ class NavigationWebBridge(Node):
         self.next_nomotion_update_time = 0.0
         self.locomotion_not_ready_since = 0.0
         self.bitmap_last_publish = {}
+        self.render_condition = threading.Condition()
+        self.render_pending = {}
+        self.render_stop = False
+        self.render_thread = threading.Thread(target=self._render_worker, name='costmap-render', daemon=True)
+        self.render_thread.start()
         self.path_stats = {
             "global": {"points": 0, "source_frame": ""},
             "local": {"points": 0, "source_frame": ""},
@@ -258,12 +269,15 @@ class NavigationWebBridge(Node):
             lambda msg: self._path_callback("global", msg),
             10,
         )
-        self.create_subscription(
-            NavigationPath,
-            "/local_plan",
-            lambda msg: self._path_callback("local", msg),
-            10,
-        )
+        # Walking (DWB) publishes its chosen rollout on /local_plan; the cart's
+        # pure pursuit publishes the commanded arc it collision-checks.
+        for topic in ("/local_plan", "/lookahead_collision_arc"):
+            self.create_subscription(
+                NavigationPath,
+                topic,
+                lambda msg: self._path_callback("local", msg),
+                10,
+            )
 
         self.map_parameter_client = self.create_client(
             SetParameters, "/map_server/set_parameters"
@@ -382,7 +396,9 @@ class NavigationWebBridge(Node):
         try:
             reference = json.loads(message.data)
             stamp = float(reference['sent_monotonic'])
-            if not 0 <= time.monotonic()-stamp <= .3 or stamp <= self.reference_received:
+            # Accept a status queued during a brief stall of this UI process;
+            # it still cannot replace a newer one.
+            if not 0 <= time.monotonic()-stamp <= 1. or stamp <= self.reference_received:
                 return
         except (ValueError, KeyError, TypeError):
             return
@@ -463,25 +479,36 @@ class NavigationWebBridge(Node):
             pass
 
     def _cart_map_pose(self, cart):
-        if not cart.get('valid') or not self.current_pose:
-            return None
+        # This cache belongs only to the map drawing, never to navigation/TF.
+        key = (cart.get('epoch'), cart.get('pose_source'),
+               getattr(self, 'selected_map', None), getattr(self, 'amcl_generation', None))
+        if key != getattr(self, '_cart_display_key', None) or not cart.get('attached', True):
+            self._cart_display_key, self._cart_display_pose = key, None
+        now = time.monotonic()
+        reason = cart.get('reason') or '小车航向或地图位姿已过期'
         try:
             # AMCL pose messages arrive only on localization updates. Combining
             # the last such pose with live cart geometry mixes acquisition times
-            # and can draw a different heading from the one DWB actually uses.
+            # and can draw a different heading from the one the controller actually uses.
             # cart_nav is published alongside nav_control from the matched state.
+            if not cart.get('valid') or not self.current_pose or not cart.get('attached', True):
+                raise ValueError('No current cart observation')
             transform = self.tf_buffer.lookup_transform('map', 'cart_nav', Time())
             age = (self.get_clock().now().nanoseconds
                    - Time.from_msg(transform.header.stamp).nanoseconds)*1e-9
             if not 0. <= age <= .5:
-                return None
+                raise ValueError('Stale cart transform')
             translation, rotation = transform.transform.translation, transform.transform.rotation
             yaw = math.atan2(2*(rotation.w*rotation.z + rotation.x*rotation.y),
                              1-2*(rotation.y**2 + rotation.z**2))
-            return dict(x=translation.x, y=translation.y, yaw=yaw,
-                        position_source=cart.get('position_source'))
+            pose = dict(x=translation.x, y=translation.y, yaw=yaw,
+                        position_source=cart.get('position_source'), sample_monotonic=now-age)
+            self._cart_display_pose = pose
+            return dict(pose, fresh=True, age_s=age, reason='')
         except Exception:
-            return None
+            pose = getattr(self, '_cart_display_pose', None)
+            return (dict(pose, fresh=False, age_s=max(0., now-pose['sample_monotonic']), reason=reason)
+                    if pose is not None else None)
 
     def status(self):
         now = time.monotonic()
@@ -1256,7 +1283,11 @@ class NavigationWebBridge(Node):
                     # during a humanoid step or particle correction and must
                     # persist for three consecutive updates before stopping.
                     hard_jump = sample_distance > 0.45 or sample_yaw_delta > 0.60
-                    rate_spike = linear_rate > 1.0 or angular_rate > 1.5
+                    # base_nav follows the pelvis, which sways with every step:
+                    # 2026-10-21 pushing at 0.3 m/s its yaw rate between scans
+                    # reached 2.32 rad/s (p90 1.57) and three samples above the
+                    # former 1.5 rad/s limit cancelled a goal as a "fault".
+                    rate_spike = linear_rate > 1.0 or angular_rate > 3.0
             self.last_localization_sample = (now, x, y, yaw)
             covariance_good = (
                 math.isfinite(covariance_xy)
@@ -1596,14 +1627,19 @@ class NavigationWebBridge(Node):
         with self.lock:
             acknowledged = bool(message.data)
             was_authorized = self.motion_requested or self.motion_enabled
+            self.motion_requested_before_ack = self.motion_requested
             if acknowledged and (
                 not self.motion_requested
                 or not self.map_ready
                 or not self.localized
                 or bool(self.localization_fault)
+                # Not-ready/unhealthy while online in POLICY is the transient
+                # case _status_timer pauses for up to TRANSIENT_PAUSE_LIMIT_S.
+                # 2026-10-21 one 80 ms control tick (stale feedback, healthy
+                # false) rejected this acknowledgement and cancelled a goal.
                 or (not locomotion_ready and not (
                     self.motion_enabled and locomotion.get('online')
-                    and locomotion.get('healthy') and locomotion.get('stage') == 'POLICY'
+                    and locomotion.get('stage') == 'POLICY'
                     and not (locomotion.get('high_policy') or {}).get('motion_blocked')))
             ):
                 # Never allow a delayed enable acknowledgement to reopen the
@@ -1611,6 +1647,15 @@ class NavigationWebBridge(Node):
                 self.motion_enabled = False
                 self.motion_requested = False
                 force_disable = True
+                # This closes the gate during a goal; record which check failed.
+                checks = dict(requested=self.motion_requested_before_ack, map_ready=self.map_ready,
+                              localized=self.localized, localization_fault=self.localization_fault,
+                              locomotion_ready=locomotion_ready, online=locomotion.get('online'),
+                              healthy=locomotion.get('healthy'), stage=locomotion.get('stage'),
+                              status_age_s=locomotion.get('age_s'),
+                              motion_blocked=(locomotion.get('high_policy') or {}).get('motion_blocked'))
+                self.get_logger().warning('Motion gate acknowledgement rejected: ' +
+                                          json.dumps(checks, ensure_ascii=False, default=str))
             else:
                 self.motion_enabled = acknowledged
                 self.motion_requested = acknowledged
@@ -2095,6 +2140,25 @@ class NavigationWebBridge(Node):
         if now - self.bitmap_last_publish.get(layer, 0.0) < interval:
             return
         self.bitmap_last_publish[layer] = now
+        # PNG encoding of a large costmap takes ~100 ms. Render on a separate
+        # thread so display never delays this node's safety callbacks; keep
+        # only the newest pending map per layer.
+        with self.render_condition:
+            self.render_pending[layer] = message
+            self.render_condition.notify()
+
+    def _render_worker(self):
+        while True:
+            with self.render_condition:
+                while not self.render_pending and not self.render_stop:
+                    self.render_condition.wait()
+                if self.render_stop:
+                    return
+                layer = next(iter(self.render_pending))
+                message = self.render_pending.pop(layer)
+            self._render_grid(layer, message)
+
+    def _render_grid(self, layer, message):
         try:
             source_frame = (message.header.frame_id or "map").lstrip("/")
             origin_x = float(message.info.origin.position.x)
@@ -2347,13 +2411,20 @@ class NavigationWebBridge(Node):
                 self.locomotion_not_ready_since = 0.0
             elif self.locomotion_not_ready_since <= 0.0:
                 self.locomotion_not_ready_since = now
-            # One stale status sample must not drop a running task; a stopped
-            # or disconnected executor closes the gate within the grace time.
+            # The body policy has stopped (damping/fault/L2) or the executor
+            # vanished: close after one stale-packet debounce. Any other
+            # not-ready state (cart camera hold, heading re-alignment, upper
+            # gain blend, smooth zero) only pauses velocity; the executor
+            # already refuses motion while not ready.
+            locomotion_stopped = (
+                not locomotion.get("online")
+                or locomotion.get("stage") != "POLICY"
+            )
+            grace = LOCOMOTION_READY_GRACE_S if locomotion_stopped else TRANSIENT_PAUSE_LIMIT_S
             locomotion_lost = (
                 gate_open
                 and self.locomotion_not_ready_since > 0.0
-                and now - self.locomotion_not_ready_since
-                >= LOCOMOTION_READY_GRACE_S
+                and now - self.locomotion_not_ready_since >= grace
             )
         if sensor_lost:
             self._handle_localization_fault("点云或里程计数据超时")
@@ -2383,7 +2454,8 @@ class NavigationWebBridge(Node):
                 self._set_motion(False)
         # Motion authorization is a lease rather than a one-shot latch.  If
         # this bridge stops running, the downstream node independently closes
-        # its gate and keeps publishing zero velocity.
+        # its gate and keeps publishing zero velocity. Keep renewing through a
+        # transient pause; the executor and UDP gate hold zero until ready.
         with self.lock:
             renew_motion = (
                 self.motion_requested
@@ -2391,7 +2463,8 @@ class NavigationWebBridge(Node):
                 and self.map_ready
                 and self.localized
                 and not self.localization_fault
-                and locomotion["ready"]
+                and locomotion.get("online")
+                and locomotion.get("stage") == "POLICY"
             )
             # A concurrent stop must not be followed by an older renewal.
             if renew_motion:
@@ -2498,6 +2571,9 @@ class NavigationWebBridge(Node):
 
     def destroy_node(self):
         self._set_motion(False)
+        with self.render_condition:
+            self.render_stop = True
+            self.render_condition.notify()
         self._stop_amcl_process()
         self.http_server.shutdown()
         self.http_server.server_close()

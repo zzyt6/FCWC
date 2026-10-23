@@ -1,5 +1,12 @@
-<library path="navigation_speed">
-  <class type="unitree_nav2_core::ApproachDWBLocalPlanner" base_class_type="nav2_core::Controller">
-    <description>DWB with a distance-based speed cap before trajectory prediction.</description>
-  </class>
-</library>
+<class_libraries>
+  <library path="navigation_speed">
+    <class type="unitree_nav2_core::ApproachDWBLocalPlanner" base_class_type="nav2_core::Controller">
+      <description>DWB with a distance-based speed cap before trajectory prediction.</description>
+    </class>
+  </library>
+  <library path="cart_pure_pursuit">
+    <class type="unitree_nav2_core::CartPurePursuitController" base_class_type="nav2_core::Controller">
+      <description>Foxy Regulated Pure Pursuit with live speed, final approach and footprint check for the cart.</description>
+    </class>
+  </library>
+</class_libraries>

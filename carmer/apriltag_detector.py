@@ -28,6 +28,10 @@ The legacy fixed mode uses --waist-yaw-deg and does not level against gravity.
 Use --cart-tag-id for one tag or --cart-tag-ids for a group (the deployed cart uses 0 and 1).
 Quad detection uses 2x internal downsampling by default. Camera frames and
 returned coordinates stay at 640x480; use --quad-decimate 1 for small/distant tags.
+With cart tag IDs, each frame is searched only in an 8 px-aligned window around the
+cart tags of the previous frame (same corners as a full search, ~7 ms instead of
+~20 ms, so detection keeps up with 60 FPS); any tracked tag missing from the window
+re-searches that same frame in full. --no-tag-window always searches in full.
 Pose axes use an adaptive low-pass filter by default to reduce small frame-to-frame
 jitter while following larger motion; use --no-smoothing for raw pose output.
 Camera X/Y translation follows motion faster, with independent filtering for Z
@@ -96,7 +100,7 @@ TIMING_CONVENTION = {
     "detection_ms": "Current frame: grayscale conversion, tag detection and raw pose/RPY estimation for all tags",
     "processing_ms": "Current frame: detection_ms plus pose smoothing, state alignment/URDF/pelvis tilt, per-tag cart headings and circular yaw fusion",
     "excluded": "Waiting for camera frames, annotation, image saving, display and X11/network transport",
-    "stage_timings_ms": "Optional --profile wall times per frame; read_wait is waiting for a new captured frame, not camera read duration; tag includes quad search, corner refinement and decoding; pose includes PnP refinement, RPY and axis projection",
+    "stage_timings_ms": "Optional --profile wall times per frame; read_wait is waiting for a new captured frame, not camera read duration; tag includes quad search, corner refinement and decoding; pose includes PnP refinement, RPY and axis projection; cart_pose is the URDF joint-PnP cart pose (only with --publish-cart-pose)",
 }
 
 
@@ -373,10 +377,59 @@ def make_detector(quad_decimate=DEFAULT_QUAD_DECIMATE):
     return cv2.aruco.ArucoDetector(dictionary, params)
 
 
-def detect_tags(detector, frame, pose_estimator=None, *, stage_timings=None):
+class TagWindow:
+    """Search only around the cart tags found in the previous frame.
+
+    The window snaps to an ALIGN-pixel grid so AprilTag quad decimation and
+    threshold tiles sample the same pixels as a full-image search; recorded cart
+    frames give bit-identical corners. If a tracked tag is missing, the caller
+    searches the same frame in full, so the window never drops a detection.
+    While only some cart tags are tracked, every FULL_EVERY-th frame is also
+    searched in full to pick up the others.
+    """
+    ALIGN = 8
+    FULL_EVERY = 30
+
+    def __init__(self, tag_ids, margin_px=48, margin_scale=0.5):
+        self.tag_ids = frozenset(tag_ids)
+        self.margin_px, self.margin_scale = margin_px, margin_scale
+        self.corners = {}
+        self.partial_frames = 0
+
+    def region(self, shape):
+        if not self.corners:
+            return None
+        if self.corners.keys() != self.tag_ids:
+            self.partial_frames += 1
+            if self.partial_frames % self.FULL_EVERY == 0:
+                return None
+        points = np.vstack(list(self.corners.values()))
+        low, high = points.min(axis=0), points.max(axis=0)
+        tag_size = max(float(np.ptp(quad, axis=0).max()) for quad in self.corners.values())
+        margin = max(self.margin_px, self.margin_scale * tag_size)
+        x0, y0 = (np.maximum(low - margin, 0) // self.ALIGN * self.ALIGN).astype(int)
+        x1, y1 = np.minimum(-(-(high + margin) // self.ALIGN) * self.ALIGN, (shape[1], shape[0])).astype(int)
+        return int(x0), int(y0), int(x1), int(y1)
+
+    def covers(self, tags):
+        """True when every tracked tag was found again inside the window."""
+        return self.corners.keys() <= {tag['id'] for tag in tags}
+
+    def update(self, tags):
+        self.corners = {tag['id']: np.asarray(tag['corners_px']) for tag in tags if tag['id'] in self.tag_ids}
+        if self.corners.keys() == self.tag_ids:
+            self.partial_frames = 0
+
+
+def detect_tags(detector, frame, pose_estimator=None, *, stage_timings=None, region=None):
+    """region=(x0, y0, x1, y1) searches only that window; coordinates stay full-image."""
     if stage_timings is not None:
         started = time.perf_counter()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    offset = np.zeros(2, dtype=np.float32)
+    if region is not None:
+        x0, y0, x1, y1 = region
+        gray, offset = gray[y0:y1, x0:x1], np.array([x0, y0], dtype=np.float32)
     if stage_timings is not None:
         gray_done = time.perf_counter()
         stage_timings['gray'] = (gray_done - started) * 1000
@@ -388,7 +441,7 @@ def detect_tags(detector, frame, pose_estimator=None, *, stage_timings=None):
     tags = []
     if ids is not None:
         for tag_id, quad in zip(ids.ravel(), corners):
-            points = quad.reshape(4, 2).astype(np.float32)
+            points = quad.reshape(4, 2).astype(np.float32) + offset
             # Project the square's center: averaging corners is biased under perspective.
             transform = cv2.getPerspectiveTransform(
                 np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32), points
@@ -417,6 +470,13 @@ def format_profile(label, samples):
         durations = [sample[name] for sample in samples]
         values.append(f"{name}={np.mean(durations):.2f}/{np.percentile(durations, 95):.2f}")
     return f"Profile {label} (last {len(samples)} frames, mean/p95 ms): " + " | ".join(values)
+
+
+def reader_profile(reader):
+    """Capture-thread cap.read() wall times (USB wait + color conversion)."""
+    with reader.condition:
+        samples = [{'cap_read': value} for value in reader.read_ms]
+    return format_profile('capture', samples)
 
 
 def format_fused_heading(heading):
@@ -592,12 +652,18 @@ class DetectionWorker:
     """Keep only the latest completed image/result pair instead of queuing stale frames."""
 
     def __init__(self, reader, detector, pose_estimator=None, pose_smoother=None, cart_heading_estimator=None, *, profile=False,
-                 pelvis_compensator=None, heading_smoother=None, cart_pose_estimator=None, missing_tag_frames=None):
+                 pelvis_compensator=None, heading_smoother=None, cart_pose_estimator=None, missing_tag_frames=None,
+                 tag_window=False):
         self.reader = reader
         self.detector = detector
+        # The window tracks cart tags only; without a cart ID set every frame is searched in full.
+        cart_ids = getattr(cart_heading_estimator, 'cart_tag_ids', None)
+        self.tag_window = TagWindow(cart_ids) if tag_window and cart_ids else None
+        self.search_counts = dict(full=0, window=0, window_fallback=0)
         self.detector_settings = {
             "quad_decimate": float(detector.getDetectorParameters().aprilTagQuadDecimate),
             "opencv_threads": cv2.getNumThreads(),
+            "tag_window": self.tag_window is not None,
         }
         self.pose_estimator = pose_estimator
         self.pose_smoother = pose_smoother
@@ -635,7 +701,20 @@ class DetectionWorker:
                     stages['read_wait'] = (time.perf_counter() - wait_started) * 1000
                 previous, frame, capture_fps, frame_timestamp = source
                 started = time.monotonic()
-                tags = detect_tags(self.detector, frame, self.pose_estimator, stage_timings=stages)
+                region = self.tag_window.region(frame.shape) if self.tag_window is not None else None
+                tags = detect_tags(self.detector, frame, self.pose_estimator, stage_timings=stages, region=region)
+                search = 'full' if region is None else 'window'
+                if region is not None and not self.tag_window.covers(tags):
+                    window_stages = stages
+                    stages = {} if stages is not None else None
+                    tags = detect_tags(self.detector, frame, self.pose_estimator, stage_timings=stages)
+                    if stages is not None:
+                        # Keep every window stage (read_wait too): profile rows must share one key set.
+                        stages = {name: value + stages.get(name, 0.) for name, value in window_stages.items()}
+                    search = 'window_fallback'
+                if self.tag_window is not None:
+                    self.tag_window.update(tags)
+                self.search_counts[search] += 1
                 detection_finished = time.monotonic()
                 if stages is not None:
                     smoothing_started = time.perf_counter()
@@ -691,6 +770,7 @@ class DetectionWorker:
                     "frame": frame, "frame_number": previous, "tags": tags,
                     "capture_fps": capture_fps, "detect_fps": detect_fps,
                     "detection_ms": (detection_finished - started) * 1000,
+                    "detection_search": search, "detection_region": region,
                     "processing_ms": (now - started) * 1000,
                     "frame_timestamp_monotonic": frame_timestamp,
                     "frame_timestamp_basis": getattr(self.reader, "timestamp_basis", "unspecified"),
@@ -712,7 +792,11 @@ class DetectionWorker:
                         from .cart_pose import urdf_cart_observation
                     else:
                         from cart_pose import urdf_cart_observation
+                    if stages is not None:
+                        cart_pose_started = time.perf_counter()
                     packet['cart_pose_urdf'] = urdf_cart_observation(packet, self.cart_pose_estimator)
+                    if stages is not None:
+                        stages['cart_pose'] = (time.perf_counter() - cart_pose_started) * 1000
                     packet['processing_ms'] = (time.monotonic()-started)*1000.
                 if stages is not None:
                     stages['process'] = packet['processing_ms']
@@ -799,7 +883,7 @@ def _config_defaults(parser, path):
         parser.error(f"Unknown config setting(s) in {path}: {', '.join(unknown)}")
     defaults = {}
     nullable = {'axis_length', 'cart_tag_id', 'cart_tag_ids', 'cart_to_tag_rpy_deg', 'missing_tag_dir'}
-    booleans = {'no_display', 'profile', 'no_smoothing', 'missing_tag_control_stdin'}
+    booleans = {'no_display', 'profile', 'no_smoothing', 'missing_tag_control_stdin', 'no_tag_window'}
     for key, value in values.items():
         action = actions[key]
         dest = action.dest
@@ -888,6 +972,11 @@ def parse_args(argv=None):
                         help='reject kinematic tilt beyond this angular difference from IMU')
     parser.add_argument("--quad-decimate", type=float, default=DEFAULT_QUAD_DECIMATE,
                         help="internal quad-search downsampling: 1=full detail, 1.5=balanced, 2=faster (default); camera stays 640x480")
+    parser.add_argument('--no-tag-window', action='store_true',
+                        help='search every frame in full instead of a window around the previous cart tags '
+                             '(the window falls back to a full search whenever a tracked tag is missing)')
+    parser.add_argument('--opencv-threads', type=int, default=1,
+                        help='OpenCV worker threads for tag detection (default: 1); results are identical, only speed changes')
     parser.add_argument("--no-smoothing", action="store_true", help="draw and report raw per-frame pose instead of filtered pose")
     parser.add_argument("--smoothing", dest="no_smoothing", action="store_false", help="enable smoothing even if disabled in config")
     parser.add_argument("--smooth-min-cutoff-hz", type=float, default=2.0,
@@ -937,6 +1026,8 @@ def parse_args(argv=None):
         parser.error("--cart-tag-id must be nonnegative")
     if args.quad_decimate < 1:
         parser.error("--quad-decimate must be >= 1")
+    if args.opencv_threads < 1:
+        parser.error('--opencv-threads must be >= 1')
     for name in ('tag_size', 'axis_length', 'smooth_min_cutoff_hz', 'smooth_xy_speed_cutoff_hz', 'smooth_reset_gap',
                  'robot_state_timeout_ms', 'state_sync_tolerance_ms', 'support_height_tolerance_m',
                  'support_normal_tolerance_deg', 'fusion_max_disagreement_deg'):
@@ -975,7 +1066,7 @@ def _run(args, resources):
     )
     if not args.no_display and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         raise RuntimeError("No desktop display. Run in an Ubuntu desktop/X11 terminal, or add --no-display --frames 600.")
-    cv2.setNumThreads(1)
+    cv2.setNumThreads(args.opencv_threads)
     detector = make_detector(args.quad_decimate)
     camera_matrix, distortion = load_intrinsics(args.intrinsics)
     pose_estimator = TagPoseEstimator(camera_matrix, distortion, args.tag_size, args.axis_length)
@@ -1034,7 +1125,9 @@ def _run(args, resources):
         ).tolist()
     print(f"Config: {args.config}", flush=True)
     print(f"Python: {sys.executable} | OpenCV {cv2.__version__} | family: {FAMILY}", flush=True)
-    print(f"Detection downsampling: {args.quad_decimate:g}x | native image/coordinate size: {WIDTH}x{HEIGHT}", flush=True)
+    print(f"Detection downsampling: {args.quad_decimate:g}x | native image/coordinate size: {WIDTH}x{HEIGHT} | "
+          f"OpenCV threads: {cv2.getNumThreads()} | cart tag window: "
+          f"{'off' if args.no_tag_window or args.cart_tag_ids is None else 'on (full-frame fallback)'}", flush=True)
     if pose_smoother is None:
         print("Pose smoothing: disabled (raw pose)", flush=True)
     else:
@@ -1084,7 +1177,8 @@ def _run(args, resources):
     try:
         worker = DetectionWorker(reader, detector, pose_estimator, pose_smoother, cart_heading_estimator,
                                  profile=args.profile, pelvis_compensator=compensator, heading_smoother=heading_smoother,
-                                 cart_pose_estimator=cart_pose_estimator, missing_tag_frames=missing_frames)
+                                 cart_pose_estimator=cart_pose_estimator, missing_tag_frames=missing_frames,
+                                 tag_window=not args.no_tag_window)
     except Exception:
         reader.close()
         raise
@@ -1133,12 +1227,15 @@ def _run(args, resources):
                     locations += f" | Cart tag ID {args.cart_tag_id} not detected; cart yaw unavailable"
                 if args.cart_tag_ids is not None and not any(tag['id'] in args.cart_tag_ids for tag in tags):
                     locations += f" | Cart tags {args.cart_tag_ids} not detected; cart yaw unavailable"
+                counts = worker.search_counts
                 print(f"Capture {packet['capture_fps']:.1f} FPS | Detect {packet['detect_fps']:.1f} FPS | "
                       f"Detect+Pose {packet['detection_ms']:.2f} ms | Process {packet['processing_ms']:.2f} ms | "
+                      f"Search window {counts['window']} / fallback {counts['window_fallback']} / full {counts['full']} | "
                       f"{format_fused_heading(packet['fused_cart_heading'])} | "
                       f"{format_compensation(compensation)} | {locations}", flush=True)
                 if args.profile:
-                    for report in (worker.profile_report(), format_profile('view', preview_profiles)):
+                    for report in (worker.profile_report(), format_profile('view', preview_profiles),
+                                   reader_profile(reader)):
                         if report:
                             print(report, flush=True)
                 last_report = now
@@ -1180,7 +1277,8 @@ def _run(args, resources):
             for report in (worker.profile_report(), format_profile('view', preview_profiles)):
                 if report:
                     print(report, flush=True)
-        print(f"Finished: capture {capture_fps:.2f} FPS; detect {detect_fps:.2f} FPS; processed {worker.processed} frames; tag frames {worker.tag_frames}; IDs {sorted(worker.seen_ids)}", flush=True)
+        print(f"Finished: capture {capture_fps:.2f} FPS; detect {detect_fps:.2f} FPS; processed {worker.processed} frames; tag frames {worker.tag_frames}; IDs {sorted(worker.seen_ids)}; "
+              f"search {worker.search_counts}", flush=True)
 
 
 if __name__ == "__main__":

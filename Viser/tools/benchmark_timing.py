@@ -55,12 +55,14 @@ class MeasuredController(Controller):
     def step(self):
         previous = self.policy_steps
         started = time.perf_counter()
+        cpu_started = time.thread_time()
         super().step()
         elapsed = (time.perf_counter() - started) * 1000
+        cpu_elapsed = (time.thread_time() - cpu_started) * 1000
         if self.collecting and self.policy_steps != previous and self.stage == 'POLICY':
             data = self.snapshot()
             self.samples.append(dict(
-                completed=data['policy_inference_monotonic'], step_ms=elapsed,
+                completed=data['policy_inference_monotonic'], step_ms=elapsed, cpu_ms=cpu_elapsed,
                 models=dict(self.model_ms), **data['timing']))
 
 
@@ -123,23 +125,73 @@ class ViewerLoad:
         self.viewer.close()
 
 
+class NavigationLoad:
+    """Actual navigation executor with commands confined to a simulated bridge."""
+    def __init__(self, controller, geometry_port=None):
+        if controller.mode != 'sim':
+            raise ValueError('Navigation benchmark requires a simulated controller')
+        sys.path.insert(0, str(ROOT.parent / 'nav/locomotion'))
+        from g1_locomotion_executor import Executor, VELOCITY_PACKET
+        self.packet = VELOCITY_PACKET
+        self.executor = Executor(controller, 0, 9, geometry_port=geometry_port)
+        self.destination = self.executor.sock.getsockname()
+        self.sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sequence = 0
+        self.samples, self.error = [], ''
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, name='benchmark-nav-executor', daemon=True)
+        self.thread.start()
+
+    def update(self, vx):
+        self.sequence += 1
+        self.sender.sendto(self.packet.pack(0x47315643, 3, 1, 0, self.sequence,
+                           vx, 0., 0., self.executor.navigation_epoch, time.monotonic_ns()),
+                           self.destination)
+        if self.error:
+            raise RuntimeError(self.error)
+
+    def run(self):
+        deadline = time.monotonic()
+        try:
+            while not self.stop.is_set():
+                started = time.perf_counter()
+                self.executor.step()
+                self.samples.append((time.perf_counter()-started)*1000)
+                deadline = max(deadline+.02, time.monotonic())
+                self.stop.wait(max(0., deadline-time.monotonic()))
+        except Exception as exc:
+            self.error = repr(exc)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=5)
+        self.executor.close()
+        self.sender.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=float, default=20)
     parser.add_argument('--record', action='store_true')
     parser.add_argument('--pushcart', action='store_true', help='Run real student + both low-level models with synthetic cart yaw')
     parser.add_argument('--viewer', action='store_true', help='Include 30 Hz Viser updates and one receiving WebSocket client')
+    parser.add_argument('--navigation-executor', action='store_true',
+                        help='Include the real navigation executor and its UDP command/status path; robot bridge stays simulated')
+    parser.add_argument('--geometry-port', type=int,
+                        help='Optional synthetic geometry output to a separate read-only navigation test stack')
     parser.add_argument('--vx', type=float, default=0., help='Synthetic task/body forward command; never sent to a robot')
     args = parser.parse_args()
     if not np.isfinite(args.seconds) or args.seconds < 2:
         parser.error('--seconds must be finite and >= 2')
     if not np.isfinite(args.vx) or not -.2 <= args.vx <= .4:
         parser.error('--vx must be finite and within [-0.2, 0.4]')
+    if args.geometry_port is not None and (not args.navigation_executor or not 1024 <= args.geometry_port <= 65535):
+        parser.error('--geometry-port requires --navigation-executor and a port in [1024, 65535]')
     config = RobotConfig()
     build_bridge()
     temporary = tempfile.TemporaryDirectory(prefix='viser_benchmark_')
     bridge_output = tempfile.TemporaryFile(mode='w+')
-    controller = backend = recorder = high = camera = viewer = None
+    controller = backend = recorder = high = camera = viewer = navigation = None
     error = None
     try:
         if args.pushcart:
@@ -179,12 +231,16 @@ def main():
                      and not d['dex3']['pending'] and d['high_policy']['history_ready'])
             controller.emit('pushcart_enable', 1)
             wait_for(controller, lambda d: d['high_policy']['enabled'] and not d['upper_pd_transitioning'])
+        if args.navigation_executor:
+            navigation = NavigationLoad(controller, args.geometry_port)
         # Run the same viewer update rate as app.py, including a short settling period.
         started = time.monotonic()
         controller.collecting = False
         while time.monotonic() - started < args.seconds + 2:
             controller.collecting = time.monotonic() - started >= 2
-            if args.vx:
+            if navigation:
+                navigation.update(args.vx)
+            elif args.vx:
                 controller.emit('move', 1, [args.vx, 0., 0.])
             if viewer:
                 viewer.viewer.update()
@@ -203,12 +259,15 @@ def main():
         report = dict(
             scope='C++ synthetic feedback + real ONNX; no physics, robot DDS, camera image processing or browser rendering',
             pushcart=args.pushcart, automatic_recording=args.record, viser_client=args.viewer,
+            navigation_executor=args.navigation_executor,
             seconds=float(completions[-1]-completions[0]),
             policy_hz=float((len(samples)-1)/(completions[-1]-completions[0])),
             per_model_ms={name: stats([s['models'][name] for s in samples]) for name in ('balance', 'homie')},
             student_ms=stats([s['high_policy_inference_ms'] for s in samples]),
             inference_ms=stats([s['inference_ms'] for s in samples]),
             full_step_ms=stats([s['step_ms'] for s in samples]),
+            control_thread_cpu_ms=stats([s['cpu_ms'] for s in samples]),
+            executor_step_ms=stats(navigation.samples) if navigation else None,
             completion_interval_ms=stats(intervals),
             compute_over_20ms=sum(s['step_ms'] > 20 for s in samples),
             completion_gaps_over_25ms=int(np.count_nonzero(intervals > 25)),
@@ -225,6 +284,8 @@ def main():
         print('Bridge output:\n' + bridge_output.read()[-6000:], file=sys.stderr)
         raise
     finally:
+        if navigation:
+            navigation.close()
         if camera:
             camera.close()
         if controller:

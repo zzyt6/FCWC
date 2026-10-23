@@ -1,13 +1,19 @@
+<!--
+  server_timeout: Foxy's bt_navigator gives each action/service node only a
+  10 ms default to receive the goal acceptance. A busy planner/controller then
+  makes the node throw "send_goal failed", which aborts the goal (status 6)
+  and can crash bt_navigator on the next goal. Allow 1 s.
+-->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="2" name="CartNavigation">
       <PipelineSequence name="CartReplanning">
         <RateController hz="1.0">
-          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" server_timeout="1000"/>
         </RateController>
-        <FollowPath path="{path}" controller_id="CartPush"/>
+        <FollowPath path="{path}" controller_id="CartPush" server_timeout="1000"/>
       </PipelineSequence>
-      <Wait wait_duration="1"/>
+      <Wait wait_duration="1" server_timeout="1000"/>
     </RecoveryNode>
   </BehaviorTree>
 </root>

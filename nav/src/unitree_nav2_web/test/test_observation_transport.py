@@ -210,3 +210,76 @@ def test_fastlio_startup_wait_stall_and_reordered_clouds_keep_current_measuremen
                 executor.shutdown()
                 node.destroy_node()
                 context.shutdown()
+
+
+def test_obstacle_filter_merges_recent_50hz_frames_in_odometry(monkeypatch):
+    # A single 20 ms MID-360 frame is sparse. Frames within the 100 ms window
+    # are merged through odom at their own times; older ones are dropped.
+    monkeypatch.setenv('ROS_DOMAIN_ID', '97')
+    monkeypatch.setenv('ROS_LOCALHOST_ONLY', '1')
+    monkeypatch.setenv('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp')
+    monkeypatch.setenv('CYCLONEDDS_URI',
+        '<CycloneDDS><Domain><General><NetworkInterfaceAddress>lo</NetworkInterfaceAddress>'
+        '<AllowMulticast>false</AllowMulticast></General><Discovery><ParticipantIndex>auto</ParticipantIndex>'
+        '<Peers><Peer Address="127.0.0.1"/></Peers></Discovery></Domain></CycloneDDS>')
+    root = Path(__file__).resolve().parents[3]
+    context = Context()
+    rclpy.init(context=context)
+    node = rclpy.create_node('obstacle_window_test', context=context)
+    executor = SingleThreadedExecutor(context=context)
+    executor.add_node(node)
+    obstacles = []
+    source = node.create_publisher(PointCloud2, '/cloud_nav', qos_profile_sensor_data)
+    node.create_subscription(PointCloud2, '/cloud_obstacles', obstacles.append, qos_profile_sensor_data)
+    broadcaster = StaticTransformBroadcaster(node)
+    transform = TransformStamped()
+    transform.header.frame_id, transform.child_frame_id = 'odom', 'base_nav'
+    transform.transform.rotation.w = 1.
+    broadcaster.sendTransform(transform)
+    def pump(duration):
+        deadline = time.monotonic()+duration
+        while time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=.005)
+    started = [time.time()]
+    def frame(offset, points):
+        data = np.asarray(points, dtype='<f4').reshape((-1, 4))
+        message = PointCloud2(height=1, width=len(data), point_step=16, row_step=len(data)*16,
+            fields=[PointField(name=name, offset=i*4, datatype=PointField.FLOAT32, count=1)
+                    for i, name in enumerate(('x', 'y', 'z', 'intensity'))],
+            data=array('B', data.tobytes()))
+        message.header.frame_id = 'base_nav'
+        message.header.stamp = Time(seconds=started[0]+offset).to_msg()
+        source.publish(message)
+    ground = [[x, y, -.8, 1.] for x in np.linspace(.7, 2., 15) for y in np.linspace(-1., 1., 15)]
+    process = subprocess.Popen([str(root/'build/unitree_nav2_core/cloud_obstacle_filter'), '--ros-args'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=os.environ.copy())
+    try:
+        deadline = time.monotonic()+5.
+        while source.get_subscription_count() < 1 and time.monotonic() < deadline:
+            pump(.05)
+        pump(.5)
+        started[0] = time.time()-.05
+        frame(.0, ground+[[1., .5, -.4, 1.]])   # ground + obstacle A
+        pump(.1)
+        frame(.02, [[1., -.5, -.4, 1.]])        # sparse frame: obstacle B only
+        deadline = time.monotonic()+.5
+        while len(obstacles) < 2 and time.monotonic() < deadline:
+            pump(.01)
+        assert len(obstacles) >= 2
+        assert obstacles[-1].width == 2, 'the sparse frame must include obstacle A from 20 ms earlier'
+        pump(.3)
+        frame(.40, [[1.5, 0., -.4, 1.]])        # outside the window: only its own point
+        deadline = time.monotonic()+.5
+        while len(obstacles) < 3 and time.monotonic() < deadline:
+            pump(.01)
+        assert obstacles[-1].width == 1
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5.)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2.)
+        executor.shutdown()
+        node.destroy_node()
+        context.shutdown()

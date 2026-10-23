@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -30,13 +31,21 @@ public:
     declare_parameter<double>("max_vy", 0.20);
     declare_parameter<double>("max_vyaw", 0.50);
     declare_parameter<double>("command_timeout", 0.25);
-    declare_parameter<double>("motion_enable_timeout", 1.50);
+    declare_parameter<double>("motion_enable_timeout", 3.0);
     declare_parameter<bool>("require_navigation_reference", true);
+    // A brief reference outage only pauses velocity (zero is sent at once).
+    // Only a sustained outage revokes the operator's motion authorization.
+    declare_parameter<double>("reference_fresh_timeout", 0.5);
+    declare_parameter<double>("reference_fault_timeout", 3.0);
     declare_parameter<double>("cart_min_vx", -0.2);
     declare_parameter<double>("cart_max_vx", 0.6);
     declare_parameter<double>("cart_max_vy", 0.3);
     declare_parameter<double>("cart_max_vyaw", 0.4);
     require_reference_ = get_parameter("require_navigation_reference").as_bool();
+    reference_fresh_timeout_ = get_parameter("reference_fresh_timeout").as_double();
+    reference_fault_timeout_ = get_parameter("reference_fault_timeout").as_double();
+    if (!(reference_fresh_timeout_ > 0.0) || !(reference_fault_timeout_ > 0.0))
+      throw std::runtime_error("Navigation reference timeouts must be positive");
     cart_min_vx_ = get_parameter("cart_min_vx").as_double();
     cart_max_vx_ = get_parameter("cart_max_vx").as_double();
     cart_max_vy_ = get_parameter("cart_max_vy").as_double();
@@ -69,6 +78,9 @@ public:
       "/g1/navigation_epoch", rclcpp::QoS(1).transient_local().reliable(),
       [this](const std_msgs::msg::UInt32::SharedPtr message) {
         if (message->data != reference_epoch_) {
+          if (enabled_)
+            RCLCPP_WARN(get_logger(), "Navigation epoch changed %u -> %u; motion gate DISABLED.",
+              reference_epoch_, message->data);
           reference_epoch_ = message->data;
           enabled_ = command_received_ = false;
           sendPacket(false, 0.0F, 0.0F, 0.0F);
@@ -78,7 +90,7 @@ public:
     reference_subscription_ = create_subscription<std_msgs::msg::Bool>(
       "/g1/navigation_reference_ready", rclcpp::QoS(1).transient_local().reliable(),
       [this](const std_msgs::msg::Bool::SharedPtr message, const rclcpp::MessageInfo & info) {
-        const auto sampled = sourceTime(info, .3);
+        const auto sampled = sourceTime(info, reference_fresh_timeout_);
         if (message->data && !sampled) return;
         checkReference();
         reference_ready_ = message->data;
@@ -115,9 +127,17 @@ public:
         // the next 20 ms timer. Reopening requires a new cmd_vel callback.
         if (!enabled_) sendPacket(false, 0.0F, 0.0F, 0.0F);
         publishEnabled();
-        if (changed)
+        if (changed) {
+          // Name the cause of every close so a gate drop is never anonymous.
+          const auto & gid = info.get_rmw_message_info().publisher_gid.data;
+          char publisher[17];
+          std::snprintf(publisher, sizeof(publisher), "%02x%02x%02x%02x%02x%02x%02x%02x",
+            gid[0], gid[1], gid[2], gid[3], gid[4], gid[5], gid[6], gid[7]);
           RCLCPP_WARN(
-            get_logger(), "G1 motion gate is now %s", enabled_ ? "ENABLED" : "DISABLED");
+            get_logger(), "G1 motion gate is now %s (request=%s latched=%d reference_fresh=%d publisher=%s)",
+            enabled_ ? "ENABLED" : "DISABLED", message->data ? "enable" : "disable",
+            reference_fault_latched_, referenceFresh(), publisher);
+        }
       });
     cmd_subscription_ = create_subscription<geometry_msgs::msg::Twist>(
       get_parameter("cmd_vel_topic").as_string(), 1,
@@ -171,21 +191,24 @@ private:
     command_received_ = false;
     if (!reference_unavailable_) {
       reference_unavailable_ = true;
-      reference_unavailable_since_ = reference_ready_ ?
-        last_reference_ + std::chrono::milliseconds(300) : now;
+      reference_unavailable_since_ = now;
+      RCLCPP_WARN(get_logger(), "Navigation reference unavailable; velocity paused at zero.");
     }
-    if (std::chrono::duration<double>(now-reference_unavailable_since_).count() >= 0.6) {
+    if (std::chrono::duration<double>(now-reference_unavailable_since_).count() >=
+      reference_fault_timeout_)
+    {
       enabled_ = false;
       reference_fault_latched_ = true;
       publishEnabled();
-      RCLCPP_ERROR(get_logger(), "Navigation reference unavailable for 0.6 s; motion gate DISABLED.");
+      RCLCPP_ERROR(get_logger(), "Navigation reference unavailable for %.1f s; motion gate DISABLED.",
+        reference_fault_timeout_);
     }
   }
 
   bool referenceFresh() const
   {
     return !require_reference_ || (reference_epoch_ != 0 && reference_ready_ &&
-      std::chrono::duration<double>(std::chrono::steady_clock::now()-last_reference_).count() <= 0.3);
+      std::chrono::duration<double>(std::chrono::steady_clock::now()-last_reference_).count() <= reference_fresh_timeout_);
   }
 
   static float clamp(double value, double limit)
@@ -277,7 +300,9 @@ private:
   double max_vy_ = 0.20;
   double max_vyaw_ = 0.50;
   double command_timeout_ = 0.25;
-  double motion_enable_timeout_ = 1.50;
+  double motion_enable_timeout_ = 3.0;
+  double reference_fresh_timeout_ = 0.5;
+  double reference_fault_timeout_ = 3.0;
   geometry_msgs::msg::Twist command_;
   std::chrono::steady_clock::time_point last_command_;
   std::chrono::steady_clock::time_point accept_commands_after_;
